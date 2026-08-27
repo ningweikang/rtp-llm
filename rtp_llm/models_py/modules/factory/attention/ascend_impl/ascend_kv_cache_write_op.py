@@ -43,6 +43,7 @@ class AscendKVCacheWriteOp:
 
         torch_npu.npu_scatter_pa_kv_cache(
             key_c, value_c, k_c, v_c, slot_mapping,
+            cache_mode="Norm",
         )
 
         k_view.copy_(k_c)
