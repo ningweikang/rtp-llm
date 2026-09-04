@@ -33,6 +33,8 @@ attrs==26.1.0
     # via aiohttp
 audioread==3.1.0
     # via librosa
+backoff==2.2.1
+    # via googleapis-common-protos
 bitsandbytes==0.49.2
     # via -r /root/.cache/bazel/_bazel_root/50832219d92abd54ef9ef74e0f443e2a/external/rtp_deps/requirements_base.txt
 blobfile==3.2.0
@@ -97,6 +99,8 @@ fsspec==2026.4.0
     # via
     #   huggingface-hub
     #   torch
+googleapis-common-protos==1.75.0
+    # via opentelemetry-exporter-otlp-proto-http
 grpcio==1.62.0
     # via
     #   -r /root/.cache/bazel/_bazel_root/50832219d92abd54ef9ef74e0f443e2a/external/rtp_deps/requirements_base.txt
@@ -206,6 +210,16 @@ onnx==1.16.0
     # via -r /root/.cache/bazel/_bazel_root/50832219d92abd54ef9ef74e0f443e2a/external/rtp_deps/requirements_base.txt
 openai==2.36.0
     # via -r /root/.cache/bazel/_bazel_root/50832219d92abd54ef9ef74e0f443e2a/external/rtp_deps/requirements_base.txt
+opentelemetry-api==1.44.0
+    # via -r requirements_base.txt
+opentelemetry-exporter-otlp-proto-http==1.15.0
+    # via -r requirements_base.txt
+opentelemetry-proto==1.15.0
+    # via opentelemetry-exporter-otlp-proto-http
+opentelemetry-sdk==1.44.0
+    # via -r requirements_base.txt
+opentelemetry-semantic-conventions==0.65b0
+    # via opentelemetry-sdk
 orjson==3.11.9
     # via -r /root/.cache/bazel/_bazel_root/50832219d92abd54ef9ef74e0f443e2a/external/rtp_deps/requirements_base.txt
 oss2==2.19.1
