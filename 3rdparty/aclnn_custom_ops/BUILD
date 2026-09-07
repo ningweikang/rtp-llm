@@ -3,6 +3,8 @@ package(default_visibility = ["//visibility:public"])
 load(":aclnn_build.bzl", "aclnn_custom_ops_build")
 
 # SoC version for the AscendC custom-op build.
+# Only support ascend950.
+# Other SoC versions are not supported.
 ACLNN_SOC_VERSION = "ascend950"
 
 aclnn_custom_ops_build(

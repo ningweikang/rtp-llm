@@ -225,20 +225,11 @@ def internal_deps():
     return []
 
 def telemetry_test_deps():
-    # Direct deps on the OTel runtime for the locks that carry it, so tracing
-    # tests fail (not skip) on a missing Bazel-declared runtime instead of
-    # silently depending on whatever the execution image happens to have
-    # preinstalled. deps/requirements_base.txt pins the packages; platform
-    # locks pick them up via bazel run //deps:requirements_<platform>.update —
-    # extend this select as each lock starts carrying them.
-    return select({
-        "@rtp_llm//:using_ascend": [
-            requirement_ascend("opentelemetry-api"),
-            requirement_ascend("opentelemetry-sdk"),
-            requirement_ascend("opentelemetry-exporter-otlp-proto-http"),
-        ],
-        "//conditions:default": [],
-    })
+    # The tracing SDK is optional at runtime. SDK-specific test methods skip
+    # explicitly when it is unavailable, while Trace-off tests remain independent
+    # of interpreter-wide packages. The lock carrying the SDK supplies it through
+    # the architecture-specific dependency selector.
+    return []
 
 def jit_deps():
     return []
