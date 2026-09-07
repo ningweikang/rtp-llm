@@ -1,15 +1,11 @@
 load("//:def.bzl", "copts")
 load("@arch_config//:arch_select.bzl", "torch_deps")
 
+# ACLNN op-api adapter layer: dlopen-based aclnn dispatch + at::Tensor →
+# aclTensor conversion. Header-only; consumed for the AscendC custom ops.
 cc_library(
     name = "npu_bridge",
-    srcs = [
-        "NPUBridge.cpp",
-        "NPUStorageImpl.cpp",
-    ],
     hdrs = [
-        "NPUBridge.h",
-        "NPUStorageImpl.h",
         "aclnn_apply_top_k_top_p_custom.h",
         "ascend_apply_top_k_top_p_custom.h",
         "op_api_common.h",
