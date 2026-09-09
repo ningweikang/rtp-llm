@@ -655,9 +655,6 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     }
 
     // ---- 2. Fast path: top_k = 1 for all batches → argmax only ----
-    // cum_log_probs must skip the fast path: the early return would drop the
-    // per-step update (top-1 filtering renormalizes to one-hot, so the main
-    // path adds log(1)=0, matching CUDA semantics).
     auto top_k_ptr = reinterpret_cast<uint32_t*>(params.top_k.data_ptr<int32_t>());
     if (std::all_of(top_k_ptr, top_k_ptr + batch_size, [](auto t) { return t == 1; }) &&
         !params.output_all_probs.has_value() && !params.cum_log_probs.has_value()) {

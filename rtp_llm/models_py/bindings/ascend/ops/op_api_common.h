@@ -564,9 +564,6 @@ typedef void (*ReleaseHugeMem)(void *, bool);
     TORCH_CHECK(workspace_status == 0,                                        \
                 "call " #aclnn_api " failed, detail:", aclGetRecentErrMsg()); \
     void *workspace_addr = nullptr;                                           \
-    /* Declared outside the if-block: the tensor must outlive cmd.Run() so    \
-       the caching allocator cannot recycle the block before the async        \
-       kernel submission uses workspace_addr. */                              \
     at::Tensor workspace_tensor;                                              \
     if (workspace_size != 0) {                                                \
       at::TensorOptions options =                                             \

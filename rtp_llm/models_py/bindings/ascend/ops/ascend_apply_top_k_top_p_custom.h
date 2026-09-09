@@ -45,11 +45,6 @@ inline void applyTopKTopP(    // ← 按算子功能命名，如 applyTopKTopP /
     //   2. 调用 GetWorkspaceSize 计算 workspace
     //   3. 分配 workspace
     //   4. 调用执行函数提交到 NPU stream
-    // Pass both optionals straight through: ConvertType(optional<Tensor>)
-    // maps nullopt/undefined → nullptr aclTensor*, matching the op's nullable
-    // p/k parameters. Do NOT forward c10::nullopt directly — it would hit the
-    // generic passthrough template and put a non-pointer nullopt_t in the
-    // aclTensor* argument slot (garbage pointer at the callee).
     EXEC_NPU_CMD(aclnnApplyTopKTopPCustom, input, param1, param2, output);
 }
 

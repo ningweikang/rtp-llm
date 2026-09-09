@@ -1,19 +1,9 @@
-"""Ascend MoE placeholder strategy: MoE is rejected on Ascend for now.
+"""Ascend MoE placeholder: rejects all MoE configurations.
 
-No NPU-capable MoE executor exists yet. The previously wired
-BatchedTritonExperts imports Triton and runs Triton grouped GEMM, but Triton
-is excluded from the Ascend dependency set (arch_config/arch_select.bzl
-_ascend_excluded), so it cannot execute on NPU tensors (upstream PR #1349
-review r3913106822).
-
-Ascend TP (tp_size > 1) is additionally not implemented: the batched data
-router would slice experts by tp_size and drop the tail experts on pure-TP
-topologies (review r3913106830).
-
-check_conditions therefore raises for every configuration so that MoE models
-fail fast at strategy selection with a clear error instead of crashing later
-inside a Triton-dependent executor or silently dropping experts. Dense
-(non-MoE) models never reach this code path.
+No NPU-capable MoE executor exists (Triton is excluded from Ascend deps),
+and Ascend TP (tp_size > 1) is not implemented. MoE models fail fast at
+strategy selection instead of crashing or silently dropping experts. Dense
+(non-MoE) models never reach this path.
 """
 
 from typing import Any
