@@ -24,9 +24,6 @@ import torch_npu  # noqa: F401 — registers NPU dispatch before any NPU ops
 
 # ---------------------------------------------------------------------------
 # Locate and import the pybind module built by Bazel.
-#   - Under `bazel test`: the .so is a data dependency and lands in the
-#     runfiles tree next to this script (dirname(__file__)).
-#   - Manual runs (cwd = workspace root): fall back to the bazel-bin path.
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MODULE_DIR = os.path.join(
