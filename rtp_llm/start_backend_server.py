@@ -432,11 +432,16 @@ def start_backend_server(
 
         return vit_start_server()
 
-    if not torch.cuda.is_available():
-        return local_rank_start(global_controller, py_env_configs)
+    from rtp_llm.device.device_type import is_ascend
+
+    # Single-rank fast path only when NO accelerator backend is available;
+    # otherwise the Ascend multi-rank path below must stay reachable.
+    if not torch.cuda.is_available() and not is_ascend():
+        return local_rank_start(global_controller, py_env_configs, 0, pipe_writer)
+
+    _dev_count = torch.npu.device_count() if is_ascend() else torch.cuda.device_count()
 
     pc = py_env_configs.parallelism_config
-    _dev_count = torch.npu.device_count() if (not torch.cuda.is_available()) else torch.cuda.device_count()
     if (
         pc.world_size % _dev_count != 0
         and pc.world_size > _dev_count
