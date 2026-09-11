@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 
 from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig, QuantizationConfig
+from rtp_llm.device.device_type import is_ascend
 from rtp_llm.model_loader.attn_weight import AttnAtomicWeight, MlaAttnAtomicWeight
 from rtp_llm.model_loader.ffn_weight import FfnAtomicWeight, MoeAtomicWeight
 from rtp_llm.model_loader.linear_attn_weight import (
@@ -746,6 +747,39 @@ class PerBlockFp8Weight(CompositeWeight, QuantWeight):
         # need reshape for kernel weight
         processed_res = super()._postprocess(tensor, device, load_config)
         kernel_weight = processed_res[self.kernel.name]
+
+        # Ascend (W8A8_MXFP8): real transpose + E8M0 scale swizzle for
+        # npu_quant_matmul, aligned with vllm-ascend w8a8_mxfp8.py. Must run
+        # after the TP split (swizzle spans the whole K-group dim).
+        if is_ascend():
+            from rtp_llm.models_py.kernels.ascend.w8a8_mx_layout import (
+                swizzle_scale_to_npu_layout,
+            )
+
+            # 2D dense: [N, K] -> [K, N];  3D MoE: [E, N, K] -> [E, K, N]
+            if kernel_weight.dim() == 2:
+                kernel_weight = kernel_weight.transpose(0, 1).contiguous()
+            else:
+                kernel_weight = kernel_weight.transpose(1, 2).contiguous()
+            processed_res[self.kernel.name] = kernel_weight
+
+            if self.scale is not None:
+                scale_weight = processed_res[self.scale.name]
+                # [N, kp] -> [kp//2, N, 2]; [E, N, kp] -> [E, kp//2, N, 2]
+                scale_weight = swizzle_scale_to_npu_layout(scale_weight)
+                kernel_weight = (
+                    load_config.exported_device.maybe_rewrite_weight_by_key(
+                        "weight", kernel_weight
+                    )
+                )
+                scale_weight = load_config.exported_device.maybe_rewrite_weight_by_key(
+                    "scale", scale_weight
+                )
+                processed_res[self.scale.name] = scale_weight
+                processed_res[self.kernel.name] = kernel_weight
+
+            return processed_res
+
         from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
             is_deep_gemm_e8m0_used,
         )
