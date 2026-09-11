@@ -1,22 +1,15 @@
 """ModelSlim pre-quantized (W8A8_MXFP8) weight loader for Ascend NPU.
 
-Loading strategy (zero re-quantization, straight-through):
-  * The kernel sub-weight reuses the source weight structure verbatim (same
-    CkptWeightInfo names + merge_fun + process_fun, including stacked MoE
-    ``stacked_ckpt_keys``), only with ``data_type=float8_e4m3fn``. Its raw
-    layout is therefore identical to the bf16 path (2D dense ``[K, N]``,
-    MoE ``[E, N, K]``).
-  * The scale sub-weight reuses the same structure but with ModelSlim scale
-    tensor names and ``data_type=uint8`` (E8M0 stored as uint8). Because every
-    involved process_fun is transpose-equivariant (pure layout ops: transpose /
-    concat / stack / slice), the scale loads as ``[kp, N]`` / ``[E, N, kp]``.
-  * ``_load_raw_tensor`` then transposes both 2D tensors into the invariants
-    expected by ``PerBlockFp8Weight._postprocess`` (dense kernel ``[N, K]``,
-    scale ``[N, kp]``); MoE 3D tensors are left untouched. No swizzle happens
-    here — it runs in ``_postprocess`` (after the TP split).
+Zero re-quantization, straight-through loading:
+  * kernel: source structure verbatim (names/merge/process funs incl. stacked
+    MoE), only data_type=float8_e4m3fn; raw layout same as the bf16 path.
+  * scale: same structure with ModelSlim scale names, uint8 (E8M0); loads as
+    [kp, N] / [E, N, kp] (all involved funs are pure layout ops).
+  * _load_raw_tensor normalizes 2D to [N, K]/[N, kp] (MoE 3D untouched) for
+    PerBlockFp8Weight._postprocess; swizzle runs there, after the TP split.
 
-This module MUST NOT import torch_npu at top level: it is imported
-unconditionally on every platform via ``model_loader/__init__.py``.
+MUST NOT import torch_npu at top level (imported on every platform via
+model_loader/__init__.py).
 """
 
 import functools
@@ -63,14 +56,12 @@ def _adapt_scale_align(
 ) -> Callable[[List[torch.Tensor]], torch.Tensor]:
     """Adapt a kernel-side process_fun for the scale tensor.
 
-    The source process_fun pads the K dimension to ``align_size`` (kernel
-    elements). The scale stores kp = K / group_size groups along that same
-    dimension, so its padding must shrink accordingly (same convention as
-    PerBlockFp8Weight._get_ffn_quant_weight: scale align = kernel align //
-    group_size). Without this, e.g. down_proj with align_size=64 pads the
-    scale kp from 96 to 128 while the kernel K stays 3072 — an inconsistent
-    pair that aclnnQuantMatmulV5 (mx mode) rejects. Padding on other dims
-    (e.g. N-side pad_w13/transpose_pad) is group-agnostic and harmless.
+    Kernel align_size pads K in kernel elements; the scale holds kp = K/32
+    groups on that dim, so its align must be kernel align // group_size
+    (same convention as PerBlockFp8Weight._get_ffn_quant_weight). Otherwise
+    e.g. down_proj (align_size=64) pads scale kp 96->128 while kernel K
+    stays 3072 — rejected by aclnnQuantMatmulV5 mx mode. Padding on other
+    dims (e.g. N-side transpose_pad) is group-agnostic and harmless.
     """
     if (
         isinstance(fn, functools.partial)
@@ -86,11 +77,9 @@ def _adapt_scale_align(
 def _as_uint8_layout_fn(fn: Callable[[List[torch.Tensor]], torch.Tensor]):
     """Run a pure-layout function on uint8 views of fp8 inputs.
 
-    All process/merge functions used by the supported weights are layout-only
-    (transpose / concat / stack / slice), so executing them on uint8 views and
-    viewing the result back is byte-equivalent. This guards against torch_npu
-    not supporting fp8 cat/stack/contiguous (the repo already uses the same
-    trick in ``utils/model_weight.py::concat_0/concat_1``).
+    torch_npu does not support fp8 cat/stack/contiguous; layout-only ops
+    (transpose/concat/stack/slice) on uint8 views are byte-equivalent.
+    Same trick as utils/model_weight.py::concat_0/concat_1.
     """
 
     @functools.wraps(fn)
@@ -130,10 +119,8 @@ def _template_matches_excludes(name_template: str, excludes: set) -> bool:
 class AscendW8A8MXFP8Weight(PerBlockFp8Weight):
     """ModelSlim pre-quantized (W8A8_MXFP8, 1x32 group along K) weight loader.
 
-    Inherits from PerBlockFp8Weight:
-      * ``w8a8_weight_list`` (kernel -> scale name mapping)
-      * ``_postprocess`` NPU branch (real transpose + E8M0 scale swizzle)
-      * TP split strategies via the W8A8Fp8PerBlock* atomic weights
+    Inherits from PerBlockFp8Weight: w8a8_weight_list, _postprocess NPU
+    branch (real transpose + E8M0 swizzle), W8A8Fp8PerBlock* TP splits.
     """
 
     @classmethod
@@ -145,12 +132,10 @@ class AscendW8A8MXFP8Weight(PerBlockFp8Weight):
         name = src_weight_info.name
         if name not in cls.w8a8_weight_list or name in [W.mla_kc, W.mla_vc]:
             return False
-        # Modules not marked MXFP8 in quant_model_description.json (FLOAT etc.)
-        # keep loading in high precision. Concrete names (global weights) and
-        # MoE expert templates are excluded here; per-layer ({i}) templates
-        # cannot be resolved at create time (all layers share one template), so
-        # partial layer quantization is decided per layer at load time (see
-        # _is_bf16_fallback).
+        # FLOAT-marked modules keep bf16 loading. Concrete names and MoE
+        # expert templates are resolvable here; {i} templates are shared by
+        # all layers, so partial-quant layers are decided per layer at load
+        # time (_is_bf16_fallback).
         if quant_config.exclude_modules and hasattr(src_weight_info, "weights"):
             for ckpt_w in src_weight_info.weights:
                 if "{i}" in ckpt_w.name and "{expert_id}" not in ckpt_w.name:
@@ -209,12 +194,9 @@ class AscendW8A8MXFP8Weight(PerBlockFp8Weight):
         self.scale = scale
 
     def _is_bf16_fallback(self, layer_id: Optional[int]) -> bool:
-        """True when this concrete layer is excluded (kept FLOAT) in the ckpt.
-
-        ModelSlim may quantize only a subset of layers (e.g. down_proj of the
-        first layers stays FLOAT). Those layers carry a bf16 weight and no
-        scale tensor, so they must bypass the fp8 loading path entirely and
-        reuse the original bf16 structure.
+        """True when this concrete layer is excluded (kept FLOAT) in the ckpt:
+        such layers carry a bf16 weight and no scale tensor, so they bypass
+        the fp8 path and reuse the original bf16 structure.
         """
         if layer_id is None:
             return False
@@ -257,10 +239,9 @@ class AscendW8A8MXFP8Weight(PerBlockFp8Weight):
         load_config: LoadConfig,
     ):
         if self._is_bf16_fallback(layer_id):
-            # Nested composites (e.g. FfnWeight) drive the loading stages via
+            # Nested composites (e.g. FfnWeight) drive the stages via
             # _load_raw_tensor/_split/_postprocess directly, bypassing load();
-            # remember the decision so the later stages delegate as well.
-            # Instances are per-layer, so this state is safe to carry.
+            # remember the decision (instances are per-layer, state is safe).
             self._bf16_fallback_active = True
             return self.src_weight_info._load_raw_tensor(
                 tensor_source, layer_id, device, load_config
@@ -272,9 +253,7 @@ class AscendW8A8MXFP8Weight(PerBlockFp8Weight):
         res: Dict[str, torch.Tensor] = {}
         kernel = kernel_res.get(self.kernel.name)
         if kernel is not None:
-            # [K, N] -> [N, K]: MXFP8 groups along K (last dim), matching the
-            # layout expected by PerBlockFp8Weight._postprocess (NPU branch).
-            # MoE 3D [E, N, K] needs no transpose.
+            # [K, N] -> [N, K] (MXFP8 groups along K); MoE 3D needs no transpose.
             if kernel.dim() == 2:
                 kernel = kernel.T.contiguous()
             res[self.kernel.name] = kernel.to(device)

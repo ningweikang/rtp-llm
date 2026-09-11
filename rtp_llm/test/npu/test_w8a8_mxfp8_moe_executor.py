@@ -1,21 +1,16 @@
-"""AscendW8A8MXFP8Executor verification on Ascend NPU (W8A8_MXFP8).
+"""AscendW8A8MXFP8Executor verification on Ascend NPU (needs torch_npu).
 
-Runs INSIDE the NPU container:
-  docker exec rtp-llm-cann-9.2.0-weekly bash -c \
-    "cd /mnt/docker/w30060538/rtp-llm-npu && \
-     PYTHONPATH=/mnt/docker/w30060538/rtp-llm-npu \
-     /root/miniconda3/envs/rtp-env/bin/python \
-     rtp_llm/test/npu/test_w8a8_mxfp8_moe_executor.py"
+Run inside the NPU container:
+  PYTHONPATH=<repo> python -m pytest rtp_llm/test/npu/test_w8a8_mxfp8_moe_executor.py -v -s
 
 Validates plan B (stepwise grouped GEMM path) against a per-expert bf16
-reference, including the up|gate ordering of moe_w1 and the grouped-contiguous
-compaction/scatter logic.
+reference, including the up|gate ordering of moe_w1 and the
+grouped-contiguous compaction/scatter logic.
 """
 
-import sys
-from typing import Dict
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 import torch_npu  # noqa: F401
 
@@ -28,47 +23,39 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.ascend.executors.w8a8_mxfp
 )
 from rtp_llm.utils.model_weight import W
 
-torch.npu.set_device(0)
+from test_w8a8_common import (
+    cos_sim,
+    quantize_weight_swizzled,
+    stack_fp8,
+)
+
 torch.manual_seed(2024)
 
 E = 4
 T = 16
 HIDDEN = 256
 INTER = 128
-GROUP = 32
 
 
-def quantize_weight(w_nk: torch.Tensor):
-    """[N, K] -> fp8 [N, K] + swizzled uint8 scale [kp//2, N, 2]."""
-    n, k = w_nk.shape
-    kernel, scale_3d = torch_npu.npu_dynamic_mx_quant(
-        w_nk.to("npu"), dst_type=torch.float8_e4m3fn
-    )
-    # op returns [N, kp//2, 2]; reshape to [N, kp] then swizzle (static path)
-    scale_2d = scale_3d.reshape(n, k // GROUP)
-    kp = k // GROUP
-    if kp % 2 != 0:
-        scale_2d = torch.nn.functional.pad(scale_2d, (0, 1))
-        kp += 1
-    swizzled = scale_2d.reshape(n, kp // 2, 2).transpose(0, 1).contiguous()
-    return kernel, swizzled
+# ---------------- fixtures ----------------
 
 
-def stack_fp8(tensors, dim=0):
-    """torch.stack does not support fp8 on NPU; stack via uint8 views."""
-    u8 = torch.stack([t.view(torch.uint8) for t in tensors], dim=dim)
-    return u8.view(torch.float8_e4m3fn)
+@pytest.fixture(scope="module")
+def w_bf16_pair():
+    """Original bf16 expert weights: w1 [E, 2N, K] up|gate, w2 [E, N_hidden, K_inter]."""
+    w1 = torch.randn(E, 2 * INTER, HIDDEN, dtype=torch.bfloat16) * 0.05
+    w2 = torch.randn(E, HIDDEN, INTER, dtype=torch.bfloat16) * 0.05
+    return w1, w2
 
 
-def main():
-    # ---- weights ----
-    # w1 in ckpt orientation: [E, 2N, K] up|gate; final: [E, K, 2N]
-    w1_bf16 = torch.randn(E, 2 * INTER, HIDDEN, dtype=torch.bfloat16) * 0.05
-    w2_bf16 = torch.randn(E, HIDDEN, INTER, dtype=torch.bfloat16) * 0.05
+@pytest.fixture(scope="module")
+def weights(w_bf16_pair):
+    """Executor-consumable weights: quantized, transposed and stacked."""
+    w1_bf16, w2_bf16 = w_bf16_pair
     w1_list, w1s_list, w2_list, w2s_list = [], [], [], []
     for e in range(E):
-        k1, s1 = quantize_weight(w1_bf16[e])
-        k2, s2 = quantize_weight(w2_bf16[e])
+        k1, s1 = quantize_weight_swizzled(w1_bf16[e])
+        k2, s2 = quantize_weight_swizzled(w2_bf16[e])
         w1_list.append(k1.transpose(0, 1).contiguous())  # [K, 2N]
         w1s_list.append(s1)
         w2_list.append(k2.transpose(0, 1).contiguous())  # [K_inter, N_hidden]
@@ -78,56 +65,75 @@ def main():
     # w2: ckpt [E, N_hidden, K_inter] -> final [E, K_inter, N_hidden]
     w2 = stack_fp8(w2_list)              # [E, INTER, HIDDEN]
     w2_scale = torch.stack(w2s_list, dim=0)  # [E, kp2, HIDDEN, 2]
-
-    weights: Dict[str, torch.Tensor] = {
+    return {
         W.moe_w1: w1.to("npu"),
         W.moe_w2: w2.to("npu"),
         W.moe_s1: w1_scale.to("npu"),
         W.moe_s2: w2_scale.to("npu"),
     }
 
-    # ---- payload ----
-    masked_m = torch.tensor([5, 0, 16, 3], dtype=torch.int32, device="npu")
-    expert_x = torch.randn(E, T, HIDDEN, dtype=torch.bfloat16, device="npu")
-    payload = ExpertForwardPayload(
-        expert_x=expert_x,
-        expert_tokens_meta=ExpertTokensMetadata(expert_num_tokens=masked_m),
-    )
 
+@pytest.fixture(scope="module")
+def masked_m():
+    # deliberately includes an empty expert (0) and a full slot (T)
+    return torch.tensor([5, 0, 16, 3], dtype=torch.int32, device="npu")
+
+
+@pytest.fixture(scope="module")
+def expert_x():
+    return torch.randn(E, T, HIDDEN, dtype=torch.bfloat16, device="npu")
+
+
+@pytest.fixture(scope="module")
+def executor(weights):
     executor = AscendW8A8MXFP8Executor(
         config=MagicMock(), quant_config=MagicMock(), weights=weights
     )
     assert not executor._use_fused, "plan B expected by default"
-    out = executor.execute(
+    return executor
+
+
+@pytest.fixture(scope="module")
+def out(executor, expert_x, masked_m):
+    payload = ExpertForwardPayload(
+        expert_x=expert_x,
+        expert_tokens_meta=ExpertTokensMetadata(expert_num_tokens=masked_m),
+    )
+    return executor.execute(
         payload, activation="SiGLU", expert_map=None, a2_scale=None,
         apply_router_weight_on_input=False, extra_expert_args=None,
     ).fused_expert_output
+
+
+@pytest.fixture(scope="module")
+def ref(w_bf16_pair, expert_x, masked_m):
+    """Per-expert bf16 reference (up|gate order of w1)."""
+    w1_bf16, w2_bf16 = w_bf16_pair
+    res = torch.zeros(E, T, HIDDEN, dtype=torch.float32)
+    x_all = expert_x.float().cpu()
+    for e in range(E):
+        m = int(masked_m[e].item())
+        if m == 0:
+            continue
+        x = x_all[e, :m]  # [m, K]
+        w1e = w1_bf16[e].float().T  # [K, 2N]
+        upgate = x @ w1e  # [m, 2N]
+        up, gate = upgate[:, :INTER], upgate[:, INTER:]
+        act = torch.nn.functional.silu(gate) * up
+        w2e = w2_bf16[e].float().T  # [K_inter, N_hidden]
+        res[e, :m] = act @ w2e
+    return res
+
+
+# ---------------- tests ----------------
+
+
+def test_output_shape_dtype(out):
     assert tuple(out.shape) == (E, T, HIDDEN), out.shape
     assert out.dtype == torch.bfloat16
 
-    # ---- bf16 reference (per expert, up|gate order of w1) ----
-    def ref_forward():
-        res = torch.zeros(E, T, HIDDEN, dtype=torch.float32)
-        x_all = expert_x.float().cpu()
-        for e in range(E):
-            m = int(masked_m[e].item())
-            if m == 0:
-                continue
-            x = x_all[e, :m]  # [m, K]
-            w1e = w1_bf16[e].float().T  # [K, 2N]
-            upgate = x @ w1e  # [m, 2N]
-            up, gate = upgate[:, :INTER], upgate[:, INTER:]
-            act = torch.nn.functional.silu(gate) * up
-            w2e = w2_bf16[e].float().T  # [K_inter, N_hidden]
-            res[e, :m] = act @ w2e
-        return res
 
-    ref = ref_forward()
-
-    def cos_sim(a, b):
-        a, b = a.float().cpu().flatten(), b.float().cpu().flatten()
-        return (a @ b / (a.norm() * b.norm())).item()
-
+def test_numeric_vs_bf16_reference(out, ref, masked_m):
     # compare only valid rows
     valid_rows = []
     for e in range(E):
@@ -140,15 +146,9 @@ def main():
         dim=0,
     )
     cs = cos_sim(valid, ref_valid)
-    max_err = (valid - ref_valid).abs().max().item()
-    print(f"MoE executor plan B: cos_sim={cs:.6f}, max_abs_err={max_err:.6f}")
+    print(f"MoE executor plan B: cos_sim={cs:.6f}")
     assert cs > 0.99, cs
 
-    # empty-expert rows must be zero
+
+def test_empty_expert_rows_zero(out):
     assert (out[1] == 0).all(), "expert with 0 tokens should stay zero"
-
-    print("MOE EXECUTOR TEST PASSED")
-
-
-if __name__ == "__main__":
-    sys.exit(main())

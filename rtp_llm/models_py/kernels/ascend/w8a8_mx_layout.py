@@ -1,12 +1,8 @@
-"""W8A8_MXFP8 (E8M0 scale) layout helpers and shared constants for Ascend NPU.
+"""W8A8_MXFP8 (E8M0 scale) layout helpers for Ascend NPU.
 
-This module MUST NOT import ``torch_npu`` at top level: it is imported lazily
-from shared modules (e.g. ``model_loader/per_block_fp8_quant_weight.py``)
-that are unconditionally imported on every platform. ``get_e8m0_dtype``
-resolves the dtype lazily at call time (callers are NPU-only modules).
-
-Reference: vllm-ascend ``quantization/methods/w8a8_mxfp8.py``
-``process_weights_after_loading``:
+MUST NOT import torch_npu at top level (imported from shared modules that
+load on every platform); get_e8m0_dtype resolves torch_npu lazily at call time.
+Reference: vllm-ascend w8a8_mxfp8.py process_weights_after_loading:
   2D dense: [N, kp]    -> [kp_pad // 2, N, 2]
   3D MoE:   [E, N, kp] -> [E, kp_pad // 2, N, 2]
 """
@@ -36,19 +32,17 @@ def get_e8m0_dtype():
 def swizzle_scale_to_npu_layout(scale: torch.Tensor) -> torch.Tensor:
     """Swizzle E8M0 scales into the pair-split layout required by npu_quant_matmul.
 
-    Executed in ``PerBlockFp8Weight._postprocess`` (i.e. AFTER the TP split),
-    because the pair-split layout spans the whole K-group dimension and an
-    earlier swizzle would be broken by the split.
+    Must run AFTER the TP split (pair-split spans the whole K-group dim, an
+    earlier swizzle would be broken by the split).
 
     Args:
-        scale: E8M0 scales stored as uint8.
-            2D dense: ``[N, kp]``; 3D MoE: ``[E, N, kp]`` where ``kp = K // 32``.
+        scale: uint8 E8M0 scales, 2D ``[N, kp]`` or 3D MoE ``[E, N, kp]``,
+            where ``kp = K // 32``.
 
     Returns:
-        2D: ``[kp_pad // 2, N, 2]``; 3D: ``[E, kp_pad // 2, N, 2]``.
-        ``kp`` is zero-padded to even when odd (the padded pair column belongs
-        to no weight group and never participates in numerics).
-        Only memory layout is permuted; E8M0 values are unchanged.
+        2D ``[kp_pad // 2, N, 2]`` or 3D ``[E, kp_pad // 2, N, 2]``; odd ``kp``
+        is zero-padded to even (the pad column belongs to no weight group).
+        Layout permutation only; E8M0 values unchanged.
     """
     if scale.dim() == 2:
         n, kp = scale.shape

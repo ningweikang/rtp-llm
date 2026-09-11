@@ -1,19 +1,11 @@
-"""Ascend NPU W8A8_MXFP8 Linear implementation (W8A8_MXFP8: Weight & Activation FP8 Quantization).
+"""Ascend NPU W8A8_MXFP8 Linear (flow aligned with vllm-ascend w8a8_mxfp8.py).
 
-This module is only imported when ``get_device_type() == DeviceType.Ascend``
-(see ``factory/linear/__init__.py`` device branch), so a top-level
-``import torch_npu`` is allowed here.
+Flow: ``npu_dynamic_mx_quant`` (activation, 1x32 groups along K) → ``npu_quant_matmul``.
 
-Flow (aligned with vllm-ascend ``quantization/methods/w8a8_mxfp8.py``):
-  1. ``torch_npu.npu_dynamic_mx_quant(input)`` — online dynamic MX quantization
-     of the activation (1x32 groups along K, E8M0 scale as uint8 [M, K//32]).
-  2. ``torch_npu.npu_quant_matmul(x_fp8, weight, weight_scale, ...)`` — the
-     W8A8_MXFP8 GEMM.
-
-Weight layouts after ``PerBlockFp8Weight._postprocess`` (NPU branch):
-  * ``weight``: fp8_e4m3fn ``[K, N]`` (real transpose, npu_quant_matmul expects it)
-  * ``weight_scales``: uint8 (E8M0) ``[kp // 2, N, 2]`` swizzled pair-split
-    layout with ``kp = K // 32``.
+Weight layouts (after ``PerBlockFp8Weight._postprocess``, NPU branch):
+  * ``weight``: fp8_e4m3fn ``[K, N]``
+  * ``weight_scales``: uint8 (E8M0) ``[kp // 2, N, 2]`` swizzled pair-split,
+    ``kp = K // 32``.
 """
 
 from typing import Optional
@@ -85,10 +77,9 @@ class AscendW8A8MXFP8Linear(LinearBase):
             output_dtype = input.dtype
         elif input.dtype == torch.float8_e4m3fn:
             x_fp8 = input
-            # E8M0 encodes pure exponents (bias=127): 1.0 == 2^0 == 0x7F.
-            # torch.ones would produce 0x01 == 2^-126 (~1e-38 scale error).
-            # NOTE: on torch_npu 2.9.0.post3 npu_dynamic_mx_quant returns the
-            # scale as [M, kp//2, 2] (pair-split 3D), so build the same layout.
+            # Unity scale: E8M0 0x7F == 2^0 == 1.0 (torch.ones would be
+            # 0x01 == 2^-126). npu_dynamic_mx_quant on torch_npu 2.9.0.post3
+            # returns [M, kp//2, 2] (pair-split 3D), so build the same layout.
             pertoken_scale = torch.full(
                 (input.shape[0], input.shape[1] // MXFP8_GROUP_SIZE // 2, 2),
                 0x7F,

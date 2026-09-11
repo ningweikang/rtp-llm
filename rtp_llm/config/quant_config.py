@@ -131,8 +131,6 @@ class QuantizationConfig(ABC):
                 }
             )
 
-        # W8A8_MXFP8: ModelSlim pre-quantized checkpoint detection (Ascend only,
-        # so CUDA/ROCm detection logic below is untouched).
         if is_ascend():
             w8a8_mxfp8_desc_path = os.path.join(
                 ckpt_path, "quant_model_description.json"

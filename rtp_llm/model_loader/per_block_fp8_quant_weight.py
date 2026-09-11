@@ -748,19 +748,15 @@ class PerBlockFp8Weight(CompositeWeight, QuantWeight):
         processed_res = super()._postprocess(tensor, device, load_config)
         kernel_weight = processed_res[self.kernel.name]
 
-        # W8A8_MXFP8 (Ascend): the CUDA branch below is DeepGEMM-specific —
-        # reshape(shape[-1], -1) is a column-major memory reinterpretation and
-        # requant_weight_ue8m0 is a Blackwell UE8M0 numeric requant. Neither is
-        # valid on NPU, so execute a real transpose + E8M0 scale swizzle instead
-        # (aligned with vllm-ascend w8a8_mxfp8.py process_weights_after_loading).
-        # This branch runs after the TP split (swizzle must not precede it).
+        # Ascend (W8A8_MXFP8): real transpose + E8M0 scale swizzle for
+        # npu_quant_matmul, aligned with vllm-ascend w8a8_mxfp8.py. Must run
+        # after the TP split (swizzle spans the whole K-group dim).
         if is_ascend():
             from rtp_llm.models_py.kernels.ascend.w8a8_mx_layout import (
                 swizzle_scale_to_npu_layout,
             )
 
-            # real transpose (data movement), not a memory reinterpretation:
-            #   2D dense: [N, K] -> [K, N];  3D MoE: [E, N, K] -> [E, K, N]
+            # 2D dense: [N, K] -> [K, N];  3D MoE: [E, N, K] -> [E, K, N]
             if kernel_weight.dim() == 2:
                 kernel_weight = kernel_weight.transpose(0, 1).contiguous()
             else:
@@ -770,8 +766,6 @@ class PerBlockFp8Weight(CompositeWeight, QuantWeight):
             if self.scale is not None:
                 scale_weight = processed_res[self.scale.name]
                 # [N, kp] -> [kp//2, N, 2]; [E, N, kp] -> [E, kp//2, N, 2]
-                # (odd kp zero-padded inside mx_layout). NPU natively outputs
-                # E8M0 values, so requant_weight_ue8m0 is skipped.
                 scale_weight = swizzle_scale_to_npu_layout(scale_weight)
                 kernel_weight = (
                     load_config.exported_device.maybe_rewrite_weight_by_key(
