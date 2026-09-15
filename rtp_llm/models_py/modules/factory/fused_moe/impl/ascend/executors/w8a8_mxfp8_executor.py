@@ -10,20 +10,15 @@ Weight layouts after ``PerBlockFp8Weight._postprocess`` (NPU branch):
   * ``moe_s1``: uint8 (E8M0) ``[E, kp1, 2N, 2]`` swizzled pair-split layout
   * ``moe_s2``: uint8 (E8M0) ``[E, kp2, N_hidden, 2]``
 
-Execution paths:
-  * Plan B (default, fully controlled semantics): grouped GEMM1 ->
-    silu*mul -> npu_dynamic_mx_quant -> grouped GEMM2. Numerically verified
-    against a per-expert bf16 reference on Ascend950PR (cos_sim ~0.997).
-  * Plan A (opt-in via RTP_LLM_ASCEND_W8A8_MXFP8_MOE_FUSED=1, requires the fused op):
-    npu_grouped_matmul_swiglu_quant_v2 (GEMM1 + SwiGLU + MX quant fused).
-    NOTE: smoke-tested on CANN 9.2.0 — the op runs but its exact semantics
-    (weight half order / dequant-quant modes) did not match either silu(gate)*up
-    or silu(up)*gate references (cos_sim 0.88/0.73), so it stays disabled until
-    validated against the CANN op spec. Plan A assumes a gate|up weight order,
-    so the up|gate halves of w1 (and its scale) are swapped once at init.
+Execution path (fully controlled semantics): grouped GEMM1 -> silu*mul ->
+npu_dynamic_mx_quant -> grouped GEMM2. Numerically verified against a
+per-expert bf16 reference on Ascend950PR (cos_sim ~0.997).
+
+NOTE: the fused ``npu_grouped_matmul_swiglu_quant_v2`` path was evaluated
+(semantics mismatch, cos_sim 0.88/0.73 vs both half-order references) and
+removed; re-introduce only after validation against the CANN op spec.
 """
 
-import os
 from typing import Any, Dict, Optional
 
 import torch
@@ -83,18 +78,6 @@ class AscendW8A8MXFP8Executor(FusedMoeExpertExecutor):
             raise ValueError(
                 "AscendW8A8MXFP8Executor requires moe_s1/moe_s2 scales (W8A8_MXFP8)"
             )
-        self._use_fused = (
-            hasattr(torch_npu, "npu_grouped_matmul_swiglu_quant_v2")
-            and os.environ.get("RTP_LLM_ASCEND_W8A8_MXFP8_MOE_FUSED", "0") == "1"
-        )
-        if self._use_fused:
-            # Swap up|gate halves to the gate|up order expected by the fused
-            # swiglu op (kernel along dim 1, scale along dim 2).
-            n = self._w1.shape[-1] // 2
-            self._w1 = torch.cat([self._w1[..., n:], self._w1[..., :n]], dim=-1)
-            self._w1_scale = torch.cat(
-                [self._w1_scale[:, :, n:, :], self._w1_scale[:, :, :n, :]], dim=2
-            ).contiguous()
 
     def execute(
         self,
@@ -130,11 +113,7 @@ class AscendW8A8MXFP8Executor(FusedMoeExpertExecutor):
         x_fp8, x_scale = torch_npu.npu_dynamic_mx_quant(
             x_grouped, dst_type=torch.float8_e4m3fn
         )
-
-        if self._use_fused:
-            down_output = self._fused_grouped_ffn(x_fp8, x_scale, group_list)
-        else:
-            down_output = self._stepwise_grouped_ffn(x_fp8, x_scale, group_list)
+        down_output = self._stepwise_grouped_ffn(x_fp8, x_scale, group_list)
 
         # Scatter back to the batched [E, T, hidden] layout.
         out = torch.zeros(
@@ -148,7 +127,7 @@ class AscendW8A8MXFP8Executor(FusedMoeExpertExecutor):
     def _stepwise_grouped_ffn(
         self, x_fp8: torch.Tensor, x_scale: torch.Tensor, group_list: torch.Tensor
     ) -> torch.Tensor:
-        """Plan B: GEMM1 -> silu*mul -> MX quant -> GEMM2."""
+        """GEMM1 -> silu*mul -> MX quant -> GEMM2."""
         upgate = _first(
             torch_npu.npu_grouped_matmul(
                 x=[x_fp8],
@@ -170,45 +149,6 @@ class AscendW8A8MXFP8Executor(FusedMoeExpertExecutor):
         act_fp8, act_scale = torch_npu.npu_dynamic_mx_quant(
             act, dst_type=torch.float8_e4m3fn
         )
-        return _first(
-            torch_npu.npu_grouped_matmul(
-                x=[act_fp8],
-                weight=[self._w2],
-                scale=[self._w2_scale],
-                per_token_scale=[act_scale],
-                split_item=2,
-                group_type=0,
-                group_list=group_list,
-                group_list_type=0,
-                output_dtype=torch.bfloat16,
-                scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-                per_token_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-            )
-        )
-
-    def _fused_grouped_ffn(
-        self, x_fp8: torch.Tensor, x_scale: torch.Tensor, group_list: torch.Tensor
-    ) -> torch.Tensor:
-        """Plan A: fused grouped GEMM + SwiGLU + MX quant, then grouped GEMM2."""
-        act_fp8, act_scale = torch_npu.npu_grouped_matmul_swiglu_quant_v2(
-            x=x_fp8,
-            weight=[self._w1],
-            group_list=group_list,
-            weight_scale=[self._w1_scale],
-            x_scale=x_scale,
-            dequant_mode=2,
-            quant_mode=2,
-            dequant_dtype=torch.float32,
-            quant_dtype=torch.float8_e4m3fn,
-            weight_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-            x_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-        )
-        # Normalize the per-token scale to the pair-split layout [M, kp//2, 2]
-        # (same as vllm-ascend A5DeviceAdaptor.maybe_normalize_mxfp_scale_layout).
-        if act_scale.dim() == 2 and act_scale.shape[-1] % 2 == 0:
-            act_scale = act_scale.reshape(
-                act_scale.shape[0], act_scale.shape[-1] // 2, 2
-            )
         return _first(
             torch_npu.npu_grouped_matmul(
                 x=[act_fp8],

@@ -28,8 +28,7 @@ from rtp_llm.model_loader.tensor_source import TensorSource
 from rtp_llm.model_loader.weight_module import AtomicWeight, CompositeWeight, WeightModule
 from rtp_llm.utils.model_weight import CkptWeightInfo, W
 
-# P0 verification item: confirm against a real ModelSlim export and, if needed,
-# adjust here (single point of change).
+# ModelSlim scale suffix (verified against a real ModelSlim export).
 ASCEND_W8A8_MXFP8_SCALE_SUFFIX = ".weight_scale"
 
 _FP8_DTYPES = (
@@ -37,6 +36,23 @@ _FP8_DTYPES = (
     torch.float8_e4m3fnuz,
     torch.float8_e5m2,
     torch.float8_e5m2fnuz,
+)
+
+# Weight families verified for the .T normalization (transpose-family
+# process_fun outputs [K, N]; identity-family entries in w8a8_weight_list
+# would be double-flipped). Keep in sync with test coverage.
+_VERIFIED_W8A8_MXFP8_WEIGHTS = frozenset(
+    [
+        W.attn_qkv_w,
+        W.attn_o_w,
+        W.ffn_w1,
+        W.ffn_w2,
+        W.ffn_w3,
+        W.ffn_w13,
+        W.moe_w1,
+        W.moe_w2,
+        W.linear_attn_qkvz_w,
+    ]
 )
 
 
@@ -68,8 +84,14 @@ def _adapt_scale_align(
         and fn.keywords
         and fn.keywords.get("align_size")
     ):
+        align_size = fn.keywords["align_size"]
+        if align_size % group_size != 0:
+            raise ValueError(
+                f"kernel align_size {align_size} not divisible by group_size "
+                f"{group_size}; scale padding invariant would break"
+            )
         keywords = dict(fn.keywords)
-        keywords["align_size"] = keywords["align_size"] // group_size
+        keywords["align_size"] = align_size // group_size
         return functools.partial(fn.func, *fn.args, **keywords)
     return fn
 
@@ -123,6 +145,10 @@ class AscendW8A8MXFP8Weight(PerBlockFp8Weight):
     branch (real transpose + E8M0 swizzle), W8A8Fp8PerBlock* TP splits.
     """
 
+    # Type marker gating the NPU MXFP8 layout branch in the base
+    # _postprocess (transpose + E8M0 swizzle), instead of is_ascend().
+    _use_npu_mxfp8_layout = True
+
     @classmethod
     def support(
         cls, quant_config: QuantizationConfig, src_weight_info: WeightModule
@@ -132,6 +158,12 @@ class AscendW8A8MXFP8Weight(PerBlockFp8Weight):
         name = src_weight_info.name
         if name not in cls.w8a8_weight_list or name in [W.mla_kc, W.mla_vc]:
             return False
+        if name not in _VERIFIED_W8A8_MXFP8_WEIGHTS:
+            raise ValueError(
+                f"AscendW8A8MXFP8 does not support weight {name!r} yet "
+                "(layout normalization is only verified for transpose-family "
+                "weights)"
+            )
         # FLOAT-marked modules keep bf16 loading. Concrete names and MoE
         # expert templates are resolvable here; {i} templates are shared by
         # all layers, so partial-quant layers are decided per layer at load

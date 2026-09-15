@@ -86,11 +86,9 @@ def expert_x():
 
 @pytest.fixture(scope="module")
 def executor(weights):
-    executor = AscendW8A8MXFP8Executor(
+    return AscendW8A8MXFP8Executor(
         config=MagicMock(), quant_config=MagicMock(), weights=weights
     )
-    assert not executor._use_fused, "plan B expected by default"
-    return executor
 
 
 @pytest.fixture(scope="module")

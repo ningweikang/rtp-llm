@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 
 from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig, QuantizationConfig
-from rtp_llm.device.device_type import is_ascend
 from rtp_llm.model_loader.attn_weight import AttnAtomicWeight, MlaAttnAtomicWeight
 from rtp_llm.model_loader.ffn_weight import FfnAtomicWeight, MoeAtomicWeight
 from rtp_llm.model_loader.linear_attn_weight import (
@@ -748,10 +747,9 @@ class PerBlockFp8Weight(CompositeWeight, QuantWeight):
         processed_res = super()._postprocess(tensor, device, load_config)
         kernel_weight = processed_res[self.kernel.name]
 
-        # Ascend (W8A8_MXFP8): real transpose + E8M0 scale swizzle for
-        # npu_quant_matmul, aligned with vllm-ascend w8a8_mxfp8.py. Must run
-        # after the TP split (swizzle spans the whole K-group dim).
-        if is_ascend():
+        # Ascend W8A8_MXFP8 only (type-marked): real transpose + E8M0 scale
+        # swizzle; must run after the TP split (swizzle spans the K-group dim).
+        if getattr(self, "_use_npu_mxfp8_layout", False):
             from rtp_llm.models_py.kernels.ascend.w8a8_mx_layout import (
                 swizzle_scale_to_npu_layout,
             )
