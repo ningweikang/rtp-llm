@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CUDA/ACL Graph 捕获与重放 — 交互演示</title>
+<style>
+  :root {
+    --bg: #0d1117; --bg-soft: #161b22; --card: #1c2333; --card-border: #2d3550;
+    --accent: #4f8cff; --accent-2: #00d4aa; --warn: #ffb454; --danger: #ff6b6b;
+    --text: #e6edf3; --text-dim: #8b949e;
+    --host: #ff9f43; --device: #4f8cff; --graph: #00d4aa; --gap: #ff5d5d;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: radial-gradient(1200px 600px at 70% -10%, #1a2740 0%, var(--bg) 55%);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    min-height: 100vh; padding: 24px 16px 80px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  code { background: rgba(255,255,255,.07); padding: 1px 6px; border-radius: 4px; font-size: 12px; color: var(--accent-2); }
+
+  header { text-align: center; margin-bottom: 26px; }
+  header h1 { font-size: 28px; letter-spacing: 1px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  header .sub { color: var(--text-dim); margin-top: 8px; font-size: 14px; }
+  .tag { display: inline-block; font-size: 11px; padding: 2px 10px; border-radius: 20px;
+    background: rgba(79,140,255,.12); color: var(--accent); border: 1px solid rgba(79,140,255,.35); margin: 0 4px; }
+
+  /* ---------- Panels ---------- */
+  .panel { background: var(--card); border: 1px solid var(--card-border); border-radius: 14px; padding: 18px; margin-bottom: 26px; }
+  .panel > h2 { font-size: 16px; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+  .panel > .p-sub { font-size: 12px; color: var(--text-dim); margin-bottom: 14px; line-height: 1.6; }
+  .panel-title { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+  .panel-title h2 { font-size: 16px; }
+
+  /* ---------- Concept cards ---------- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-bottom: 26px; }
+  .card { background: var(--card); border: 1px solid var(--card-border); border-radius: 12px; padding: 14px 16px; position: relative; overflow: hidden; }
+  .card::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px; }
+  .card.c-cap::before { background: var(--graph); } .card.c-inst::before { background: var(--warn); }
+  .card.c-rep::before { background: var(--device); } .card.c-why::before { background: var(--warn); }
+  .card.c-limit::before { background: var(--danger); } .card.c-llm::before { background: var(--accent); }
+  .card h3 { font-size: 14px; margin-bottom: 7px; }
+  .card p { font-size: 12.5px; color: var(--text-dim); line-height: 1.65; }
+
+  /* ---------- Lifecycle ---------- */
+  .life-steps { display: flex; align-items: stretch; gap: 0; margin: 16px 0; flex-wrap: wrap; }
+  .step { flex: 1; min-width: 150px; background: var(--bg-soft); border: 1px solid var(--card-border);
+    border-radius: 10px; padding: 12px; text-align: center; cursor: pointer; transition: all .2s; position: relative; }
+  .step + .step { margin-left: 34px; }
+  .step::after { content: "→"; position: absolute; right: -26px; top: 50%; transform: translateY(-50%); color: var(--text-dim); font-size: 16px; }
+  .step:last-child::after { content: ""; }
+  .step .s-icon { font-size: 22px; margin-bottom: 4px; }
+  .step .s-name { font-size: 13px; font-weight: 600; }
+  .step .s-type { font-size: 10px; color: var(--text-dim); margin-top: 3px; font-family: Consolas, monospace; }
+  .step:hover { border-color: var(--accent); }
+  .step.active { border-color: var(--accent); box-shadow: 0 0 14px rgba(79,140,255,.35); background: rgba(79,140,255,.08); }
+  .step.done { border-color: var(--accent-2); }
+  .life-detail { background: var(--bg-soft); border-radius: 10px; padding: 14px 16px; font-size: 13px; color: var(--text-dim); line-height: 1.7; min-height: 76px; border-left: 3px solid var(--accent); }
+  .life-detail b { color: var(--text); }
+  .life-ctl { display: flex; gap: 8px; margin-top: 12px; }
+
+  /* ---------- buttons ---------- */
+  .ctl { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--card-border);
+    background: var(--bg-soft); color: var(--text); font-size: 13px; cursor: pointer; transition: all .15s; }
+  .ctl:hover { border-color: var(--accent); }
+  .ctl.primary { background: var(--accent); border-color: transparent; color: #fff; }
+  .ctl:disabled { opacity: .4; cursor: not-allowed; }
+  .modes { display: flex; gap: 8px; flex-wrap: wrap; }
+  .mode-btn { padding: 7px 14px; border-radius: 8px; border: 1px solid var(--card-border);
+    background: var(--bg-soft); color: var(--text-dim); font-size: 13px; cursor: pointer; transition: all .15s; }
+  .mode-btn:hover { color: var(--text); border-color: var(--accent); }
+  .mode-btn.active { background: linear-gradient(135deg, var(--accent), #3b6fd4); color: #fff; border-color: transparent; }
+  .mode-desc { font-size: 13px; color: var(--text-dim); background: var(--bg-soft);
+    border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; border-left: 3px solid var(--accent); line-height: 1.6; }
+
+  /* ---------- Timeline ---------- */
+  .timeline { background: var(--bg-soft); border-radius: 10px; padding: 14px; position: relative; overflow-x: auto; }
+  .lane { position: relative; height: 56px; margin-bottom: 10px; border-radius: 8px; background: rgba(255,255,255,.02); }
+  .lane:last-child { margin-bottom: 0; }
+  .lane .lane-label { position: absolute; left: 8px; top: 50%; transform: translateY(-50%);
+    font-size: 11px; color: var(--text-dim); width: 52px; z-index: 5; display: flex; align-items: center; gap: 4px; }
+  .lane .lane-label .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .lane-h .lane-label .dot { background: var(--host); }
+  .lane-d .lane-label .dot { background: var(--device); }
+  .lane .axis { position: absolute; left: 0; right: 0; bottom: 0; border-top: 1px dashed rgba(255,255,255,.08); }
+  .tick { position: absolute; bottom: 4px; font-size: 9px; color: rgba(139,148,158,.5); transform: translateX(-50%); }
+  .blk { position: absolute; top: 50%; transform: translateY(-50%); height: 24px; border-radius: 5px;
+    font-size: 10px; color: #fff; display: flex; align-items: center; justify-content: center;
+    white-space: nowrap; overflow: hidden; text-shadow: 0 1px 2px rgba(0,0,0,.4); }
+  .blk.h { background: linear-gradient(180deg, #ffb054, var(--host)); }
+  .blk.d { background: linear-gradient(180deg, #6ea1ff, var(--device)); }
+  .blk.gap { background: repeating-linear-gradient(135deg, rgba(255,93,93,.35) 0 4px, rgba(255,93,93,.15) 4px 8px); color: rgba(255,255,255,.65); font-size: 9px; }
+  .blk.cursor { background: linear-gradient(90deg, transparent, rgba(255,255,255,.18), transparent);
+    width: 2px !important; height: 42px; border-radius: 0; }
+  .blk.done { opacity: .5; }
+  .blk.running { box-shadow: 0 0 12px rgba(79,140,255,.6); }
+  .graph-box { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); width: 108px; height: 32px;
+    border: 1px dashed rgba(0,212,170,.5); border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    font-size: 11px; color: var(--graph); background: rgba(0,212,170,.06); opacity: 0; transition: opacity .3s; z-index: 6; }
+  .graph-box.show { opacity: 1; }
+  .graph-box.ready { border-style: solid; background: rgba(0,212,170,.14); font-weight: 600; }
+  .util-note { font-size: 11px; color: var(--text-dim); margin-top: 8px; text-align: center; }
+  .util-note b { color: var(--accent-2); }
+
+  /* ---------- Stats ---------- */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 14px; }
+  .stat { background: var(--bg-soft); border-radius: 10px; padding: 12px 14px; text-align: center; }
+  .stat .num { font-size: 21px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .num.ok { color: var(--accent-2); } .stat .num.warn { color: var(--warn); } .stat .num.bad { color: var(--danger); }
+  .stat .lbl { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+
+  /* ---------- Memory binding demo ---------- */
+  .mem-wrap { background: var(--bg-soft); border-radius: 10px; padding: 16px; }
+  .mem-row { display: flex; gap: 12px; align-items: stretch; flex-wrap: wrap; }
+  .mem-side { flex: 1; min-width: 280px; }
+  .mem-title { font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }
+  .mem-bank { position: relative; height: 64px; background: rgba(255,255,255,.03); border: 1px solid var(--card-border);
+    border-radius: 8px; overflow: hidden; }
+  .mem-block { position: absolute; top: 6px; bottom: 6px; border-radius: 5px; display: flex; align-items: center;
+    justify-content: center; font-size: 10px; color: #fff; transition: all .4s; font-family: Consolas, monospace; }
+  .mem-block.q { background: linear-gradient(180deg, #6ea1ff, var(--device)); }
+  .mem-block.stale { background: repeating-linear-gradient(135deg, rgba(255,93,93,.4) 0 5px, rgba(255,93,93,.15) 5px 10px); }
+  .mem-node { position: relative; height: 74px; background: rgba(0,212,170,.04); border: 1px solid rgba(0,212,170,.3);
+    border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; }
+  .mem-node .arrow { position: absolute; font-size: 18px; color: var(--accent-2); }
+  .mem-node .arrow.bad { color: var(--danger); }
+  .mem-status { margin-top: 12px; padding: 10px 14px; border-radius: 8px; font-size: 13px; line-height: 1.7; }
+  .mem-status.ok { background: rgba(0,212,170,.08); border: 1px solid rgba(0,212,170,.3); color: var(--accent-2); }
+  .mem-status.bad { background: rgba(255,93,93,.08); border: 1px solid rgba(255,93,93,.35); color: var(--danger); }
+  .mem-status b { color: var(--text); }
+  .addr-chip { font-family: Consolas, monospace; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: rgba(255,255,255,.08); }
+
+  /* ---------- Pool demo ---------- */
+  .pool-zone { display: flex; gap: 14px; flex-wrap: wrap; }
+  .pool-buckets { flex: 1.4; min-width: 300px; }
+  .bucket { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px;
+    background: var(--bg-soft); border: 1px solid var(--card-border); margin-bottom: 8px; transition: all .2s; }
+  .bucket .b-name { font-family: Consolas, monospace; font-size: 12px; width: 62px; color: var(--accent-2); }
+  .bucket .b-slots { display: flex; gap: 4px; flex: 1; }
+  .bucket .slot { width: 22px; height: 18px; border-radius: 3px; background: rgba(79,140,255,.15); border: 1px solid rgba(79,140,255,.3); }
+  .bucket .slot.used { background: linear-gradient(180deg, #6ea1ff, var(--device)); }
+  .bucket .slot.pad { background: repeating-linear-gradient(135deg, rgba(255,180,84,.4) 0 4px, rgba(255,180,84,.15) 4px 8px); border-color: rgba(255,180,84,.4); }
+  .bucket.active { border-color: var(--accent); box-shadow: 0 0 10px rgba(79,140,255,.3); }
+  .bucket.pool-disabled { opacity: .45; }
+  .pool-ctrl { flex: 1; min-width: 260px; }
+  .pool-ctrl .slider-row { margin-bottom: 16px; }
+  .pool-ctrl label { font-size: 12px; color: var(--text-dim); display: block; margin-bottom: 6px; }
+  .pool-ctrl input[type=range] { width: 100%; accent-color: var(--accent); }
+  .pool-result { background: var(--bg-soft); border-radius: 8px; padding: 10px 12px; font-size: 12.5px; line-height: 1.8; }
+  .pool-result b { color: var(--accent); }
+  .pool-result .hl { color: var(--warn); }
+
+  /* ---------- Update demo ---------- */
+  .update-zone { background: var(--bg-soft); border-radius: 10px; padding: 14px; }
+  .update-zone .g-tag { font-family: Consolas, monospace; font-size: 11px; color: var(--graph); margin-bottom: 10px; }
+  .ctx-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+  .ctx-row .ctx-label { font-size: 12px; color: var(--text-dim); width: 130px; }
+  .ctx-row .ctx-box { display: flex; gap: 5px; flex: 1; flex-wrap: wrap; }
+  .ctx { width: 40px; height: 26px; border-radius: 5px; background: rgba(79,140,255,.15); border: 1px solid rgba(79,140,255,.35);
+    display: flex; align-items: center; justify-content: center; font-size: 11px; font-family: Consolas, monospace; transition: all .3s; }
+  .ctx.new { background: rgba(0,212,170,.2); border-color: var(--accent-2); color: var(--accent-2); transform: scale(1.1); }
+  .update-arrow { text-align: center; font-size: 14px; color: var(--warn); margin: 6px 0; }
+  .update-note { font-size: 12px; color: var(--text-dim); margin-top: 10px; line-height: 1.7; }
+  .update-note .ok { color: var(--accent-2); } .update-note .no { color: var(--danger); }
+
+  /* ---------- Bars ---------- */
+  .bars { display: flex; align-items: flex-end; gap: 34px; justify-content: center; padding: 14px 0 0; height: 200px; }
+  .bar-col { display: flex; flex-direction: column; align-items: center; width: 110px; }
+  .bar-col .val { font-size: 12px; font-weight: 700; margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+  .bar { width: 62px; border-radius: 6px 6px 0 0; transition: height .6s cubic-bezier(.2,.8,.2,1); position: relative; }
+  .bar .chip { position: absolute; top: -18px; left: 50%; transform: translateX(-50%);
+    font-size: 9px; padding: 1px 6px; border-radius: 10px; white-space: nowrap; opacity: 0; transition: opacity .4s; }
+  .bar:hover .chip { opacity: 1; }
+  .bar.e { background: linear-gradient(180deg, #ffb054, #d97706); } .bar.e .chip { background: rgba(255,159,67,.15); color: var(--host); }
+  .bar.c { background: linear-gradient(180deg, #2df0c6, #0d9c7c); } .bar.c .chip { background: rgba(0,212,170,.15); color: var(--graph); }
+  .bar.r { background: linear-gradient(180deg, #6ea1ff, #2f5fd0); } .bar.r .chip { background: rgba(79,140,255,.15); color: var(--device); }
+  .bar-col .name { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
+  .bar-col .name .env { font-size: 10px; opacity: .7; display: block; }
+
+  /* ---------- Profiler ---------- */
+  .prof-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .prof { background: var(--bg-soft); border-radius: 10px; padding: 14px; }
+  .prof h4 { font-size: 13px; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  .prof .ph { font-size: 10px; color: var(--text-dim); font-weight: 400; margin-left: auto; }
+  .prof-track { position: relative; height: 60px; background: rgba(255,255,255,.02); border-radius: 6px; margin-bottom: 8px; }
+  .prof-track .seg { position: absolute; top: 8px; bottom: 8px; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 9px; color: #fff; }
+  .prof-track .seg.h { background: linear-gradient(180deg, #ffb054, var(--host)); }
+  .prof-track .seg.d { background: linear-gradient(180deg, #6ea1ff, var(--device)); }
+  .prof-track .seg.gap { background: repeating-linear-gradient(135deg, rgba(255,93,93,.3) 0 4px, rgba(255,93,93,.12) 4px 8px); }
+  .prof .marks { display: flex; gap: 6px; font-size: 11px; flex-wrap: wrap; }
+  .prof .marks span { padding: 3px 9px; border-radius: 12px; background: rgba(255,255,255,.05); color: var(--text-dim); }
+  .prof .marks span.good { background: rgba(0,212,170,.1); color: var(--accent-2); }
+  .prof .marks span.bad { background: rgba(255,93,93,.1); color: var(--danger); }
+
+  /* ---------- Quiz ---------- */
+  .quiz .q { background: var(--bg-soft); border: 1px solid var(--card-border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+  .quiz .q button { width: 100%; text-align: left; padding: 13px 16px; background: none; border: none; cursor: pointer;
+    color: var(--text); font-size: 13.5px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .quiz .q .qnum { color: var(--accent); font-weight: 700; margin-right: 8px; }
+  .quiz .q .arrow { color: var(--text-dim); transition: transform .2s; }
+  .quiz .q.open .arrow { transform: rotate(90deg); }
+  .quiz .q .ans { display: none; padding: 0 16px 14px; font-size: 13px; color: var(--text-dim); line-height: 1.75; }
+  .quiz .q.open .ans { display: block; }
+  .quiz .q .ans b { color: var(--accent-2); }
+
+  footer { text-align: center; color: var(--text-dim); font-size: 12px; margin-top: 36px; line-height: 1.8; }
+  .note { font-size: 11px; color: rgba(139,148,158,.6); text-align: center; margin-top: 10px; }
+
+  @media (max-width: 700px) { .step + .step { margin-left: 0; margin-top: 8px; } .step::after { content: "↓"; right: auto; top: auto; bottom: -22px; left: 50%; transform: translateX(-50%); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>⚡ 图执行：捕获（Capture）→ 实例化（Instantiate）→ 重放（Replay）</h1>
+    <div class="sub">
+      <span class="tag">CUDA Graph</span><span class="tag">ACL Graph (昇腾)</span>
+      <span class="tag">一次录制 · 多次播放</span><span class="tag">RTP-LLM decode 图模式</span>
+    </div>
+  </header>
+
+  <!-- ═══════════ 1. 概念卡片 ═══════════ -->
+  <section class="cards">
+    <div class="card c-cap"><h3>① 捕获 Capture</h3>
+      <p>Host 把固定算子序列逐个下发并"录制"。绑定的是 <b>kernel 顺序、依赖、参数和内存指针</b>，产出 <code>cudaGraph_t</code>（图描述）。</p></div>
+    <div class="card c-inst"><h3>② 实例化 Instantiate</h3>
+      <p><code>cudaGraphInstantiate</code> 把图描述编译为 <code>cudaGraphExec_t</code>（<b>优化后可执行图</b>）。真正执行的是 Exec 版本。</p></div>
+    <div class="card c-rep"><h3>③ 重放 Replay</h3>
+      <p>之后每次只需一次 <code>cudaGraphLaunch(exec, stream)</code>，GPU 上算子排队连续执行，<b>CPU 不再逐个提交 kernel</b>。</p></div>
+    <div class="card c-why"><h3>④ 为什么快</h3>
+      <p>1000 个 kernel：传统 = <b>1000 次 CPU 调度</b>；Graph = <b>1 次 Graph Launch</b>。减少 Python 调度、dispatcher、runtime launch、driver 交互。</p></div>
+    <div class="card c-limit"><h3>⑤ 核心限制</h3>
+      <p>执行路径固定、<b>memory address 固定</b>（Graph 绑定指针而非 tensor 名）、layout 固定。动态量需特殊处理。</p></div>
+    <div class="card c-llm"><h3>⑥ 与 LLM 结合</h3>
+      <p>decode 每 token 的 Attention→MLP→AllReduce 序列固定，<b>每个 token 一次 Graph Replay</b>。vLLM/TensorRT-LLM 维护 <b>Graph Pool</b>（按 batch 分桶）。</p></div>
+  </section>
+
+  <!-- ═══════════ 2. 生命周期 ═══════════ -->
+  <section class="panel">
+    <h2>🔁 CUDA Graph 生命周期</h2>
+    <div class="p-sub">完整链路：<b>Stream Capture → cudaGraph_t（描述）→ Instantiate → cudaGraphExec_t（可执行）→ Replay</b>。点击任意节点查看说明，或「自动走一遍」。</div>
+    <div class="life-steps" id="lifeSteps">
+      <div class="step" data-s="0"><div class="s-icon">🎬</div><div class="s-name">Stream Capture</div><div class="s-type">cudaStreamBeginCapture</div></div>
+      <div class="step" data-s="1"><div class="s-icon">📄</div><div class="s-name">cudaGraph_t</div><div class="s-type">图结构描述</div></div>
+      <div class="step" data-s="2"><div class="s-icon">⚙️</div><div class="s-name">Instantiate</div><div class="s-type">cudaGraphInstantiate</div></div>
+      <div class="step" data-s="3"><div class="s-icon">🚀</div><div class="s-name">cudaGraphExec_t</div><div class="s-type">优化后可执行图</div></div>
+      <div class="step" data-s="4"><div class="s-icon">▶️</div><div class="s-name">Replay</div><div class="s-type">cudaGraphLaunch</div></div>
+    </div>
+    <div class="life-detail" id="lifeDetail"></div>
+    <div class="life-ctl">
+      <button class="ctl primary" id="btnLifeAuto">▶ 自动走一遍</button>
+      <button class="ctl" id="btnLifeReset">↺ 重置</button>
+    </div>
+  </section>
+
+  <!-- ═══════════ 3. 时间轴演示 ═══════════ -->
+  <section class="panel">
+    <div class="panel-title">
+      <h2>⏱ 三种执行模式时间轴（8 个算子，短 kernel 场景）</h2>
+    </div>
+    <div class="panel-title" style="margin-top:-6px">
+      <div class="modes" id="modes">
+        <button class="mode-btn" data-mode="eager">逐算子下发 Eager</button>
+        <button class="mode-btn" data-mode="capture">捕获 Capture</button>
+        <button class="mode-btn active" data-mode="replay">重放 Replay</button>
+      </div>
+      <div class="controls">
+        <button class="ctl primary" id="btnPlay">▶ 播放</button>
+        <button class="ctl" id="btnStep">⏭ 步进</button>
+        <button class="ctl" id="btnReset">↺ 重置</button>
+        <button class="ctl" id="btnSlow" title="切换速度">🐢/🐇</button>
+      </div>
+    </div>
+    <div class="mode-desc" id="modeDesc"></div>
+    <div class="timeline" id="timeline">
+      <div class="lane lane-h"><div class="lane-label"><span class="dot"></span>Host CPU</div><div class="axis"></div></div>
+      <div class="lane lane-d"><div class="lane-label"><span class="dot"></span>Device GPU</div><div class="axis"></div>
+        <div class="graph-box" id="graphBox">图录制中…</div></div>
+    </div>
+    <div class="util-note" id="utilNote"></div>
+    <div class="stats">
+      <div class="stat"><div class="num" id="sHost">0</div><div class="lbl">Host 调度调用数</div></div>
+      <div class="stat"><div class="num" id="sOps">0 / 8</div><div class="lbl">已执行算子</div></div>
+      <div class="stat"><div class="num warn" id="sTotal">0</div><div class="lbl">总耗时（逻辑单位）</div></div>
+      <div class="stat"><div class="num" id="sUtil">—</div><div class="lbl">GPU 利用率</div></div>
+    </div>
+  </section>
+
+  <!-- ═══════════ 4. 内存地址绑定 ═══════════ -->
+  <section class="panel">
+    <h2>🎯 内存地址绑定（Graph 绑定指针，不绑定 tensor 名）</h2>
+    <div class="p-sub">Graph 记录的是捕获时的 <b>pointer</b>。Replay 时若 tensor 地址漂移，图仍访问旧地址 → 错误。点击按钮切换场景。</div>
+    <div class="mem-wrap">
+      <div class="mem-row">
+        <div class="mem-side">
+          <div class="mem-title">捕获时的内存布局（Q tensor 在 <span class="addr-chip" id="addrCap">0x100000</span>）</div>
+          <div class="mem-bank">
+            <div class="mem-block q" id="memCap" style="left:10%;width:18%">Q</div>
+            <div class="mem-block" style="left:34%;width:14%;opacity:.5;background:linear-gradient(180deg,#5a6577,#3c4453)">K</div>
+            <div class="mem-block" style="left:54%;width:14%;opacity:.5;background:linear-gradient(180deg,#5a6577,#3c4453)">V</div>
+          </div>
+          <div class="mem-title" style="margin-top:10px">Replay 时</div>
+          <div class="mem-bank">
+            <div class="mem-block q" id="memReplay" style="left:10%;width:18%">Q</div>
+            <div class="mem-block stale" id="memStale" style="left:10%;width:18%;opacity:0">旧 Q?</div>
+          </div>
+        </div>
+        <div class="mem-side">
+          <div class="mem-title">图内的 Attention 节点</div>
+          <div class="mem-node">
+            <div style="text-align:center">Attention<br><span style="font-size:11px;color:var(--text-dim)">输入指针: <span class="addr-chip" id="nodeAddr">0x100000</span></span></div>
+            <div class="arrow" id="nodeArrow" style="left:-2px;bottom:-20px">↓</div>
+          </div>
+          <div class="mem-status ok" id="memStatus"></div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+        <button class="ctl" id="btnAddrStable">✅ 场景A：地址稳定</button>
+        <button class="ctl" id="btnAddrDrift">⚠️ 场景B：地址漂移</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════ 5. 动态输入三方案 ═══════════ -->
+  <section class="panel">
+    <h2>🧩 动态输入怎么处理？</h2>
+    <div class="p-sub">LLM 的 batch size / seq len 是动态的，但 Graph 需要固定 shape、固定内存、固定 kernel 路径。三种常用方案如下。<br><span style="color:var(--warn)">💡 注意：Graph Pool 里多张图并不是懒加载 —— 它们在<b>服务启动时一次性全部捕获完成</b>（RTP-LLM 的 <code>initCapture()</code>），捕获顺序<b>从大到小</b>以确定内存池高水位；请求 batch 超过已捕获最大值时 fallback 到普通模式。</span></div>
+    <div class="panel-title" style="margin-bottom:10px"><h2 style="font-size:14px">方案一 · 固定 Shape + Padding</h2>
+      <span style="font-size:12px;color:var(--text-dim)">所有请求用同一张图，不足的 slot 用 padding 填充</span></div>
+    <div style="font-size:12.5px;color:var(--text-dim);background:var(--bg-soft);border-radius:8px;padding:10px 14px;margin-bottom:18px;line-height:1.8">
+      <code>batch=8, seq_len=8192</code> 固定一张图 → 任意请求都 <b>padding 到该 shape</b> 后 replay。简单但浪费算力。</div>
+
+    <div class="panel-title" style="margin-bottom:10px"><h2 style="font-size:14px">方案二 · 多 Graph Cache（Graph Pool）</h2>
+      <span style="font-size:12px;color:var(--text-dim)">按 batch size 分桶建多张图，请求按 batch 选图，不足则 padding</span></div>
+    <div class="pool-zone">
+      <div class="pool-buckets" id="poolBuckets">
+        <div class="bucket" data-b="2"><span class="b-name">Graph1</span><div class="b-slots"></div><span class="b-tag" style="font-size:10px;color:var(--text-dim)">batch ≤ 2</span></div>
+        <div class="bucket" data-b="4"><span class="b-name">Graph2</span><div class="b-slots"></div><span class="b-tag" style="font-size:10px;color:var(--text-dim)">batch ≤ 4</span></div>
+        <div class="bucket" data-b="8"><span class="b-name">Graph3</span><div class="b-slots"></div><span class="b-tag" style="font-size:10px;color:var(--text-dim)">batch ≤ 8</span></div>
+        <div class="bucket" data-b="16"><span class="b-name">Graph4</span><div class="b-slots"></div><span class="b-tag" style="font-size:10px;color:var(--text-dim)">batch ≤ 16</span></div>
+      </div>
+      <div class="pool-ctrl">
+        <div class="slider-row">
+          <label>当前请求的 batch size：<b id="poolVal" style="color:var(--accent)">5</b></label>
+          <input type="range" id="poolSlider" min="1" max="16" value="5">
+        </div>
+        <div class="pool-result" id="poolResult"></div>
+      </div>
+    </div>
+
+    <div class="panel-title" style="margin:18px 0 10px"><h2 style="font-size:14px">方案三 · Graph Update（图内参数更新）</h2>
+      <span style="font-size:12px;color:var(--text-dim)">部分参数可更新：seq_len、kernel 参数、memcpy size</span></div>
+    <div class="update-zone">
+      <div class="g-tag">┌─ cudaGraphExec_t (已实例化) ─────────────────────────┐</div>
+      <div class="ctx-row">
+        <div class="ctx-label">节点参数槽<br><span style="font-size:10px;color:var(--text-dim)">context_lens[8]</span></div>
+        <div class="ctx-box" id="ctxBefore"></div>
+      </div>
+      <div class="update-arrow">▼ &nbsp;<code>cudaGraphExecKernelNodeSetParams()</code>&nbsp; ▼</div>
+      <div class="ctx-row">
+        <div class="ctx-label">replay 前更新<br><span style="font-size:10px;color:var(--text-dim)">graph_task_update</span></div>
+        <div class="ctx-box" id="ctxAfter"></div>
+      </div>
+      <div class="g-tag">└─────────────────────────────────────────────────────┘</div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="ctl primary" id="btnUpdate">🔄 更新参数并 replay</button>
+      </div>
+      <div class="update-note" id="updateNote"></div>
+    </div>
+  </section>
+
+  <!-- ═══════════ 6. 总耗时对比 ═══════════ -->
+  <section class="panel">
+    <div class="panel-title"><h2>📊 三种方式总耗时对比（Eager = 32 / Capture = 32 / Replay = 8.5）</h2></div>
+    <div class="bars" id="bars">
+      <div class="bar-col"><div class="val" id="vE">—</div>
+        <div class="bar e" id="barE" style="height:0"><span class="chip">1000 次调度</span></div>
+        <div class="name">Eager <span class="env">每算子一次 Host 调度</span></div></div>
+      <div class="bar-col"><div class="val" id="vC">—</div>
+        <div class="bar c" id="barC" style="height:0"><span class="chip">一次性录制</span></div>
+        <div class="name">Capture <span class="env">首次，产出图</span></div></div>
+      <div class="bar-col"><div class="val" id="vR">—</div>
+        <div class="bar r" id="barR" style="height:0"><span class="chip">1 次 Launch</span></div>
+        <div class="name">Replay <span class="env">之后每次都这样</span></div></div>
+    </div>
+    <div class="note">Capture 只发生一次；服务长期运行时，Replay 的成本才是真实成本。收益 = <b>减少 CPU overhead、提高 GPU 利用率、降低小 batch 推理延迟</b>。</div>
+  </section>
+
+  <!-- ═══════════ 7. Profiler 识别 ═══════════ -->
+  <section class="panel">
+    <h2>🔍 Profiler 中如何判断 Graph 是否生效</h2>
+    <div class="p-sub">同样的 kernel 序列，两种模式在 profiler 时间线上的形态截然不同。</div>
+    <div class="prof-grid">
+      <div class="prof">
+        <h4>Eager 模式 <span class="ph">PyTorch → Runtime → Kernel</span></h4>
+        <div class="prof-track" id="profE"></div>
+        <div class="marks">
+          <span class="bad">Host Runtime 调用多</span>
+          <span class="bad">kernel 间存在间隙</span>
+          <span class="bad">CPU 调度明显</span>
+        </div>
+      </div>
+      <div class="prof">
+        <h4>Graph 模式 <span class="ph">PyTorch → Graph Execute → Nodes</span></h4>
+        <div class="prof-track" id="profG"></div>
+        <div class="marks">
+          <span class="good">Graph Launch / Replay 事件</span>
+          <span class="good">Host runtime 减少</span>
+          <span class="good">kernel 连续执行 · GPU idle 减少</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════ 8. 自检 ═══════════ -->
+  <section class="panel quiz">
+    <div class="panel-title"><h2>❓ 自检（点击展开）</h2></div>
+
+    <div class="q"><button><span><span class="qnum">Q1</span> 为什么图执行能消除 Host 调度开销？</span><span class="arrow">▶</span></button>
+      <div class="ans">Eager 下每个 kernel 都要经 <b>CPU 调度 → 设置参数 → 提交 kernel</b> 三步，且 1000 个 kernel = 1000 次调度。<br>
+      图模式把整个序列录成一张图，replay 时 CPU <b>只提交一次</b>（<code>cudaGraphLaunch</code>），GPU 按图内依赖直接执行完整 pipeline。减少的不仅是 runtime launch，还有 <b>Python 调度、PyTorch dispatcher、driver 交互</b> 整条链路。</div></div>
+
+    <div class="q"><button><span><span class="qnum">Q2</span> <code>cudaGraph_t</code> 和 <code>cudaGraphExec_t</code> 有什么区别？</span><span class="arrow">▶</span></button>
+      <div class="ans"><b>cudaGraph_t = 图结构描述</b>（记录节点、依赖、参数）；<b>cudaGraphExec_t = 优化后的可执行图</b>（经 <code>cudaGraphInstantiate</code> 编译）。<br>
+      真正执行的是 Exec 版本；描述版本可以反复修改/重新实例化。对应到昇腾侧，NPUGraph 捕获后同样要先实例化才能 replay。</div></div>
+
+    <div class="q"><button><span><span class="qnum">Q3</span> 为什么必须「固定内存地址」？地址漂移会怎样？</span><span class="arrow">▶</span></button>
+      <div class="ans">Graph 绑定的是 <b>memory address（指针）而不是 tensor 名称</b>。捕获时 Q 在 <code>0x100000</code>，图就记住 <code>0x100000</code>；replay 时即使 Q 挪到了 <code>0x900000</code>，图 <b>仍访问 0x100000</b>（旧地址的过期数据，甚至非法地址崩溃）。<br>
+      所以要求：<b>tensor storage 固定、memory allocation 固定、pointer 地址稳定</b>。这也是 RTP-LLM 用 <code>CaptureMemoryHold</code> 在捕获期保持 tensor 生命周期、并用静态缓冲池的原因。</div></div>
+
+    <div class="q"><button><span><span class="qnum">Q4</span> 动态输入有哪些处理方案？为什么 LLM 需要 Graph Pool？</span><span class="arrow">▶</span></button>
+      <div class="ans">三方案：<b>① 固定 shape</b>（所有请求 pad 到同一 shape，简单但浪费）；<b>② 多 Graph Cache / Graph Pool</b>（按 batch=1/2/4/8 各建一张图，请求按 batch 选图，不足 padding —— 上方方案二可交互操作）；<b>③ Graph Update</b>（<code>cudaGraphExecKernelNodeSetParams</code> 改参数值，但 <b>不能改 kernel 数量 / dependency / memory allocation</b>）。<br>
+      LLM 输入天然动态（batch / seq / context length / KV offset），所以 vLLM / TensorRT-LLM 维护 <b>Graph Pool</b>，按 batch size 选图执行。<br><br>
+      ⚙️ <b>实现细节：</b>Pool 里的多张图<b>在服务启动时一次性全部捕获</b>（RTP-LLM 的 <code>initCapture()</code> → <code>captureDecode()</code>），捕获顺序<b>从大到小</b>（先确定内存池高水位，小图复用同一块池）；每个 bucket 捕获后立即 <code>replayAndSyncCheck</code> 验证。启动变慢换来运行期零捕获开销；batch 超过已捕获最大值时 fallback 普通模式。</div></div>
+
+    <div class="q"><button><span><span class="qnum">Q5</span> CUDA Graph 与 ACL Graph（昇腾）是同一套东西吗？</span><span class="arrow">▶</span></button>
+      <div class="ans"><b>机制同构、实现不同</b>：都是 capture → instantiate → replay，消除 Host 调度。<br>
+      差异在设备层 API：<code>NPUGraph</code>/<code>NPUStream</code> vs <code>CUDAGraph</code>/<code>CUDAStream</code>。本仓库 <code>rtp_llm/cpp/ascend_graph/</code> 用 <code>ascend_graph_device_shims</code> 把 ACL 原语封装成与 CUDA 版一一对应的接口，Runner 逻辑几乎原样复用 —— 这就是"对标 CudaGraphRunner"的依据。</div></div>
+
+    <div class="q"><button><span><span class="qnum">Q6</span> Profiler 里怎么判断 Graph 是否生效？</span><span class="arrow">▶</span></button>
+      <div class="ans">Eager：时间线上 <b>Host Runtime 调用密集</b>、kernel 之间有 <b>间隙</b>、CPU 调度明显。<br>
+      Graph：出现 <b>Graph Launch / Replay 事件</b>、Host runtime 调用大幅减少、<b>kernel 连续执行</b>、GPU idle 减少。对照上方 Profiler 对比区查看。</div></div>
+  </section>
+
+  <footer>
+    RTP-LLM · pr-25 (ACL Graph) 学习演示 · 内容依据 GRAPH-CAPANDREP.md（CUDA Graph 原理 13 节）<br>
+    对照阅读：<code>rtp_llm/cpp/ascend_graph/ascend_graph_device_shims.h</code> · <code>rtp_llm/cpp/cuda_graph/</code>
+  </footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ═══════════ 常量与模型 ═══════════ */
+  const N = 8, L = 3, E = 1, HOST_CALL = 0.5;
+  const T_EAGER = N * (L + E), T_CAPTURE = N * (L + E), T_REPLAY = HOST_CALL + N * E;
+  const LANE_W = 820, AXIS_MAX = T_EAGER + 2;
+  const $ = id => document.getElementById(id);
+
+  /* ═══════════ 1. 生命周期 ═══════════ */
+  const LIFE = [
+    { t: "🎬 Stream Capture 捕获", d: "调用 <code>cudaStreamBeginCapture(stream)</code> 后，<b>stream 上发生的所有操作（memcpy、kernel launch）被逐一记录</b>。CUDA 不仅执行这些操作，同时把 <b>kernel 顺序、依赖关系、参数、内存指针</b> 录制为一张静态图。" },
+    { t: "📄 cudaGraph_t 图描述", d: "Capture 结束（<code>cudaStreamEndCapture(stream, &graph)</code>）产出 <b>cudaGraph_t</b>：它只是 <b>图的结构描述</b>（Node: MatMul→LayerNorm→Attention→AllReduce，以及它们之间的 dependency），还不能直接执行。" },
+    { t: "⚙️ Instantiate 实例化", d: "调用 <code>cudaGraphInstantiate()</code> 把描述编译成 <b>优化后的可执行版本</b>。这一步会做资源分配与优化（如 kernel 融合、依赖分析），是 <b>一次性的成本</b>。" },
+    { t: "🚀 cudaGraphExec_t 可执行图", d: "得到 <b>cudaGraphExec_t</b>。与 cudaGraph_t（描述）不同，Exec 是<b>真正会被执行的对象</b>，内部已绑定捕获时的内存指针。<b>地址从此被固定</b>。" },
+    { t: "▶️ Replay 重放", d: "后续每次执行只需一次 <code>cudaGraphLaunch(graphExec, stream)</code>。<b>CPU 不再逐个提交 kernel</b>，GPU 按图内拓扑连续执行整个 pipeline —— 每个 token 一次 Replay，调度开销趋近于零。" }
+  ];
+  const lifeSteps = [...document.querySelectorAll("#lifeSteps .step")];
+  const lifeDetail = $("lifeDetail");
+  let lifeIdx = -1, lifeTimer = null;
+  function showLife(i) {
+    lifeIdx = i;
+    lifeSteps.forEach((s, k) => {
+      s.classList.toggle("active", k === i);
+      s.classList.toggle("done", k < i);
+    });
+    lifeDetail.innerHTML = i < 0 ? "<b>点击上方节点</b>或点击「自动走一遍」，查看 Capture → Instantiate → Replay 的完整生命周期。" : "<b>" + LIFE[i].t + "</b>　" + LIFE[i].d;
+  }
+  lifeSteps.forEach(s => s.addEventListener("click", () => { clearInterval(lifeTimer); showLife(+s.dataset.s); }));
+  $("btnLifeReset").addEventListener("click", () => { clearInterval(lifeTimer); showLife(-1); });
+  $("btnLifeAuto").addEventListener("click", () => {
+    clearInterval(lifeTimer); showLife(0);
+    let i = 0;
+    lifeTimer = setInterval(() => { i++; if (i >= LIFE.length) { clearInterval(lifeTimer); return; } showLife(i); }, 1400);
+  });
+  showLife(-1);
+
+  /* ═══════════ 2. 时间轴演示 ═══════════ */
+  const MODE_INFO = {
+    eager:   "逐算子下发：每个 kernel 都要 <b>CPU 调度 → 设置参数 → 提交</b>。GPU 执行很短（1 单位），但 CPU 下发要 3 单位 —— <b>kernel 之间的红色斜纹就是 GPU 空等 CPU 的间隙</b>（launch 开销是瓶颈）。",
+    capture: "捕获：Host 逐算子下发并同时录制进图（右侧绿色框），<b>一次性成本</b>。捕获时输入内存地址被固定 —— 之后 replay 只能访问这些地址（见下方「地址绑定」演示）。",
+    replay:  "重放：Host 只有一次 <code>cudaGraphLaunch()</code>，GPU 上 8 个算子<b>排队连续执行、零间隙</b>。总耗时 ≈ GPU 执行时间 + 一次调用。"
+  };
+  function schedule(m) {
+    const s = [];
+    for (let i = 0; i < N; i++) {
+      if (m === "replay") s.push({ hs: null, he: null, ds: HOST_CALL + i * E, de: HOST_CALL + (i + 1) * E });
+      else { const st = i * (L + E); s.push({ hs: st, he: st + L, ds: st + L, de: st + L + E }); }
+    }
+    return s;
+  }
+  const SCHED = { eager: schedule("eager"), capture: schedule("capture"), replay: schedule("replay") };
+  const TOTAL = { eager: T_EAGER, capture: T_CAPTURE, replay: T_REPLAY };
+
+  let mode = "replay", t = 0, running = false, slow = false, rafId = null;
+  let opsDone = 0, hostCalls = 0, totalTime = 0;
+  const px = x => (x / AXIS_MAX) * LANE_W;
+
+  function render() {
+    const laneH = document.querySelector(".lane-h"), laneD = document.querySelector(".lane-d");
+    [...laneH.children].forEach(el => { if (el.classList.contains("blk")) el.remove(); });
+    [...laneD.children].forEach(el => { if (el.classList.contains("blk")) el.remove(); });
+
+    const tickCount = Math.floor(AXIS_MAX / 5) + 1;
+    [...document.querySelectorAll(".tick")].forEach(el => el.remove());
+    for (let k = 0; k <= tickCount; k++) {
+      const tk = document.createElement("div"); tk.className = "tick";
+      tk.style.left = px(k * 5) + "px"; tk.textContent = k * 5; laneH.appendChild(tk);
+    }
+    const cur = document.createElement("div"); cur.className = "blk cursor";
+    cur.style.left = (px(Math.min(t, AXIS_MAX)) - 1) + "px"; laneD.appendChild(cur);
+
+    opsDone = 0; hostCalls = 0; totalTime = 0;
+    let gpuBusy = 0;
+    const sch = SCHED[mode];
+
+    for (let i = 0; i < N; i++) {
+      const seg = sch[i];
+      if (mode !== "replay") {
+        if (t >= seg.hs) hostCalls++;
+        if (t > seg.hs) {
+          const el = document.createElement("div");
+          el.className = "blk h" + (t >= seg.he ? " done" : " running");
+          el.style.left = px(seg.hs) + "px"; el.style.width = px(seg.he - seg.hs) + "px";
+          el.textContent = "launch" + (i + 1); laneH.appendChild(el);
+        }
+        if (t >= seg.ds) {
+          const el = document.createElement("div");
+          el.className = "blk d" + (t >= seg.de ? " done" : " running");
+          el.style.left = px(seg.ds) + "px"; el.style.width = px(seg.de - seg.ds) + "px";
+          el.textContent = "op" + (i + 1); laneD.appendChild(el);
+          gpuBusy += (seg.de - seg.ds);
+          if (t >= seg.de) { opsDone++; totalTime = Math.max(totalTime, seg.de); }
+        }
+        // GPU 空等 CPU 的间隙（eager/capture 特有）
+        if (i < N - 1 && t > seg.de) {
+          const gapStart = seg.de, gapEnd = sch[i + 1].ds;
+          if (gapEnd > gapStart) {
+            const el = document.createElement("div");
+            el.className = "blk gap";
+            el.style.left = px(gapStart) + "px"; el.style.width = px(gapEnd - gapStart) + "px";
+            el.textContent = "GPU 等 CPU"; laneD.appendChild(el);
+          }
+        }
+      } else {
+        if (t >= seg.de) { opsDone++; totalTime = Math.max(totalTime, seg.de); }
+        gpuBusy += (seg.de - seg.ds);
+        if (t > seg.ds) {
+          const el = document.createElement("div");
+          el.className = "blk d" + (t >= seg.de ? " done" : " running");
+          el.style.left = px(seg.ds) + "px"; el.style.width = px(seg.de - seg.ds) + "px";
+          el.textContent = "op" + (i + 1); laneD.appendChild(el);
+        }
+      }
+    }
+
+    if (mode === "replay") {
+      if (t > 0.2) {
+        const el = document.createElement("div");
+        el.className = "blk h" + (t >= HOST_CALL ? " done" : " running");
+        el.style.left = "0px"; el.style.width = px(HOST_CALL) + "px"; el.textContent = "replay()";
+        laneH.appendChild(el);
+      }
+      if (t > HOST_CALL * 0.3) hostCalls = 1;
+    }
+
+    const graphBox = $("graphBox");
+    if (mode === "capture") {
+      graphBox.classList.add("show"); graphBox.classList.toggle("ready", opsDone === N);
+      graphBox.textContent = opsDone === N ? "✅ cudaGraph_t 已生成" : "录制中… " + opsDone + "/" + N;
+    } else {
+      graphBox.classList.remove("show", "ready");
+      if (mode === "replay" && opsDone === N) { graphBox.classList.add("show", "ready"); graphBox.textContent = "✅ Exec 图就绪"; }
+    }
+
+    $("sHost").textContent = hostCalls;
+    $("sOps").textContent = opsDone + " / " + N;
+    const shownTotal = totalTime || (t > 0 ? Math.min(t, TOTAL[mode]) : 0);
+    $("sTotal").textContent = shownTotal % 1 === 0 ? shownTotal : shownTotal.toFixed(1);
+    const util = (gpuBusy / Math.max(shownTotal, 0.001)) * 100;
+    $("sUtil").textContent = util > 0 ? util.toFixed(0) + "%" : "—";
+    $("sUtil").className = "num " + (util > 70 ? "ok" : util > 0 ? "warn" : "");
+    $("utilNote").innerHTML = mode === "eager"
+      ? "GPU 利用率 <b>≈25%</b>：红色斜纹 = GPU 空等 CPU 下发的时间，占总耗时 3/4 —— 这就是被消除的调度开销"
+      : mode === "capture"
+      ? "Capture 阶段同样有调度开销，但它是 <b>一次性录制成本</b>，产出可复用的图"
+      : "GPU 利用率 <b>≈94%</b>：kernel 连续执行，Host 只剩一次 replay() 调用";
+
+    setBar("e", T_EAGER, TOTAL.eager, $("vE"));
+    setBar("c", T_CAPTURE, TOTAL.capture, $("vC"));
+    setBar("r", T_REPLAY, TOTAL.replay, $("vR"));
+  }
+  function setBar(key, full, cur, valEl) {
+    $("bar" + key.toUpperCase()).style.height = Math.max(2, (cur / T_EAGER) * 150) + "px";
+    valEl.textContent = cur % 1 === 0 ? cur : cur.toFixed(1);
+    $("bar" + key.toUpperCase()).style.filter = mode === key ? "brightness(1.25)" : "none";
+    $("bar" + key.toUpperCase()).style.boxShadow = mode === key ? "0 0 16px rgba(79,140,255,.35)" : "none";
+  }
+
+  function tick(ts) {
+    if (running) {
+      t += (ts - (tick.last || ts)) / 1000 * (slow ? 1.2 : 5);
+      tick.last = ts;
+      if (t >= TOTAL[mode] + 0.5) { t = TOTAL[mode] + 0.5; running = false; $("btnPlay").textContent = "▶ 播放"; }
+    } else tick.last = ts;
+    render();
+    rafId = requestAnimationFrame(tick);
+  }
+  function reset() { t = 0; running = false; $("btnPlay").textContent = "▶ 播放"; render(); }
+  function playPause() {
+    if (running) { running = false; $("btnPlay").textContent = "▶ 播放"; }
+    else { running = true; tick.last = null; $("btnPlay").textContent = "⏸ 暂停"; }
+  }
+  function step() {
+    running = false; $("btnPlay").textContent = "▶ 播放";
+    const sch = SCHED[mode];
+    const events = mode === "replay"
+      ? [HOST_CALL, ...sch.map(s => s.de), TOTAL[mode] + 0.5]
+      : [...sch.flatMap(s => [s.hs, s.he, s.ds, s.de]), TOTAL[mode] + 0.5];
+    const next = events.find(e => e > t + 0.01);
+    if (next !== undefined) t = next;
+    render();
+  }
+  function setMode(m) {
+    mode = m; reset();
+    document.querySelectorAll(".mode-btn").forEach(b => b.classList.toggle("active", b.dataset.mode === m));
+    $("modeDesc").innerHTML = MODE_INFO[m];
+  }
+  document.querySelectorAll(".mode-btn").forEach(b => b.addEventListener("click", () => setMode(b.dataset.mode)));
+  $("btnPlay").addEventListener("click", playPause);
+  $("btnStep").addEventListener("click", step);
+  $("btnReset").addEventListener("click", reset);
+  $("btnSlow").addEventListener("click", () => { slow = !slow; $("btnSlow").style.color = slow ? "var(--warn)" : ""; });
+
+  /* ═══════════ 3. 内存地址绑定 ═══════════ */
+  const ADDR_CAP = "0x100000", ADDR_DRIFT = "0x900000";
+  function setAddrScene(drift) {
+    $("addrCap").textContent = ADDR_CAP;
+    $("nodeAddr").textContent = ADDR_CAP;                       // 图节点绑定的指针永远不变
+    const memQ = $("memReplay"), stale = $("memStale"), arrow = $("nodeArrow"), status = $("memStatus");
+    if (drift) {
+      memQ.style.left = "58%"; memQ.style.width = "18%"; memQ.style.opacity = ".35";
+      stale.style.left = "10%"; stale.style.width = "18%"; stale.style.opacity = "1";
+      arrow.style.color = "var(--danger)";
+      status.className = "mem-status bad";
+      status.innerHTML = "❌ <b>错误！</b>Replay 时 Q 已漂移到 <span class='addr-chip'>" + ADDR_DRIFT + "</span>，但图仍访问捕获时的 <span class='addr-chip'>" + ADDR_CAP + "</span><br>→ 读到 <b>旧地址的过期数据</b>（甚至非法地址崩溃）。<br><b>解决办法：</b>预分配静态缓冲池（CaptureMemoryHold），保证地址稳定；地址会变的量走 Graph Update 槽位。";
+    } else {
+      memQ.style.left = "10%"; memQ.style.width = "18%"; memQ.style.opacity = "1";
+      stale.style.left = "10%"; stale.style.width = "18%"; stale.style.opacity = "0";
+      arrow.style.color = "var(--accent-2)";
+      status.className = "mem-status ok";
+      status.innerHTML = "✅ <b>正常。</b>Replay 时 Q 仍在 <span class='addr-chip'>" + ADDR_CAP + "</span>，与图内绑定的指针一致 → 执行正确。这就是为什么图模式要求 <b>tensor storage / memory allocation / pointer 全部固定</b>。";
+    }
+  }
+  $("btnAddrStable").addEventListener("click", () => setAddrScene(false));
+  $("btnAddrDrift").addEventListener("click", () => setAddrScene(true));
+  setAddrScene(false);
+
+  /* ═══════════ 4. Graph Pool ═══════════ */
+  const BUCKETS = [
+    { cap: 2, name: "Graph1" }, { cap: 4, name: "Graph2" },
+    { cap: 8, name: "Graph3" }, { cap: 16, name: "Graph4" }
+  ];
+  function renderPool() {
+    const b = +$("poolSlider").value;
+    $("poolVal").textContent = b;
+    document.querySelectorAll(".bucket").forEach(bk => {
+      const cap = +bk.dataset.b;
+      const slots = bk.querySelector(".b-slots"); slots.innerHTML = "";
+      for (let i = 0; i < cap; i++) {
+        const s = document.createElement("div");
+        s.className = "slot" + (i < b ? " used" : b <= cap ? " pad" : "");
+        slots.appendChild(s);
+      }
+      const chosen = BUCKETS.find(x => x.cap >= b);
+      const active = chosen && chosen.cap === cap;
+      bk.classList.toggle("active", !!active);
+      bk.classList.toggle("pool-disabled", cap < b);
+    });
+    const chosen = BUCKETS.find(x => x.cap >= b);
+    $("poolResult").innerHTML = "请求 <b>batch=" + b + "</b> → 选择 <b>" + chosen.name + "</b>（batch ≤ " + chosen.cap + "）"
+      + (chosen.cap > b ? "，padding <span class='hl'>" + (chosen.cap - b) + "</span> 个空 slot 后执行 <code>" + chosen.name + ".replay()</code>" : "，恰好装满，直接 <code>" + chosen.name + ".replay()</code>")
+      + "<br>vLLM / TensorRT-LLM 就是靠这样的 Graph Pool 覆盖动态 batch：<b>batch 每次变化，选一张最近的图</b>，而不是重新捕获。"
+      + "<br><span style='color:var(--text-dim)'>多张图在服务启动时<b>一次性全部捕获</b>（不是懒加载），捕获顺序从大到小以确定内存池高水位；每个 bucket 捕获后立即 replay 验证一次。</span>";
+  }
+  $("poolSlider").addEventListener("input", renderPool);
+  renderPool();
+
+  /* ═══════════ 5. Graph Update ═══════════ */
+  const ctxBoxB = $("ctxBefore"), ctxBoxA = $("ctxAfter");
+  const lens = [5, 9, 12, 4, 18, 7, 3, 11];
+  let updated = false;
+  function drawCtx() {
+    ctxBoxB.innerHTML = ""; ctxBoxA.innerHTML = "";
+    lens.forEach((v, i) => {
+      const a = document.createElement("div"); a.className = "ctx"; a.textContent = v; ctxBoxB.appendChild(a);
+      const b = document.createElement("div"); b.className = "ctx" + (updated ? " new" : ""); b.textContent = updated ? Math.min(v + 1, 24) : v; ctxBoxA.appendChild(b);
+    });
+  }
+  $("btnUpdate").addEventListener("click", () => {
+    updated = !updated;
+    drawCtx();
+    $("updateNote").innerHTML = updated
+      ? "<span class='ok'>✅ 更新成功：</span>每个 slot 的 <code>context_lens</code> +1（新 token 已写入），随后 replay 用的是<b>新参数</b>。<br>"
+        + "允许更新：<span class='ok'>kernel 参数 / seq_len / memcpy size</span>（<code>cudaGraphExecKernelNodeSetParams</code>）；"
+        + "不可修改：<span class='no'>kernel 数量 / dependency / memory allocation</span>。<br>"
+        + "对应本 fork：<code>graph_task_update_begin/end</code> 动态更新 context_lens（见 commit 80b8aa9e 的精度修复）。"
+      : "未更新时 replay 使用捕获时的旧参数。点击上方按钮演示「replay 前更新参数」。";
+    $("btnUpdate").textContent = updated ? "↩ 恢复旧参数" : "🔄 更新参数并 replay";
+  });
+  drawCtx();
+  $("updateNote").innerHTML = "未更新时 replay 使用捕获时的旧参数。点击上方按钮演示「replay 前更新参数」。";
+
+  /* ═══════════ 6. Profiler 对比（静态渲染） ═══════════ */
+  function profilerTrack(el, segs) {
+    segs.forEach(s => {
+      const d = document.createElement("div");
+      d.className = "seg " + s.c;
+      d.style.left = s.x + "%"; d.style.width = s.w + "%";
+      if (s.t) d.textContent = s.t;
+      if (s.title) d.title = s.title;
+      el.appendChild(d);
+    });
+  }
+  // Eager：launch(host) + kernel + gap 交替
+  profilerTrack($("profE"), [
+    { c: "h", x: 0,  w: 5,  t: "L1", title: "Host: launch kernel1" },
+    { c: "d", x: 5,  w: 3,  t: "k1", title: "GPU: kernel1" },
+    { c: "gap", x: 8, w: 6, title: "GPU 空等 CPU 下发 kernel2" },
+    { c: "h", x: 14, w: 5,  t: "L2", title: "Host: launch kernel2" },
+    { c: "d", x: 19, w: 3,  t: "k2" },
+    { c: "gap", x: 22, w: 6, title: "GPU 空等 CPU 下发 kernel3" },
+    { c: "h", x: 28, w: 5,  t: "L3", title: "Host: launch kernel3" },
+    { c: "d", x: 33, w: 3,  t: "k3" },
+    { c: "gap", x: 36, w: 6, title: "GPU 空等 CPU 下发 kernel4" },
+    { c: "h", x: 42, w: 5,  t: "L4", title: "Host: launch kernel4" },
+    { c: "d", x: 47, w: 3,  t: "k4" },
+    { c: "gap", x: 50, w: 50, title: "… 大量 launch 调用 + kernel 间隙 …" }
+  ]);
+  // Graph：一次 launch + 连续 kernel
+  profilerTrack($("profG"), [
+    { c: "h", x: 0,  w: 4,  t: "Graph Launch", title: "Host: cudaGraphLaunch() 仅一次" },
+    { c: "d", x: 4,  w: 4,  t: "k1" },
+    { c: "d", x: 8,  w: 4,  t: "k2" },
+    { c: "d", x: 12, w: 4,  t: "k3" },
+    { c: "d", x: 16, w: 4,  t: "k4" },
+    { c: "d", x: 20, w: 4,  t: "k5" },
+    { c: "d", x: 24, w: 4,  t: "k6" },
+    { c: "d", x: 28, w: 4,  t: "k7" },
+    { c: "d", x: 32, w: 4,  t: "k8" },
+    { c: "d", x: 36, w: 4,  t: "k9" },
+    { c: "d", x: 40, w: 4,  t: "k10" },
+    { c: "d", x: 44, w: 4,  t: "k11" },
+    { c: "d", x: 48, w: 4,  t: "k12", title: "kernel 连续执行，无间隙" },
+    { c: "d", x: 52, w: 48, opacity: .25, title: "… 整个 decode pipeline 连续执行 …" }
+  ]);
+
+  /* ═══════════ 7. Quiz ═══════════ */
+  document.querySelectorAll(".q button").forEach(b =>
+    b.addEventListener("click", () => {
+      const q = b.parentElement;
+      q.classList.toggle("open");
+      b.querySelector(".arrow").textContent = q.classList.contains("open") ? "▼" : "▶";
+    }));
+
+  window.addEventListener("resize", render);
+  setMode("replay");
+  rafId = requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
