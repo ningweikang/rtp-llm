@@ -7,7 +7,7 @@ They mirror the 7 C++ test cases from SamplerTest.cc.
 
 Prerequisites (set by .bazelrc test:ascend --test_env):
   LD_LIBRARY_PATH  must include torch/lib, torch_npu/lib, /opt/conda310/lib
-  PYTHONHOME       must point to conda env (e.g. /root/miniconda3/envs/py310)
+  PYTHONHOME       must point to conda env (e.g. /opt/conda310)
   ASCEND_CUSTOM_OPP_PATH  must point to aclnn_custom_ops/opp
 
 Usage:
