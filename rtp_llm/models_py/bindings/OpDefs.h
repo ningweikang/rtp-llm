@@ -200,8 +200,8 @@ private:
                                     "MHA kernel block subdivision (seq_size_per_block=%zu, "
                                     "kernel_seq_size_per_block=%zu, ratio=%lld) is not yet supported on Ascend; "
                                     "require seq_size_per_block == kernel_seq_size_per_block for tag=%s",
-                                    group.seq_size_per_block,
-                                    group.kernel_seq_size_per_block,
+                                    group.seqSizePerBlock(),
+                                    group.kernelSeqSizePerBlock(),
                                     static_cast<long long>(blocks_per_physical),
                                     group.tag.c_str());
             result.kv_cache_base =
