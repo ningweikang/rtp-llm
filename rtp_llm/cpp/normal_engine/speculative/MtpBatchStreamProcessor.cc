@@ -265,7 +265,10 @@ void MtpBatchStreamProcessor::updateDecodePostDraftModelInput(
     auto& accept_lens = speculative_sampler_output.accept_len;
     total_accept_len  = std::accumulate(accept_lens.begin(), accept_lens.end(), 0);
 
-    model_input.combo_tokens = torch::empty({(int64_t)total_accept_len}, torch::kInt32).pin_memory();
+    // NOTE: the Ascend draft prefill runs eager (Phase C draft graphs
+    // postponed), so the original ragged layout applies on all platforms.
+    const size_t tokens_per_stream = propose_step_ + 1;
+    model_input.combo_tokens       = torch::empty({(int64_t)total_accept_len}, torch::kInt32).pin_memory();
 
     int  token_offset      = 0;
     auto lm_output_indexes = torch::empty({(int64_t)batch_size}, torch::kInt32).pin_memory();
@@ -278,6 +281,11 @@ void MtpBatchStreamProcessor::updateDecodePostDraftModelInput(
                                 accept_lens[i],
                                 i,
                                 speculative_sampler_output.accept_tokens[i].numel());
+        RTP_LLM_CHECK_WITH_INFO(accept_lens[i] <= tokens_per_stream,
+                                "accept_lens[%d] = %d exceeds tokens_per_stream = %d",
+                                i,
+                                accept_lens[i],
+                                (int)tokens_per_stream);
 
         memcpy(model_input.combo_tokens.data_ptr<int>() + token_offset,
                speculative_sampler_output.accept_tokens[i].data_ptr<int>(),
@@ -353,9 +361,18 @@ void MtpBatchStreamProcessor::preparePrefillSpecUpdateInfo(const StreamGroups&  
     const auto& new_all_token_ids         = sampler_output.token_ids;
     const auto& propose_new_all_token_ids = draft_sampler_output.token_ids;
 
-    RTP_LLM_LOG_DEBUG("new_all_token_ids = [%s]", tensorDebugStringWithData<int32_t>(new_all_token_ids).c_str());
-    RTP_LLM_LOG_DEBUG("propose_new_all_token_ids = [%s]",
-                      tensorDebugStringWithData<int64_t>(propose_new_all_token_ids).c_str());
+    // Guard the debug prints: token_ids tensors may be undefined (K=1 propose
+    // path leaves them empty) or int32 — tensorDebugStringWithData<int64_t>
+    // on those crashes the engine (SIGSEGV seen with log_level=DEBUG).
+    if (new_all_token_ids.defined() && new_all_token_ids.numel() > 0) {
+        RTP_LLM_LOG_DEBUG("new_all_token_ids = [%s]",
+                          tensorDebugStringWithData<int32_t>(new_all_token_ids).c_str());
+    }
+    if (propose_new_all_token_ids.defined() && propose_new_all_token_ids.numel() > 0
+        && propose_new_all_token_ids.scalar_type() == torch::kLong) {
+        RTP_LLM_LOG_DEBUG("propose_new_all_token_ids = [%s]",
+                          tensorDebugStringWithData<int64_t>(propose_new_all_token_ids).c_str());
+    }
 
     const size_t total_batch_size_out = stream_groups.totalSamplerBatchSizeOut();
     RTP_LLM_CHECK(total_batch_size_out == (size_t)new_all_token_ids.size(0));
@@ -440,6 +457,9 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
 
         torch::Tensor last_hidden_states;
         if (propose_step_ > 1) {
+            // Ragged layout (all platforms): the draft prefill runs eager with
+            // token_offset accumulating accept_len per stream, so stream i's
+            // last *real* (accepted) hidden row sits at token_offset + a_i - 1.
             auto slice_t =
                 draft_model_output.all_hidden_states.narrow(0, token_offset + accept_len[batch_idx_out] - 1, 1);
             last_hidden_states = slice_t;

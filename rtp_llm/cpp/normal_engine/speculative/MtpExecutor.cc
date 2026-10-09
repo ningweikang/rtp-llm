@@ -22,6 +22,7 @@
 
 namespace rtp_llm {
 
+
 bool MtpExecutor::isTpRank0() const {
     return tp_rank_ == 0;
 }
@@ -253,10 +254,20 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                 "[speculative decoding] enable_cuda_graph=%d (set ENABLE_CUDA_GRAPH=1 when starting server to enable sp_prefill_draft_model_)",
                 static_cast<int>(enable_cuda_graph));
             if (enable_cuda_graph) {
+#if USING_ASCEND
+                // Phase C postponed: the fixed-shape draft-prefill ACL graph
+                // (pad to K+1 + dedicated runner) was judged too aggressive —
+                // fall back to the Phase B behaviour where the draft prefill
+                // runs through draft_model_ eager with the ragged layout.
+                RTP_LLM_LOG_INFO(
+                    "[speculative decoding] Ascend: skip separate prefill draft model "
+                    "(Phase C draft graphs postponed, eager fallback)");
+#else
                 RTP_LLM_LOG_INFO(
                     "[speculative decoding] creating separate prefill draft model with CUDA graph support");
                 sp_prefill_draft_model_.reset(new PyWrappedModel(
                     model_params, params.py_sp_model, true, false, draft_cache_layer_layout.layer_to_groups));
+#endif
             }
         }
         break;  // NOTE: only support one mtp model now
@@ -536,6 +547,9 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     size_t total_accept_len = 0;
 
+    // Phase-timing probes (DEBUG) for MTP cycle decomposition.
+    const int64_t t_cycle_beg = autil::TimeUtility::currentTimeInMicroSeconds();
+
     // clone tensors from grpc
     {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(clone_sp_tensors,stream_count=%zu)", streams.size());
@@ -608,6 +622,9 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode end");
     }
 
+    // Phase-timing probes (DEBUG) for MTP cycle decomposition.
+    const int64_t t_clone_end   = autil::TimeUtility::currentTimeInMicroSeconds();
+    const int64_t t_verify_beg = autil::TimeUtility::currentTimeInMicroSeconds();
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_model_verify)");
         maybePrintModelInput(model_input, "decode target model");
@@ -622,6 +639,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         RTP_LLM_LOG_DEBUG("[MTP decode] target model verify forward end");
         model_input.is_target_verify = false;
     }
+    const int64_t t_verify_end = autil::TimeUtility::currentTimeInMicroSeconds();
 
     // trick: update draft sampler output after spec decode to avoid kernel launch overhead
     if (isTpRank0()) {
@@ -649,6 +667,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         executor_collector.eplb_step_latency_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
 
+    const int64_t t_sample_end = autil::TimeUtility::currentTimeInMicroSeconds();
     if (isTpRank0()) {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(rejection_sampling)");
 
@@ -688,6 +707,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
     }
 
+    const int64_t t_draft_beg = autil::TimeUtility::currentTimeInMicroSeconds();
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(draft_model_forward)");
         // Use sp_prefill_draft_model_ if CUDA graph is enabled, otherwise use draft_model_
@@ -697,6 +717,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             draft_prefill_model_output = std::move(draft_model_->forward(model_input));
         }
     }
+    const int64_t t_draft_end = autil::TimeUtility::currentTimeInMicroSeconds();
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
         cudaSyncAndCheck();
@@ -707,10 +728,21 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     // draft model sample
     {
+        const int64_t t_dsample_beg = autil::TimeUtility::currentTimeInMicroSeconds();
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(draft_model_sample)");
         fast_topk_sampler_output               = fast_topk_sampler_->forward(draft_prefill_model_output.logits);
         draft_prefill_sampler_output.all_probs = fast_topk_sampler_output.all_probs;
         draft_prefill_sampler_output.token_ids = fast_topk_sampler_output.token_ids;
+        RTP_LLM_LOG_DEBUG(
+            "[MTP cycle] clone+gather+prepare=%ldus verify_fwd=%ldus sample+reject=%ldus update_input=%ldus "
+            "draft_fwd=%ldus draft_sample=%ldus total_decodeStep=%ldus",
+            t_clone_end - t_cycle_beg,
+            t_verify_end - t_verify_beg,
+            t_sample_end - t_verify_end,
+            t_draft_beg - t_sample_end,
+            t_draft_end - t_draft_beg,
+            autil::TimeUtility::currentTimeInMicroSeconds() - t_dsample_beg,
+            autil::TimeUtility::currentTimeInMicroSeconds() - t_cycle_beg);
     }
 
     // collect metrics

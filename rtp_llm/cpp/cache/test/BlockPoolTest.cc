@@ -96,39 +96,31 @@ TEST_F(BlockPoolTest, ConstructorAndInit) {
 
 TEST_F(BlockPoolTest, MTPConvertIndexGlobalIdMapping) {
     // Use createSpConfig logic so that global_layer_ids is filled for main + sub-model layers.
-    // main(2 layers) + mtp1(1 layer) + mtp2(1 layer)
+    // G9: a single-layer draft (Qwen3.5 MTP) allocates only one MTP module even
+    // when gen_num_per_cycle > 1 — main(2 layers) + mtp(1 layer).
     auto cache_cfg = makeMtpCacheConfigByCreateSpConfig(/*main_layers=*/2, /*mtp_module_num=*/2, /*block_num=*/4);
 
     ASSERT_FALSE(cache_cfg.global_layer_ids.empty());
     ASSERT_EQ(cache_cfg.global_layer_ids[0].size(), static_cast<size_t>(cache_cfg.layer_all_num));
 
-    ASSERT_EQ(cache_cfg.mtp_sub_configs.size(), 2u);
+    ASSERT_EQ(cache_cfg.mtp_sub_configs.size(), 1u);
     ASSERT_NE(cache_cfg.mtp_sub_configs[0], nullptr);
-    ASSERT_NE(cache_cfg.mtp_sub_configs[1], nullptr);
     ASSERT_EQ(cache_cfg.mtp_sub_configs[0]->groupNums(), 1);
-    ASSERT_EQ(cache_cfg.mtp_sub_configs[1]->groupNums(), 1);
-    EXPECT_EQ(cache_cfg.mtp_sub_configs[0]->cache_specs[0]->block_size_bytes(),
-              cache_cfg.mtp_sub_configs[1]->cache_specs[0]->block_size_bytes());
 
     ASSERT_FALSE(cache_cfg.mtp_sub_configs[0]->global_layer_ids.empty());
-    ASSERT_FALSE(cache_cfg.mtp_sub_configs[1]->global_layer_ids.empty());
     ASSERT_EQ(cache_cfg.mtp_sub_configs[0]->global_layer_ids[0].size(), 1u);
-    ASSERT_EQ(cache_cfg.mtp_sub_configs[1]->global_layer_ids[0].size(), 1u);
     EXPECT_EQ(cache_cfg.mtp_sub_configs[0]->global_layer_ids[0][0], 2);
-    EXPECT_EQ(cache_cfg.mtp_sub_configs[1]->global_layer_ids[0][0], 3);
 
     auto pool_cfg = rtp_llm::BlockPoolConfigHelper::createConfig(cache_cfg);
-    ASSERT_EQ(pool_cfg.memory_layouts.size(), 3u);
+    ASSERT_EQ(pool_cfg.memory_layouts.size(), 2u);
     ASSERT_EQ(pool_cfg.memory_layouts[0].layer_num, 2u);
     ASSERT_EQ(pool_cfg.memory_layouts[1].layer_num, 1u);
-    ASSERT_EQ(pool_cfg.memory_layouts[2].layer_num, 1u);
 
     block_pool_ = std::make_shared<BlockPool>(pool_cfg);
     ASSERT_TRUE(block_pool_->init());
 
     const int global_main = 0;
     const int global_mtp1 = static_cast<int>(pool_cfg.memory_layouts[0].layer_num);
-    const int global_mtp2 = global_mtp1 + 1;
 
     const int block_id  = 1;
     auto      base_addr = block_pool_->convertIndexToAddr(/*layer_id=*/0, /*block_id=*/0);
@@ -164,7 +156,6 @@ TEST_F(BlockPoolTest, MTPConvertIndexGlobalIdMapping) {
 
     verify_one(global_main, /*expect_layout_idx=*/0, /*expect_local_layer=*/0);
     verify_one(global_mtp1, /*expect_layout_idx=*/1, /*expect_local_layer=*/0);
-    verify_one(global_mtp2, /*expect_layout_idx=*/2, /*expect_local_layer=*/0);
 
     // Partitioned buffer correctness on mtp layer (heads=2, partition_count=2, partition_id=1)
     const auto& mtp_layout_cfg = pool_cfg.memory_layouts[1];
