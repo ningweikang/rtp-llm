@@ -11,7 +11,7 @@ Prerequisites (set by .bazelrc test:ascend --test_env):
   ASCEND_CUSTOM_OPP_PATH  must point to aclnn_custom_ops/opp
 
 Usage:
-  cd /home/d30033799/rtp-llm
+  cd rtp-llm
   python rtp_llm/models_py/bindings/ascend/ops/tests/test_ascend_sampler.py
 """
 
