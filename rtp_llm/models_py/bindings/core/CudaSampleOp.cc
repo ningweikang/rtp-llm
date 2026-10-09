@@ -634,6 +634,10 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
                         params.temperature.data_ptr<float>() + batch_size,
                         [](auto t) { return t != 1.0f; })) {
             auto temperature_npu = params.temperature.to(device_type).reshape({(int64_t)batch_size, 1});
+            // temperature <= 0 means greedy (OpenAI convention: temperature=0 equals
+            // greedy). Clamp the divisor so those rows degenerate to argmax instead of
+            // producing NaN via division by zero (which made argmax return token 0).
+            temperature_npu = torch::clamp(temperature_npu, 1e-7f);
             params.logits.div_(temperature_npu);
         }
     }
