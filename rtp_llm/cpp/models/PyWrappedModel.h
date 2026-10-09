@@ -249,18 +249,28 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
                                                          static_cast<int>(params.parallelism_config.tp_rank));
         }
 #elif USING_ASCEND
-        // Ascend ACL Graph: decode-only. Prefill graph mode is rejected in the
-        // runner constructor — fall back to eager forward in that case.
+        // Ascend ACL Graph: decode + target-verify only. A variable-length
+        // prefill graph (embedding model) is still rejected by the runner
+        // constructor, and the draft model (model_id != 0) stays eager — both
+        // the draft decode and the fixed-shape draft-prefill graphs (Phase C)
+        // are postponed — fall back to eager forward.
         if (is_prefill_cuda_graph_mode) {
             RTP_LLM_LOG_WARNING(
                 "Ascend ACL Graph does not support prefill cuda graph mode; "
                 "graph_runner_ will not be created, falling back to eager forward.");
+        } else if (params.sp_config.type != SP_TYPE_NONE && params.model_id) {
+            // MTP draft model on Ascend stays eager: the draft decode graph
+            // (Phase C) is postponed along with the draft-prefill graph.
+            RTP_LLM_LOG_WARNING(
+                "Ascend ACL Graph is disabled for the MTP draft model; draft runs eager.");
         } else {
             c10::ScalarType dtype = dataTypeToTorchType(description_.data_type);
             GraphParams      graph_params;
             graph_params.enable_cuda_graph            = params.hw_kernel_config.enable_cuda_graph;
             graph_params.enable_cuda_graph_debug_mode = params.hw_kernel_config.enable_cuda_graph_debug_mode;
-            graph_params.is_prefill_cuda_graph_mode   = false;  // ACL Graph is decode-only
+            // Always false here: this branch is only reached for decode/verify
+            // models (the prefill-graph request above returned early).
+            graph_params.is_prefill_cuda_graph_mode   = is_prefill_cuda_graph_mode;
             graph_params.max_seq_len                  = params.max_seq_len;
             graph_params.tokens_per_block             = params.tokens_per_block;
             graph_params.kernel_tokens_per_block      = params.kernel_tokens_per_block;
@@ -278,10 +288,17 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
 
             graph_params.is_target_verify = use_spec_decoding;
             if (params.sp_config.type != SP_TYPE_NONE) {
-                graph_params.sp_steps           = params.sp_config.gen_num_per_cycle;
-                graph_params.num_tokens_per_bs  = params.sp_config.gen_num_per_cycle + 1;
+                graph_params.sp_steps = params.sp_config.gen_num_per_cycle;
+            }
+            // Decision table aligned with the CUDA branch above (G5): the target
+            // model (model_id == 0) runs a K+1 token verify forward; the draft
+            // model (model_id != 0) stays eager on Ascend (Phase C postponed),
+            // and the plain decode path runs a single token per stream.
+            if (params.sp_config.type != SP_TYPE_NONE && params.sp_config.gen_num_per_cycle > 0
+                && !params.model_id) {
+                graph_params.num_tokens_per_bs = params.sp_config.gen_num_per_cycle + 1;
             } else {
-                graph_params.num_tokens_per_bs  = 1;
+                graph_params.num_tokens_per_bs = 1;
             }
 
             graph_runner_ = new AscendGraphRunner(graph_params, py_instance);

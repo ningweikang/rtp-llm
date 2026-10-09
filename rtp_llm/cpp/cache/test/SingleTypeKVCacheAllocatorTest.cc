@@ -45,9 +45,9 @@ static rtp_llm::ModelConfig makeTestModelConfig(uint32_t num_layers) {
 }
 
 static rtp_llm::CacheConfig
-makeMtpCacheConfigByCreateSpConfig(uint32_t main_layers, int mtp_module_num, uint32_t block_num) {
+makeMtpCacheConfigByCreateSpConfig(uint32_t main_layers, int mtp_module_num, uint32_t block_num, uint32_t draft_layers = 1) {
     auto score_model_config   = makeTestModelConfig(main_layers);
-    auto propose_model_config = makeTestModelConfig(/*num_layers=*/1);
+    auto propose_model_config = makeTestModelConfig(/*num_layers=*/draft_layers);
 
     rtp_llm::ParallelismConfig parallelism_config;
     parallelism_config.tp_size = 1;
@@ -439,8 +439,11 @@ TEST_F(SingleTypeKVCacheAllocatorTest, ConvertToGlobalLayerIdSingleNoMtp) {
 }
 
 TEST_F(SingleTypeKVCacheAllocatorTest, ConvertToGlobalLayerIdSingleWithMtp) {
-    auto config = makeMtpCacheConfigByCreateSpConfig(/*main_layers=*/2, /*mtp_module_num=*/2, /*block_num=*/8);
-    allocator_  = std::make_shared<SingleTypeKVCacheAllocator>(config);
+    // G9 caps num_mtp_modules at the draft layer count, so request 2 draft
+    // layers to keep exercising two MTP sub-configs.
+    auto config = makeMtpCacheConfigByCreateSpConfig(
+        /*main_layers=*/2, /*mtp_module_num=*/2, /*block_num=*/8, /*draft_layers=*/2);
+    allocator_ = std::make_shared<SingleTypeKVCacheAllocator>(config);
 
     // main model: global == local
     EXPECT_EQ(allocator_->convertToGlobalLayerId(/*model_id=*/0, /*local_layer_id=*/0), 0u);
@@ -448,11 +451,12 @@ TEST_F(SingleTypeKVCacheAllocatorTest, ConvertToGlobalLayerIdSingleWithMtp) {
     EXPECT_EQ(allocator_->convertToGlobalLayerId(/*model_id=*/0, /*local_layer_id=*/2),
               std::numeric_limits<uint32_t>::max());
 
-    // mtp sub-models map via sub_cfg->global_layer_ids[0]
+    // mtp sub-models map via sub_cfg->global_layer_ids[0]:
+    // module 0 owns global layers {2,3}, module 1 owns {4,5}.
     EXPECT_EQ(allocator_->convertToGlobalLayerId(/*model_id=*/1, /*local_layer_id=*/0), 2u);
-    EXPECT_EQ(allocator_->convertToGlobalLayerId(/*model_id=*/2, /*local_layer_id=*/0), 3u);
-    EXPECT_EQ(allocator_->convertToGlobalLayerId(/*model_id=*/1, /*local_layer_id=*/1),
-              std::numeric_limits<uint32_t>::max());
+    EXPECT_EQ(allocator_->convertToGlobalLayerId(/*model_id=*/1, /*local_layer_id=*/1), 3u);
+    EXPECT_EQ(allocator_->convertToGlobalLayerId(/*model_id=*/2, /*local_layer_id=*/0), 4u);
+    EXPECT_EQ(allocator_->convertToGlobalLayerId(/*model_id=*/2, /*local_layer_id=*/1), 5u);
     EXPECT_EQ(allocator_->convertToGlobalLayerId(/*model_id=*/3, /*local_layer_id=*/0),
               std::numeric_limits<uint32_t>::max());
 }

@@ -49,10 +49,12 @@ AscendGraphRunner::AscendGraphRunner(const GraphParams& graph_params, py::object
     if (kernel_seq_size_per_block_ <= 0) {
         throw std::runtime_error("AscendGraphRunner constructor: kernel_tokens_per_block must be > 0.");
     }
-    // Prefill graph mode is not supported on Ascend ACL Graph today.
+    // Ascend ACL Graph is decode/verify-only: a variable-length prefill graph
+    // (embedding models) and the fixed-shape draft-prefill variant (Phase C,
+    // postponed) are both rejected — callers fall back to eager forward.
     if (graph_params.is_prefill_cuda_graph_mode) {
         throw std::runtime_error(
-            "AscendGraphRunner: prefill cuda graph mode is not supported on Ascend ACL Graph.");
+            "AscendGraphRunner: variable-length prefill cuda graph mode is not supported on Ascend ACL Graph.");
     }
     max_bs_ = graph_params.max_context_batch_size;
 
@@ -183,7 +185,8 @@ bool AscendGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& stat
     if (!enable_graph_) {
         return false;
     }
-    // Decode only: any prefill goes to eager.
+    // Decode-only: prefill-shaped forwards never run through the ACL graph
+    // (the draft-prefill graph of Phase C is postponed).
     if (inputs.attention_inputs.is_prefill) {
         return false;
     }
@@ -664,7 +667,11 @@ void AscendGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphStat
         py_model_inputs.attention_inputs.kv_cache_layer_to_group.copy_(
             inputs.attention_inputs.kv_cache_layer_to_group);
     }
-    if (inputs.attention_inputs.sequence_lengths.defined()) {
+    // In target-verify mode the engine leaves sequence_lengths empty
+    // (MtpExecutor sets it to torch::empty({0})); guard the numel so the
+    // slice/copy does not raise a size-mismatch RuntimeError.
+    if (inputs.attention_inputs.sequence_lengths.defined()
+        && inputs.attention_inputs.sequence_lengths.numel() > 0) {
         auto src = inputs.attention_inputs.sequence_lengths.slice(0, 0, state.current_batch_size);
         py_model_inputs.attention_inputs.sequence_lengths.slice(0, 0, state.current_batch_size).copy_(src);
     }
@@ -712,10 +719,19 @@ void AscendGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphStat
         }
     }
 
-    // Compute sequence_lengths_plus_1_d from sequence_lengths (engine doesn't populate it)
-    py_model_inputs.attention_inputs.sequence_lengths_plus_1_d.slice(0, 0, state.current_batch_size) =
-        py_model_inputs.attention_inputs.sequence_lengths.slice(0, 0, state.current_batch_size)
-            .to(options_npu_int32_.device()) + 1;
+    // Compute sequence_lengths_plus_1_d from sequence_lengths (engine doesn't populate it).
+    // Skip in target-verify mode: PyWrappedModel already filled it from
+    // prefix_lengths + 1 (see buildPyAttentionInputs) — verify inputs carry it
+    // through the copy above — and sequence_lengths is empty, so recomputing
+    // here would overwrite the correct verify values.
+    if (!inputs.attention_inputs.is_target_verify) {
+        if (inputs.attention_inputs.sequence_lengths.defined()
+            && inputs.attention_inputs.sequence_lengths.numel() > 0) {
+            py_model_inputs.attention_inputs.sequence_lengths_plus_1_d.slice(0, 0, state.current_batch_size) =
+                py_model_inputs.attention_inputs.sequence_lengths.slice(0, 0, state.current_batch_size)
+                    .to(options_npu_int32_.device()) + 1;
+        }
+    }
 
     // -------- Update attention impl with the freshly-copied inputs --------
     {

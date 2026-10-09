@@ -389,8 +389,23 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
                                    [](auto t) { return std::abs(t - 1.0f) < 1e-7f; });
 
     if (has_top_k || has_top_p) {
-        // Move top_k/top_p from CPU to NPU.
-        // applyTopKTopP expects: k → INT32 1D [batch_size], p → FLOAT32 1D [batch_size].
+        // Top-k/top-p filtering via the AscendC custom operator
+        // aclnnApplyTopKTopPCustom. The kernel pre-fills the output with -inf
+        // and scatters the retained logits back (see op_kernel/
+        // apply_top_p_custom.h GetSoftmaxSum + ScatterSingleTask), so the
+        // subsequent softmax in step 4 yields the renormalized filtered
+        // distribution — same semantics as CUDA's flashinfer
+        // top_k_renorm_probs / top_p_renorm_probs.
+        //   top-k: keep the k largest logits per row (k <= 0 → keep all,
+        //          mirroring the CUDA "no limit" convention).
+        //   top-p: keep the smallest prefix (by prob, descending) whose
+        //          cumulative sum reaches p — always at least one token.
+        // Both parameters are optional: the wrapper forwards
+        // c10::optional<at::Tensor> straight into EXEC_NPU_CMD, which maps an
+        // absent value (nullopt) to a nullptr aclTensor*. Passing a bare
+        // c10::nullopt here would bind to the generic passthrough overload and
+        // drop a non-pointer nullopt_t into the aclTensor* slot (UB), so only
+        // the optional<Tensor> form is used.
         c10::optional<at::Tensor> k_npu;
         c10::optional<at::Tensor> p_npu;
         if (has_top_k) {
@@ -485,7 +500,86 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
 }
 
 void chainSpeculativeSampling(const SpeculativeSamplingParams& params) {
-    throw OpException(OpErrorType::ERROR_UNIMPLEMENTED);
+    // NPU implementation composed of plain torch ops (mirrors the semantics of
+    // the CUDA/ROCm kernel in rtp_llm/cpp/rocm/speculative_sampling/sampling.cu:288-409):
+    //   per row b, draft position i in [0, K):
+    //     accept draft token d_i iff  u[b,i] * p[b,i] < q[b,i], where
+    //       p = draft_probs[b,i,d_i], q = target_probs[b,i,d_i]
+    //   let pos = first rejected position (K when all accepted):
+    //     output[b, 0..pos-1] = accepted draft ids
+    //     output[b, pos]      = token resampled from residual max(q-p, 0)
+    //     output[b, pos+1..K] = -1
+    //     emitted[b]          = pos + 1
+    // output_accepted_token_num_d is intentionally untouched (the CUDA kernel
+    // never writes it either; the host side only reads emitted).
+    // NOTE: SpeculativeSampler::batchSample always overwrites the last accepted
+    // token with the target sampler token, so output[b, pos] is not observable;
+    // it is still computed here for parity with the CUDA kernel.
+    // NOTE (deterministic greedy): requests with do_sample=false are forced to
+    // top_k=1 (fillSamplerCommonInputs), so applyTopKTopP(k=1) zeroes all
+    // non-argmax logits (-inf) and all_probs becomes one-hot — the acceptance
+    // test above then degenerates to the deterministic "draft == argmax"
+    // comparison, same as CUDA's top_k_renorm_probs(k=1) path. Requests that
+    // only set temperature=0 with do_sample=true keep probabilistic acceptance
+    // (upstream CUDA semantics — identical requests may diverge).
+
+    auto draft_probs = params.draft_probs_d.to(torch::kFloat);      // [bs, K, V]
+    auto draft_ids   = params.draft_token_ids_d.to(torch::kLong);   // [bs, K]
+    auto uniform     = params.uniform_samples_d.to(torch::kFloat);  // [bs, K+1]
+    auto target      = params.target_probs_d.to(torch::kFloat);     // [bs, K+1, V]
+
+    const int64_t bs = draft_ids.size(0);
+    const int64_t K  = draft_ids.size(1);
+    if (bs == 0 || K == 0) {
+        return;
+    }
+    const int64_t V = draft_probs.size(-1);
+
+    auto idx    = draft_ids.unsqueeze(-1);                          // [bs, K, 1]
+    auto q      = target.slice(1, 0, K).gather(-1, idx).squeeze(-1);  // [bs, K] P_target(d_i)
+    auto p      = draft_probs.gather(-1, idx).squeeze(-1);          // [bs, K] P_draft(d_i)
+    auto u      = uniform.slice(1, 0, K);                           // [bs, K]
+    auto accept = (u * p) < q;                                      // [bs, K]
+
+    // pos = first rejected position per row (K when all accepted):
+    // reject_cnt >= 1 exactly at/after the first rejection, so the accepted
+    // prefix is the set of positions whose rejection count is still 0.
+    auto reject_cnt  = accept.logical_not().to(torch::kInt32).cumsum(1);  // [bs, K]
+    auto prefix_mask = reject_cnt.eq(0);                                  // [bs, K]
+    auto pos         = prefix_mask.to(torch::kLong).sum(1);               // [bs]
+
+    // ---- recovered token at the first rejected position (kernel parity) ----
+    // residual r[v] = max(target[b,pos,v] - draft[b,pos,v], 0);
+    // sampled index = #{v : cumsum(r)[v] < u' * sum(r)}  (inverse CDF, division-free)
+    auto pos_safe     = pos.clamp_max(K - 1);                       // safe index into K-dim tensors
+    auto gather_idx   = pos_safe.view({bs, 1, 1}).expand({bs, 1, V});
+    auto q_row        = target.gather(1, gather_idx).squeeze(1);    // [bs, V] target[b, pos, :]
+    auto p_row        = draft_probs.gather(1, gather_idx).squeeze(1);  // [bs, V] draft[b, pos, :]
+    auto residual     = (q_row - p_row).clamp_min(0.0);             // [bs, V]
+    auto cdf          = residual.cumsum(-1);                        // [bs, V]
+    auto residual_sum = cdf.select(-1, V - 1);                      // [bs]
+    auto u_next       = uniform.gather(1, (pos + 1).clamp_max(K).unsqueeze(1)).squeeze(1);  // [bs]
+    auto recovered    = (cdf < (u_next * residual_sum).unsqueeze(1)).to(torch::kLong).sum(-1);  // [bs]
+    recovered         = recovered.clamp_max(V - 1);
+    // all-accepted rows have no rejected position; mark -1 (CUDA leaves the
+    // bonus slot untouched; the host overwrites it either way)
+    recovered         = torch::where(pos.lt(K), recovered, torch::full_like(recovered, -1));
+
+    // ---- assemble output [bs, K+1] ----
+    auto id_opts  = torch::TensorOptions().dtype(torch::kLong).device(draft_ids.device());
+    auto cols     = torch::arange(K + 1, id_opts).unsqueeze(0);     // [1, K+1]
+    auto fill_pre = cols.lt(pos.unsqueeze(1));                      // [bs, K+1] i < pos
+    auto at_pos   = cols.eq(pos.unsqueeze(1));                      // [bs, K+1] i == pos
+    auto draft_ext = torch::cat({draft_ids, torch::full({bs, 1}, -1, id_opts)}, 1);  // [bs, K+1]
+    auto neg_one   = torch::full_like(draft_ext, -1);               // [bs, K+1]
+    auto out_ids   = torch::where(fill_pre,
+                                  draft_ext,
+                                  torch::where(at_pos,
+                                               recovered.unsqueeze(1).expand({bs, K + 1}),
+                                               neg_one));           // [bs, K+1]
+
+    params.output_token_ids_d.copy_(out_ids.to(params.output_token_ids_d.dtype()));
+    params.output_emitted_token_num_d.copy_((pos + 1).to(params.output_emitted_token_num_d.dtype()));
 }
 
 #else  // !USING_CUDA — ROCm platform

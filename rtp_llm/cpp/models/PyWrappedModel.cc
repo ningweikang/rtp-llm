@@ -490,7 +490,11 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
 
         // Cast the Python object to PyModelOutputs and extract hidden states
         CudaGraphState graph_state;
-        if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state)) {
+        // graph_runner_ may be null on Ascend when prefill graph mode is
+        // requested (PyWrappedModel constructor refuses to build a prefill
+        // ACL graph and logs a warning) — fall back to the eager forward.
+        if (enable_cuda_graph_ && graph_runner_
+            && graph_runner_->canRun(py_model_inputs, graph_state)) {
             py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(cuda_graph)");
             DevicePerfWrapper wrapper(enable_device_perf_, "cuda graph python forward");
