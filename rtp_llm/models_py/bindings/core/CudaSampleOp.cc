@@ -611,6 +611,9 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     auto transposed_tokens = device_tokens.transpose(0, 1).contiguous();
 
     // ---- Handle do_sample: save logits for non-sampling (greedy) batches ----
+    // temperature <= 0 also means greedy (OpenAI convention: temperature=0
+    // equals greedy) even when do_sample stays true.
+    bool has_temp_greedy  = false;
     bool has_not_do_sample = params.do_sample.has_value() &&
                              std::any_of(params.do_sample.value().data_ptr<bool>(),
                                          params.do_sample.value().data_ptr<bool>() + batch_size,
@@ -619,13 +622,28 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
                               std::any_of(params.do_sample.value().data_ptr<bool>(),
                                          params.do_sample.value().data_ptr<bool>() + batch_size,
                                          [](auto t) { return t; });
+    if (need_do_sample) {
+        has_temp_greedy = std::any_of(params.temperature.data_ptr<float>(),
+                                      params.temperature.data_ptr<float>() + batch_size,
+                                      [](auto t) { return t <= 0.0f; });
+    }
+    has_not_do_sample = has_not_do_sample || has_temp_greedy;
 
     torch::Tensor selected_logits;
-    torch::Tensor mask_tensor;
+    torch::Tensor mask_tensor;  // true = greedy rows (should NOT be sampled/penalized)
     if (has_not_do_sample && need_do_sample) {
-        auto do_sample_npu = params.do_sample.value().to(device_type);
-        mask_tensor        = do_sample_npu.reshape({(int64_t)batch_size, 1}).logical_not();
-        selected_logits    = params.logits.masked_select(mask_tensor);
+        if (params.do_sample.has_value()) {
+            auto do_sample_npu = params.do_sample.value().to(device_type);
+            mask_tensor        = do_sample_npu.reshape({(int64_t)batch_size, 1}).logical_not();
+        }
+        if (has_temp_greedy) {
+            auto temp_npu  = params.temperature.to(device_type);
+            auto temp_mask = (temp_npu <= 0.0f).reshape({(int64_t)batch_size, 1});
+            mask_tensor    = mask_tensor.defined()
+                                 ? mask_tensor.logical_or(temp_mask)
+                                 : temp_mask;
+        }
+        selected_logits = params.logits.masked_select(mask_tensor);
     }
 
     // ---- 1. Apply temperature penalty (PyTorch op, torch_npu handles NPU) ----
@@ -633,12 +651,12 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
         if (std::any_of(params.temperature.data_ptr<float>(),
                         params.temperature.data_ptr<float>() + batch_size,
                         [](auto t) { return t != 1.0f; })) {
-            auto temperature_npu = params.temperature.to(device_type).reshape({(int64_t)batch_size, 1});
-            // temperature <= 0 means greedy (OpenAI convention: temperature=0 equals
-            // greedy). Clamp the divisor so those rows degenerate to argmax instead of
-            // producing NaN via division by zero (which made argmax return token 0).
-            temperature_npu = torch::clamp(temperature_npu, 1e-7f);
-            params.logits.div_(temperature_npu);
+            // temperature == 0 requests greedy decoding but do_sample stays true:
+            // dividing by zero yields inf/NaN and breaks argmax. Treat
+            // non-positive temperatures as 1.0 (no scaling, pure greedy).
+            auto temperature_npu = params.temperature.to(device_type);
+            temperature_npu.masked_fill_(temperature_npu <= 0.0f, 1.0f);
+            params.logits.div_(temperature_npu.reshape({(int64_t)batch_size, 1}));
         }
     }
 
