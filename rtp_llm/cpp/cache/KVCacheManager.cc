@@ -264,7 +264,18 @@ CacheLayerLayout KVCacheManager::getMainModelCacheLayerLayout() const {
         layout.layers_to_scale_buffer_ptrs.resize(config_.layer_num);
     }
 
-    layout.layer_to_groups = config_.layer_to_group_id;
+    // config_.layer_to_group_id covers ALL layers (main model + MTP draft
+    // modules, see CacheConfigCreator::createSpConfig). The main-model layout
+    // must expose only the first config_.layer_num entries: callers size their
+    // buffers by layers_to_kv_buffer_ptrs (e.g. MtpExecutor's
+    // target_kv_cache_layer_to_group), and a full-length vector would make
+    // those copies read/write out of bounds.
+    RTP_LLM_CHECK_WITH_INFO(config_.layer_to_group_id.size() >= config_.layer_num,
+                            "layer_to_group_id size [%zu] < main model layer_num [%u]",
+                            config_.layer_to_group_id.size(),
+                            config_.layer_num);
+    layout.layer_to_groups.assign(config_.layer_to_group_id.begin(),
+                                  config_.layer_to_group_id.begin() + config_.layer_num);
     layout.group_types     = config_.group_types;
     layout.layer_attn_types.resize(config_.layer_num, CacheGroupType::FULL);
 

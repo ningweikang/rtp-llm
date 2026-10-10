@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/cache/CacheConfigCreator.h"
 
+#include <algorithm>
 #include <numeric>
 
 #include "rtp_llm/cpp/cache/HybridConfigCreator.h"
@@ -100,10 +101,20 @@ CacheConfig CacheConfigCreator::createSpConfig(const ModelConfig&               
 
     int num_mtp_modules = 1;
     if (is_mtp) {
-        num_mtp_modules = sp_config.gen_num_per_cycle;
+        // G9: only allocate as many MTP modules as the draft model has layers.
+        // MtpExecutor uses module 0 exclusively ("only support one mtp model
+        // now") and Qwen3.5's single MTP layer is reused across all K proposal
+        // steps, so allocating gen_num_per_cycle modules would waste
+        // (K - draft_layer_num) * draft_layer_num layers of KV budget.
+        const int draft_layer_num = static_cast<int>(propose_config.layer_num);
+        num_mtp_modules = std::min(static_cast<int>(sp_config.gen_num_per_cycle), draft_layer_num);
         if (is_eagle) {
             num_mtp_modules = 1;
         }
+        RTP_LLM_CHECK_WITH_INFO(num_mtp_modules > 0,
+                                "num_mtp_modules must be > 0 (gen_num_per_cycle=%d, draft_layer_num=%d)",
+                                static_cast<int>(sp_config.gen_num_per_cycle),
+                                draft_layer_num);
     }
 
     uint32_t total_layer_num = score_config.layer_num;
