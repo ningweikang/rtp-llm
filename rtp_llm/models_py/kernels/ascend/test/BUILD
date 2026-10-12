@@ -55,3 +55,10 @@ py_test(
     srcs = ["test_state_migration.py"],
     deps = _DEPS,
 )
+
+py_test(
+    name = "recurrent_stepwise_vs_single_test",
+    srcs = ["test_recurrent_stepwise_vs_single.py"],
+    main = "test_recurrent_stepwise_vs_single.py",
+    deps = _DEPS,
+)
