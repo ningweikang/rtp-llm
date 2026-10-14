@@ -94,11 +94,12 @@ class AscendPrefillImpl(FMHAImplBase):
 
     @staticmethod
     def support(attn_configs, attn_inputs):
-        # MRoPE rejected: only 1-D positions are built here (same guard as the
-        # CUDA impl); multi-axis support lands with multimodal models.
+        # Rope gate: only Base/Yarn styles generate a rope cache (see C++
+        # RopeCache.cc); Glm2/DynamicNTK/QwenDynamicNTK/Llama3 return an
+        # undefined cache tensor and would fail on every forward.
         return attn_inputs.is_prefill and \
                not attn_configs.use_mla and \
-               attn_configs.rope_config.style != RopeStyle.Mrope and \
+               attn_configs.rope_config.style in (RopeStyle.No, RopeStyle.Base, RopeStyle.Yarn) and \
                torch.npu.is_available()
 
 
