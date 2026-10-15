@@ -96,14 +96,11 @@ class AscendDecodeImpl(FMHAImplBase):
 
     @staticmethod
     def support(attn_configs, attn_inputs):
-        # Rope gate: only Base/Yarn styles generate a rope cache (see C++
-        # RopeCache.cc); Glm2/DynamicNTK/QwenDynamicNTK/Llama3 return an
-        # undefined cache tensor and would fail on every forward.
         # MRoPE rejected: only 1-D positions are built here (same guard as the
         # CUDA impl); multi-axis support lands with multimodal models.
         return not attn_inputs.is_prefill and \
                not attn_configs.use_mla and \
-               attn_configs.rope_config.style in (RopeStyle.No, RopeStyle.Base, RopeStyle.Yarn) and \
+               attn_configs.rope_config.style != RopeStyle.Mrope and \
                torch.npu.is_available()
 
 

@@ -114,8 +114,8 @@ def _reset_sanitize_warn_state():
     _last_downgrade_warn_time = 0.0
 
 
-def _has_nonneutral(value, neutral) -> bool:
-    """True if a scalar-or-list sampling param deviates from its neutral value."""
+def _deviates(value, neutral) -> bool:
+    """True if a scalar-or-list sampling param deviates from its neutral (no-op) value."""
     if value is None:
         return False
     if isinstance(value, (list, tuple)):
@@ -512,13 +512,13 @@ class GenerateConfig(BaseModel):
         unsupported = []
         if self.has_num_beams():
             unsupported.append(f"num_beams={self.max_num_beams()} (beam search)")
-        if _has_nonneutral(self.repetition_penalty, 1.0):
+        if _deviates(self.repetition_penalty, 1.0):
             unsupported.append(f"repetition_penalty={self.repetition_penalty}")
-        if _has_nonneutral(self.presence_penalty, 0.0):
+        if _deviates(self.presence_penalty, 0.0):
             unsupported.append(f"presence_penalty={self.presence_penalty}")
-        if _has_nonneutral(self.frequency_penalty, 0.0):
+        if _deviates(self.frequency_penalty, 0.0):
             unsupported.append(f"frequency_penalty={self.frequency_penalty}")
-        if _has_nonneutral(self.no_repeat_ngram_size, 0):
+        if _deviates(self.no_repeat_ngram_size, 0):
             unsupported.append(f"no_repeat_ngram_size={self.no_repeat_ngram_size}")
         if unsupported:
             raise FtRuntimeException(
