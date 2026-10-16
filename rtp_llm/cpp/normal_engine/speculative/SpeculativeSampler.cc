@@ -67,11 +67,18 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_
 
     // Override per-stream uniform samples with seeded generator when random_seed is set,
     // ensuring deterministic acceptance for reproducible iter_count.
+    // The device check is required: without it, under speculative decoding on
+    // NPU, any request with a random_seed crashes the engine —
+    // GenerateStream creates a CPU generator there (no NPU generator wired
+    // yet), and torch::rand(CPU generator + NPU device options) throws a
+    // device-mismatch RuntimeError. Requests without a seed never enter this
+    // branch; mismatched-generator rows keep the default random values above
+    // (acceptance not reproducible on NPU).
     {
         int idx = 0;
         for (const auto& stream : streams) {
             auto gen = stream->getGenerator();
-            if (gen.defined()) {
+            if (gen.defined() && gen.device().type() == target_device.type()) {
                 uniform_samples_d[idx] = torch::rand({(long)propose_step_ + 1}, gen, std::nullopt, rand_options);
             }
             idx++;

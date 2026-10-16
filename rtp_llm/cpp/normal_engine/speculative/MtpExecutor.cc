@@ -253,10 +253,20 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                 "[speculative decoding] enable_cuda_graph=%d (set ENABLE_CUDA_GRAPH=1 when starting server to enable sp_prefill_draft_model_)",
                 static_cast<int>(enable_cuda_graph));
             if (enable_cuda_graph) {
+#if USING_ASCEND
+                // Ascend ACL Graph is decode-only: the separate prefill draft
+                // model exists solely to hold a prefill-shaped graph, which is
+                // unsupported on Ascend. Skip it — the draft re-propagation
+                // forward stays eager via draft_model_ with the ragged layout.
+                RTP_LLM_LOG_INFO(
+                    "[speculative decoding] Ascend: skip separate prefill draft model "
+                    "(ACL Graph is decode-only, eager fallback)");
+#else
                 RTP_LLM_LOG_INFO(
                     "[speculative decoding] creating separate prefill draft model with CUDA graph support");
                 sp_prefill_draft_model_.reset(new PyWrappedModel(
                     model_params, params.py_sp_model, true, false, draft_cache_layer_layout.layer_to_groups));
+#endif
             }
         }
         break;  // NOTE: only support one mtp model now

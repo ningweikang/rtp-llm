@@ -249,8 +249,12 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
                                                          static_cast<int>(params.parallelism_config.tp_rank));
         }
 #elif USING_ASCEND
-        // Ascend ACL Graph: decode-only. Prefill graph mode is rejected in the
-        // runner constructor — fall back to eager forward in that case.
+        // Ascend ACL Graph: decode + target-verify. A variable-length prefill
+        // graph (embedding model) is rejected by the runner constructor — fall
+        // back to eager forward. The draft model (model_id != 0) captures a
+        // plain decode graph (1 token per stream); its multi-token
+        // re-propagation forward is prefill-shaped (sequence_lengths empty)
+        // and is rejected by AscendGraphRunner::canRun, so it stays eager.
         if (is_prefill_cuda_graph_mode) {
             RTP_LLM_LOG_WARNING(
                 "Ascend ACL Graph does not support prefill cuda graph mode; "
@@ -278,10 +282,17 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
 
             graph_params.is_target_verify = use_spec_decoding;
             if (params.sp_config.type != SP_TYPE_NONE) {
-                graph_params.sp_steps           = params.sp_config.gen_num_per_cycle;
-                graph_params.num_tokens_per_bs  = params.sp_config.gen_num_per_cycle + 1;
+                graph_params.sp_steps = params.sp_config.gen_num_per_cycle;
+            }
+            // Decision table aligned with the CUDA branch above: the target
+            // model (model_id == 0) runs a K+1 token verify forward; the draft
+            // model (model_id != 0) captures a plain 1-token decode graph, and
+            // the plain decode path runs a single token per stream.
+            if (params.sp_config.type != SP_TYPE_NONE && params.sp_config.gen_num_per_cycle > 0
+                && !params.model_id) {
+                graph_params.num_tokens_per_bs = params.sp_config.gen_num_per_cycle + 1;
             } else {
-                graph_params.num_tokens_per_bs  = 1;
+                graph_params.num_tokens_per_bs = 1;
             }
 
             graph_runner_ = new AscendGraphRunner(graph_params, py_instance);
