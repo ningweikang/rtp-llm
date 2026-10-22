@@ -121,6 +121,28 @@ class TestLinearAttentionTorch(unittest.TestCase):
         self.assertEqual(fake.dtype, torch.float16)
         self.assertEqual(out.dtype, torch.float32)
 
+    def test_chunk_state_layout_matches_cache_and_attention(self):
+        class FakeOps:
+            h = None
+
+            def npu_chunk_gated_delta_rule_fwd_h(self, **kwargs):
+                return expected, kwargs["u"], None
+
+            def npu_chunk_fwd_o(self, **kwargs):
+                self.h = kwargs["h"]
+                return kwargs["v"]
+
+        fake = FakeOps()
+        k = torch.zeros(1, 129, 1, 4, dtype=torch.bfloat16)
+        u = torch.zeros(1, 129, 2, 3, dtype=torch.bfloat16)
+        # Three chunks and two heads make an accidental transpose observable.
+        expected = torch.arange(72, dtype=torch.bfloat16).reshape(1, 3, 2, 4, 3)
+        with mock.patch.object(self.module, "_get_ascendc_ops", return_value=fake):
+            h, v_new, _ = self.module.chunk_gated_delta_rule_fwd_h(k, k, u)
+            self.module.chunk_fwd_o(k, k, v_new, h)
+        torch.testing.assert_close(h, expected)
+        torch.testing.assert_close(fake.h, expected)
+
     def test_chunk_interface_rejects_head_first_layout(self):
         q = torch.zeros((1, 1, 1, 1), dtype=torch.float16)
         with self.assertRaisesRegex(NotImplementedError, "head_first=True"):

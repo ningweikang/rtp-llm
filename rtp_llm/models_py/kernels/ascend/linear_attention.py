@@ -307,7 +307,8 @@ def chunk_gated_delta_rule_fwd_h(
             "npu_chunk_gated_delta_rule_fwd_h returned an invalid result"
         )
     h, v_new, final_state = result
-    h = h.transpose(1, 2).contiguous()
+    # h already uses [B, chunks, HV, DK, DV], the order consumed by both
+    # the block-map snapshot writer and npu_chunk_fwd_o.
     v_new_out = (
         v_new.transpose(1, 2).contiguous().to(u.dtype) if save_new_value else None
     )
@@ -342,7 +343,7 @@ def chunk_fwd_o(
         q=q.transpose(1, 2).contiguous().to(compute_dtype),
         k=k.transpose(1, 2).contiguous().to(compute_dtype),
         v=v.transpose(1, 2).contiguous().to(compute_dtype),
-        h=h.transpose(1, 2).contiguous().to(compute_dtype),
+        h=h.contiguous().to(compute_dtype),
         scale=float(q.shape[-1] ** -0.5 if scale is None else scale),
         g=g_input.transpose(1, 2).contiguous().float(),
         cu_seqlens=cu,
