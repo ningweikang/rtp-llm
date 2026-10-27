@@ -1,9 +1,13 @@
 """Ascend MoE placeholder: rejects all MoE configurations.
 
-No NPU-capable MoE executor exists (Triton is excluded from Ascend deps),
-and Ascend TP (tp_size > 1) is not implemented. MoE models fail fast at
-strategy selection instead of crashing or silently dropping experts. Dense
-(non-MoE) models never reach this path.
+No NPU-capable MoE executor exists for this placeholder path (Triton is
+excluded from Ascend deps), and Ascend TP (tp_size > 1) is not implemented.
+MoE models fail fast at strategy selection instead of crashing or silently
+dropping experts. Dense (non-MoE) models never reach this path.
+
+The BF16 pure-TP CANN pipeline (AscendCannStrategy) supersedes this
+placeholder and is the strategy registered in fused_moe/__init__.py; the
+class is kept as the fail-fast contract for every other MoE configuration.
 """
 
 from typing import Any
