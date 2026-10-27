@@ -4035,7 +4035,7 @@ torch @ https://mirrors.aliyun.com/pytorch-wheels/cpu/torch-2.9.0%2Bcpu-cp310-cp
     #   timm
     #   torch-npu
     #   torchvision
-torch-npu @ https://files.pythonhosted.org/packages/78/f3/1e957440f30c48077dceadbe6ad92ec6651628db020a958bdf7ecc00558e/torch_npu-2.9.0-cp310-cp310-manylinux_2_28_x86_64.whl \
+torch-npu @ https://gitcode.com/Ascend/pytorch/releases/download/v26.1.0-beta.1-pytorch2.9.0/torch_npu-2.9.0.post3-cp310-cp310-manylinux_2_28_x86_64.whl \
     --hash=sha256:3d436f74af70089b4320e6dae374641ddfb76712cdd593e67763ded33cf31a2a
     # via -r requirements_ascend_x86.txt
 torchvision==0.24.0 \
