@@ -74,11 +74,15 @@ elif device_type == DeviceType.Ascend:
     # ========== Ascend Registry ==========
 
     from rtp_llm.models_py.modules.factory.fused_moe.impl.ascend.strategy import (
-        AscendBf16FallbackStrategy,
+        AscendCannStrategy,
     )
 
+    # CANN expert pipeline for BF16 pure-TP MoE (Qwen3.5 eager). The
+    # AscendBf16FallbackStrategy placeholder stays out of the registry: it
+    # raises from get_attributes(), which would abort candidate evaluation
+    # before the CANN strategy could be selected.
     registry = StrategyRegistry()
-    registry.register(AscendBf16FallbackStrategy())
+    registry.register(AscendCannStrategy())
     FusedMoeFactory.set_registry(registry)
 
 else:
