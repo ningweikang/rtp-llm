@@ -1377,8 +1377,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         valid_mask = attn_meta.cp_local_valid_mask
         local_attn_out[valid_mask] = full_attn_out[attn_meta.cp_local_extract_indices]
 
+        # Per-head gated RMSNorm (weight [head_dim]): match main's Triton
+        # semantics, which normalizes each value head independently.
         local_attn_out = self.norm(
-            local_attn_out.reshape(-1, self.local_num_v_heads * self.head_v_dim), z
+            local_attn_out.reshape(-1, self.head_v_dim),
+            z.reshape(-1, self.head_v_dim),
+        )
+        local_attn_out = local_attn_out.reshape(
+            -1, self.local_num_v_heads * self.head_v_dim
         )
         local_attn_out = self.out_proj(local_attn_out)
         return local_attn_out
@@ -1414,8 +1420,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             attn_output = self.decode_gdn(
                 mixed_qkv, b, a, attention_inputs, kv_cache, attn_meta
             )
+        # Per-head gated RMSNorm (weight [head_dim]): match main's Triton
+        # semantics, which normalizes each value head independently.
         attn_output = self.norm(
-            attn_output.reshape(-1, self.local_num_v_heads * self.head_v_dim), z
+            attn_output.reshape(-1, self.head_v_dim),
+            z.reshape(-1, self.head_v_dim),
+        )
+        attn_output = attn_output.reshape(
+            -1, self.local_num_v_heads * self.head_v_dim
         )
         attn_output = self.out_proj(attn_output)
         if self.parallelism_config.get_attn_tp_size() > 1:
@@ -1850,6 +1862,12 @@ class Qwen35Model(Qwen3NextModel):
 
     def word_embedding(self, inputs: PyModelInputs) -> torch.Tensor:
         input_ids: torch.Tensor = inputs.input_ids
+
+        if _IS_ASCEND:
+            # Ascend text-only serving: the Ascend Embedding is a pure lookup
+            # (no position/token-type args and no multimodal injector input),
+            # and _parse_mm_config keeps the model non-multimodal there.
+            return self.embed_tokens(input_ids)
 
         position_ids = inputs.combo_position_ids
         token_type_ids = inputs.embedding_inputs.combo_tokens_type_ids
