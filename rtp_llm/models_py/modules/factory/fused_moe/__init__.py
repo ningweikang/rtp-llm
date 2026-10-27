@@ -74,15 +74,15 @@ elif device_type == DeviceType.Ascend:
     # ========== Ascend Registry ==========
 
     from rtp_llm.models_py.modules.factory.fused_moe.impl.ascend.strategy import (
+        AscendBf16FallbackStrategy,
         AscendCannStrategy,
     )
 
-    # CANN expert pipeline for BF16 pure-TP MoE (Qwen3.5 eager). The
-    # AscendBf16FallbackStrategy placeholder stays out of the registry: it
-    # raises from get_attributes(), which would abort candidate evaluation
-    # before the CANN strategy could be selected.
     registry = StrategyRegistry()
+    # CANN pipeline first (eager); the pure-PyTorch fallback covers
+    # configurations where the CANN strategy opts out (align with main #53).
     registry.register(AscendCannStrategy())
+    registry.register(AscendBf16FallbackStrategy())
     FusedMoeFactory.set_registry(registry)
 
 else:

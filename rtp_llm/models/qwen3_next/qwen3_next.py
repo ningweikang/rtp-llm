@@ -1,9 +1,11 @@
 import json
+import logging
 import os
 from typing import Any, Dict, List
 
 from rtp_llm.config.kv_cache_config import KVCacheConfig
 from rtp_llm.config.model_config import ModelConfig, ssm_state_dtype_str_to_data_type
+from rtp_llm.device.device_type import is_ascend
 from rtp_llm.model_factory_register import register_model
 from rtp_llm.models.base_model import BaseModel
 from rtp_llm.models.hybrid_kv_cache import build_hybrid_kv_cache_spec_descs
@@ -234,10 +236,6 @@ class Qwen35Moe(Qwen3NextBase):
 
     @classmethod
     def _parse_rope_config(cls, config_json: dict, config: ModelConfig):
-        import logging
-
-        from rtp_llm.device.device_type import is_ascend
-
         rope_parameters = config_json["rope_parameters"]
         mrope_interleaved = rope_parameters.get("mrope_interleaved", True)
         if not mrope_interleaved:
@@ -278,10 +276,6 @@ class Qwen35Moe(Qwen3NextBase):
 
     @classmethod
     def _parse_mm_config(cls, config_json: dict, config: ModelConfig):
-        import logging
-
-        from rtp_llm.device.device_type import is_ascend
-
         # Ascend serves Qwen3.5 text-only for now: the Ascend attention impls
         # build 1-D positions and reject MRoPE, so keeping the multimodal flag
         # would make the engine build the vision tower on a CUDA device string
@@ -315,7 +309,6 @@ class Qwen35Moe(Qwen3NextBase):
             is_hip,
             is_ppu,
         )
-        from rtp_llm.device.device_type import is_ascend
 
         # Per-model allowlist: a device belongs here once it has the attention,
         # MoE and MRoPE impls Qwen35Model needs. Naming the device in the message
