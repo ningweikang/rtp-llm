@@ -234,12 +234,33 @@ class Qwen35Moe(Qwen3NextBase):
 
     @classmethod
     def _parse_rope_config(cls, config_json: dict, config: ModelConfig):
+        import logging
+
+        from rtp_llm.device.device_type import is_ascend
+
         rope_parameters = config_json["rope_parameters"]
         mrope_interleaved = rope_parameters.get("mrope_interleaved", True)
         if not mrope_interleaved:
             raise ValueError(
                 "Qwen3Next requires rope_parameters.mrope_interleaved to be true"
             )
+        if is_ascend():
+            # Ascend serves text-only with 1-D positions (same rationale as
+            # _parse_mm_config below): the Ascend RoPE cache only supports
+            # Base/Yarn and the attention impls build 1-D positions, so keep
+            # the rope style at Base like main does for text-only serving.
+            # (main: "TODO@xieshui support mrope in cuda graph and reopen")
+            logging.warning(
+                "Qwen3.5 on Ascend: rope style downgraded Mrope->Base for "
+                "text-only serving (1-D positions)."
+            )
+            config.attn_config.rope_config.style = 1
+            config.attn_config.rope_config.base = rope_parameters["rope_theta"]
+            config.partial_rotary_factor = rope_parameters["partial_rotary_factor"]
+            config.attn_config.rope_config.dim = int(
+                config.attn_config.size_per_head * config.partial_rotary_factor
+            )
+            return
         config.attn_config.rope_config.style = 7
         config.attn_config.rope_config.base = rope_parameters["rope_theta"]
         config.partial_rotary_factor = rope_parameters["partial_rotary_factor"]
@@ -257,6 +278,22 @@ class Qwen35Moe(Qwen3NextBase):
 
     @classmethod
     def _parse_mm_config(cls, config_json: dict, config: ModelConfig):
+        import logging
+
+        from rtp_llm.device.device_type import is_ascend
+
+        # Ascend serves Qwen3.5 text-only for now: the Ascend attention impls
+        # build 1-D positions and reject MRoPE, so keeping the multimodal flag
+        # would make the engine build the vision tower on a CUDA device string
+        # and fail. Leaving the flag false makes the C++ ingress resolver pick
+        # "no mm processor" instead of asserting on a LOCAL vit with no local
+        # engine.
+        if is_ascend():
+            logging.warning(
+                "Qwen3.5 multimodal checkpoint on Ascend: serving text-only "
+                "(no ViT support in the Ascend python model yet)."
+            )
+            return
         config.mm_model_config.is_multimodal = True
         config.mm_model_config.mm_sep_tokens = [
             [config_json["vision_start_token_id"], config_json["vision_end_token_id"]]
@@ -278,11 +315,12 @@ class Qwen35Moe(Qwen3NextBase):
             is_hip,
             is_ppu,
         )
+        from rtp_llm.device.device_type import is_ascend
 
         # Per-model allowlist: a device belongs here once it has the attention,
         # MoE and MRoPE impls Qwen35Model needs. Naming the device in the message
         # keeps it truthful as the list grows.
-        if not is_cuda() and not is_hip() and not is_ppu():
+        if not is_cuda() and not is_hip() and not is_ppu() and not is_ascend():
             raise RuntimeError(
                 "Qwen3Next has no python-model implementation for "
                 f"{get_device_type().name}"
