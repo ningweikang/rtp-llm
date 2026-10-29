@@ -79,8 +79,7 @@ elif device_type == DeviceType.Ascend:
     )
 
     registry = StrategyRegistry()
-    # CANN pipeline first (eager); the pure-PyTorch fallback covers
-    # configurations where the CANN strategy opts out (align with main #53).
+    # CANN first; the PyTorch fallback covers CANN opt-out configs.
     registry.register(AscendCannStrategy())
     registry.register(AscendBf16FallbackStrategy())
     FusedMoeFactory.set_registry(registry)
