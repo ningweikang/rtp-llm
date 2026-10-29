@@ -1,0 +1,2 @@
+#!/bin/sh
+# post-commit hook (placeholder — oss-lfs does not need post-commit processing)

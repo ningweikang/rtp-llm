@@ -1,0 +1,791 @@
+#include "gtest/gtest.h"
+
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "rtp_llm/cpp/cache/CacheConfig.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
+#include "rtp_llm/cpp/cache/CoordinatorCacheManager.h"
+#include "rtp_llm/cpp/disaggregate/cache_store/CacheStore.h"
+#include "rtp_llm/models_py/bindings/OpDefs.h"
+#include "rtp_llm/models_py/bindings/core/CacheStoreAsyncWriter.h"
+
+#if USING_CUDA
+#include <cuda_runtime.h>
+#elif USING_ROCM
+#include <hip/hip_runtime.h>
+#endif
+
+namespace rtp_llm {
+
+#if USING_CUDA || USING_ROCM
+namespace {
+
+int gpuDeviceCountForTest() {
+#if USING_CUDA
+    int device_count = 0;
+    return cudaGetDeviceCount(&device_count) == cudaSuccess ? device_count : 0;
+#elif USING_ROCM
+    int device_count = 0;
+    return hipGetDeviceCount(&device_count) == hipSuccess ? device_count : 0;
+#else
+    return 0;
+#endif
+}
+
+int currentDeviceForTest() {
+#if USING_CUDA
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return -1;
+    }
+    return device;
+#elif USING_ROCM
+    int device = -1;
+    if (hipGetDevice(&device) != hipSuccess) {
+        return -1;
+    }
+    return device;
+#else
+    return -1;
+#endif
+}
+
+bool setDeviceForTest(int device) {
+#if USING_CUDA
+    return cudaSetDevice(device) == cudaSuccess;
+#elif USING_ROCM
+    return hipSetDevice(device) == hipSuccess;
+#else
+    return false;
+#endif
+}
+
+class ScopedDeviceResetForTest {
+public:
+    ScopedDeviceResetForTest(): original_device_(currentDeviceForTest()) {}
+    ~ScopedDeviceResetForTest() {
+        if (original_device_ >= 0) {
+            setDeviceForTest(original_device_);
+        }
+    }
+
+    ScopedDeviceResetForTest(const ScopedDeviceResetForTest&) = delete;
+    ScopedDeviceResetForTest& operator=(const ScopedDeviceResetForTest&) = delete;
+
+private:
+    int original_device_;
+};
+
+}  // namespace
+#endif
+
+class CacheStoreAsyncWriterTest: public ::testing::Test {};
+
+static CacheConfig makeWriterTestCacheConfig(const std::string& tag, size_t kv_stride, uint32_t block_num = 1) {
+    CacheConfig config;
+    config.dtype              = DataType::TYPE_BF16;
+    config.layer_num          = 1;
+    config.seq_size_per_block = 1;
+
+    AttentionConfigs attn_config;
+    attn_config.kv_head_num   = 1;
+    attn_config.size_per_head = static_cast<int>(kv_stride / (2 * getTypeSize(config.dtype)));
+    ParallelismConfig parallelism_config;
+    parallelism_config.tp_size = 1;
+    KVCacheSpecDesc desc;
+    desc.tag        = tag;
+    desc.cache_type = KVCacheSpecType::MultiHeadAttention;
+    desc.dtype      = config.dtype;
+    SpecBuildContext ctx;
+    ctx.dtype              = config.dtype;
+    ctx.seq_size_per_block = 1;
+    ctx.attn_config        = &attn_config;
+    ctx.parallelism_config = &parallelism_config;
+    auto spec              = SpecBuilder::build(desc, ctx);
+
+    GroupBase group;
+    group.tag       = tag;
+    group.spec      = spec;
+    group.policy    = defaultCacheGroupPolicy(CacheGroupType::FULL);
+    group.block_num = block_num;
+
+    config.setTopology({std::move(group)}, {{0, {tag}}});
+    return config;
+}
+
+class DelayedCacheStore: public CacheStore {
+public:
+    void store(const std::shared_ptr<RequestBlockBuffer>& buffer, CacheStoreStoreDoneCallback callback) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        buffer_   = buffer;
+        callback_ = std::move(callback);
+    }
+
+    bool hasPendingStore() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<bool>(callback_);
+    }
+
+    bool completeStore(bool success = true) {
+        CacheStoreStoreDoneCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            callback = std::move(callback_);
+            buffer_.reset();
+        }
+        if (!callback) {
+            return false;
+        }
+        callback(success, success ? CacheStoreErrorCode::None : CacheStoreErrorCode::StoreFailed);
+        return true;
+    }
+
+    void load(const std::shared_ptr<RequestBlockBuffer>&,
+              CacheStoreLoadDoneCallback callback,
+              const std::string&,
+              uint32_t,
+              uint32_t,
+              uint32_t,
+              int,
+              int) override {
+        callback(true, CacheStoreErrorCode::None);
+    }
+
+    std::shared_ptr<LoadContext> loadBuffers(const std::vector<std::shared_ptr<RequestBlockBuffer>>&,
+                                             const std::string&,
+                                             uint32_t,
+                                             uint32_t,
+                                             int64_t,
+                                             LoadContext::CheckCancelFunc,
+                                             int,
+                                             int) override {
+        return nullptr;
+    }
+
+    std::shared_ptr<StoreContext> storeBuffers(const std::vector<std::shared_ptr<RequestBlockBuffer>>&,
+                                               int64_t) override {
+        return nullptr;
+    }
+
+    std::shared_ptr<RemoteStoreTask>
+    submitRemoteStoreTask(const std::shared_ptr<RemoteStoreRequest>&,
+                          const std::shared_ptr<CacheStoreRemoteStoreMetricsCollector>&,
+                          RemoteStoreTask::CheckCancelFunc) override {
+        return nullptr;
+    }
+
+    void releaseRemoteStoreTask(const std::shared_ptr<RemoteStoreTask>&) override {}
+
+    bool regUserBuffers(const std::vector<std::shared_ptr<BlockBuffer>>&) override {
+        return true;
+    }
+
+    std::shared_ptr<BlockBuffer> findUserBuffer(const std::string&) override {
+        return nullptr;
+    }
+
+    const std::shared_ptr<MemoryUtil>& getMemoryUtil() const override {
+        return null_memory_util_;
+    }
+
+    void debugInfo() override {}
+
+private:
+    mutable std::mutex                  mutex_;
+    std::shared_ptr<RequestBlockBuffer> buffer_;
+    CacheStoreStoreDoneCallback         callback_;
+    std::shared_ptr<MemoryUtil>         null_memory_util_;
+};
+
+TEST_F(CacheStoreAsyncWriterTest, InitAndWaitBasic) {
+    CacheStoreAsyncWriter writer;
+
+    writer.init();
+
+    std::atomic<int> counter{0};
+    writer.submit([&counter]() { counter.fetch_add(1); });
+    writer.submit([&counter]() { counter.fetch_add(1); });
+    writer.submit([&counter]() { counter.fetch_add(1); });
+
+    writer.waitAllDone();
+    ASSERT_EQ(3, counter.load());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, WaitAllDoneWhileIdleThrows) {
+    CacheStoreAsyncWriter writer;
+    ASSERT_ANY_THROW(writer.waitAllDone());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, SubmitWhileIdleThrows) {
+    CacheStoreAsyncWriter writer;
+    ASSERT_ANY_THROW(writer.submit([]() {}));
+}
+
+TEST_F(CacheStoreAsyncWriterTest, InitWhileRunningThrows) {
+    CacheStoreAsyncWriter writer;
+    writer.init();
+
+    ASSERT_ANY_THROW(writer.init());
+
+    // Writer should still be functional after the failed second init.
+    std::atomic<int> counter{0};
+    writer.submit([&counter]() { counter.fetch_add(1); });
+    writer.waitAllDone();
+    ASSERT_EQ(1, counter.load());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, InitWaitCycle) {
+    CacheStoreAsyncWriter writer;
+    std::vector<int>      order;
+    std::mutex            order_mutex;
+
+    writer.init();
+    writer.submit([&]() {
+        std::lock_guard<std::mutex> lock(order_mutex);
+        order.push_back(1);
+    });
+    writer.submit([&]() {
+        std::lock_guard<std::mutex> lock(order_mutex);
+        order.push_back(2);
+    });
+    writer.waitAllDone();
+
+    ASSERT_EQ(2u, order.size());
+
+    writer.init();
+    writer.submit([&]() {
+        std::lock_guard<std::mutex> lock(order_mutex);
+        order.push_back(3);
+    });
+    writer.waitAllDone();
+
+    ASSERT_EQ(3u, order.size());
+    ASSERT_EQ(3, order.back());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, AsyncExecution) {
+    CacheStoreAsyncWriter writer;
+    writer.init();
+
+    auto              main_tid = std::this_thread::get_id();
+    std::atomic<bool> different_thread{false};
+
+    writer.submit([&]() {
+        if (std::this_thread::get_id() != main_tid) {
+            different_thread.store(true);
+        }
+    });
+    writer.waitAllDone();
+
+    ASSERT_TRUE(different_thread.load());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, AsyncExecutionWithDeviceId) {
+#if USING_CUDA || USING_ROCM
+    const int device_count = gpuDeviceCountForTest();
+    if (device_count < 2) {
+        GTEST_SKIP() << "Need at least two GPU devices to prove non-default device pinning";
+    }
+
+    ScopedDeviceResetForTest reset_device;
+    const int                kMainThreadDevice = device_count > 2 ? 1 : 0;
+    // Two-device hosts cannot use both a nonzero parent and a non-default writer.
+    // Prefer writer=1 there so the assertion is not satisfied by the runtime default.
+    const int kWriterDevice = device_count > 2 ? 2 : 1;
+    ASSERT_NE(kMainThreadDevice, kWriterDevice);
+    ASSERT_GT(kWriterDevice, 0);
+    ASSERT_TRUE(setDeviceForTest(kMainThreadDevice));
+    ASSERT_EQ(kMainThreadDevice, currentDeviceForTest());
+
+    CacheStoreAsyncWriter writer(kWriterDevice);
+    writer.init();
+
+    std::atomic<int> counter{0};
+    std::atomic<int> observed_device{-1};
+    writer.submit([&counter, &observed_device]() {
+        observed_device.store(currentDeviceForTest(), std::memory_order_release);
+        counter.fetch_add(1);
+    });
+    writer.waitAllDone();
+
+    ASSERT_EQ(1, counter.load());
+    ASSERT_EQ(kWriterDevice, observed_device.load(std::memory_order_acquire));
+    ASSERT_EQ(kMainThreadDevice, currentDeviceForTest());
+#else
+    GTEST_SKIP() << "GPU device pinning is unavailable in CPU-only builds";
+#endif
+}
+
+TEST_F(CacheStoreAsyncWriterTest, SelectsRequestedMtpCacheConfig) {
+    auto main_config = makeWriterTestCacheConfig("main", /*kv_stride=*/16);
+    main_config.mtp_sub_configs.push_back(
+        std::make_shared<CacheConfig>(makeWriterTestCacheConfig("draft", /*kv_stride=*/32)));
+    auto cache_manager = std::make_shared<KVCacheManager>(main_config, /*warmup=*/true);
+
+    CacheStoreAsyncWriter writer(
+        /*device_id=*/-1, cache_manager, /*cache_model_id=*/7, /*mtp_cache_config_index=*/0);
+
+    EXPECT_EQ(writer.cache_manager_, cache_manager);
+    EXPECT_EQ(writer.cache_config_->groupTags(), std::vector<std::string>{"draft"});
+    EXPECT_EQ(writer.cache_model_id_, 7);
+    EXPECT_EQ(writer.cp_rank_, 0);
+    EXPECT_EQ(writer.cp_size_, 1);
+}
+
+TEST_F(CacheStoreAsyncWriterTest, UsesPhysicalCpTopologyFromAllocatorMapper) {
+    auto              config = makeWriterTestCacheConfig("default", /*kv_stride=*/16);
+    ParallelismConfig parallelism;
+    parallelism.tp_rank                            = 1;
+    parallelism.tp_size                            = 2;
+    parallelism.prefill_cp_config.method           = CPRotateMethod::ALL_GATHER;
+    parallelism.prefill_cp_config.kv_cache_sharded = true;
+    auto cache_manager                             = std::make_shared<KVCacheManager>(
+        config, /*warmup=*/true, /*metrics_reporter=*/nullptr, KVCacheConfig{}, parallelism);
+    CacheStoreAsyncWriter writer(/*device_id=*/-1, cache_manager);
+
+    EXPECT_EQ(writer.cp_rank_, 1);
+    EXPECT_EQ(writer.cp_size_, 2);
+}
+
+TEST_F(CacheStoreAsyncWriterTest, ForwardCpWithoutPhysicalShardingKeepsCompleteNamespace) {
+    for (size_t tp_rank = 0; tp_rank < 2; ++tp_rank) {
+        auto              config = makeWriterTestCacheConfig("default", /*kv_stride=*/16);
+        ParallelismConfig parallelism;
+        parallelism.tp_rank                            = tp_rank;
+        parallelism.tp_size                            = 2;
+        parallelism.prefill_cp_config.method           = CPRotateMethod::ALL_GATHER;
+        parallelism.prefill_cp_config.kv_cache_sharded = false;
+        auto cache_manager                             = std::make_shared<KVCacheManager>(
+            config, /*warmup=*/true, /*metrics_reporter=*/nullptr, KVCacheConfig{}, parallelism);
+        CacheStoreAsyncWriter writer(/*device_id=*/-1, cache_manager);
+
+        EXPECT_EQ(writer.cp_rank_, 0) << "tp_rank=" << tp_rank;
+        EXPECT_EQ(writer.cp_size_, 1) << "tp_rank=" << tp_rank;
+    }
+}
+
+TEST_F(CacheStoreAsyncWriterTest, ExceptionPropagation) {
+    CacheStoreAsyncWriter writer;
+    writer.init();
+
+    writer.submit([]() { throw std::runtime_error("test error"); });
+
+    ASSERT_THROW(writer.waitAllDone(), std::runtime_error);
+    ASSERT_EQ(0, writer.pending_count_.load());
+    ASSERT_EQ(CacheStoreAsyncWriter::State::IDLE, writer.state_);
+
+    // After exception, writer should be back in IDLE and re-initializable.
+    writer.init();
+    std::atomic<int> counter{0};
+    writer.submit([&counter]() { counter.fetch_add(1); });
+    writer.waitAllDone();
+    ASSERT_EQ(1, counter.load());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, FirstExceptionKeptOnMultipleFailures) {
+    CacheStoreAsyncWriter writer;
+    writer.init();
+
+    writer.submit([]() { throw std::runtime_error("first"); });
+    writer.submit([]() { throw std::runtime_error("second"); });
+
+    try {
+        writer.waitAllDone();
+        FAIL() << "expected exception";
+    } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        ASSERT_TRUE(msg == "first" || msg == "second") << "unexpected: " << msg;
+    }
+}
+
+TEST_F(CacheStoreAsyncWriterTest, WaitWithoutSubmit) {
+    CacheStoreAsyncWriter writer;
+    writer.init();
+    writer.waitAllDone();
+}
+
+TEST_F(CacheStoreAsyncWriterTest, FinishSubmissionsDoesNotFinishPublication) {
+    CacheStoreAsyncWriter writer;
+    writer.init(/*track_store_completions=*/true);
+    auto complete = writer.registerStoreCompletion();
+
+    writer.finishSubmissions();
+
+    EXPECT_EQ(CacheStoreAsyncWriter::State::IDLE, writer.state_);
+    EXPECT_NE(writer.finished_store_completion_state_, nullptr);
+    EXPECT_ANY_THROW(writer.init(/*track_store_completions=*/true));
+
+    complete(nullptr);
+    EXPECT_NO_THROW(writer.waitStoreCompletions());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, DelayedPublicationCompletesBeforeTerminalTimeout) {
+    CacheStoreAsyncWriter writer(
+        /*device_id=*/-1, nullptr, /*cache_model_id=*/0, std::nullopt, std::chrono::milliseconds(500));
+    writer.init(/*track_store_completions=*/true);
+    auto complete = writer.registerStoreCompletion();
+    writer.finishSubmissions();
+
+    std::thread delayed_completion([complete]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        complete(nullptr);
+    });
+    EXPECT_NO_THROW(writer.waitStoreCompletions());
+    delayed_completion.join();
+}
+
+TEST_F(CacheStoreAsyncWriterTest, MissingPublicationCallbackTimesOutAndReleasesCycle) {
+    CacheStoreAsyncWriter writer(
+        /*device_id=*/-1, nullptr, /*cache_model_id=*/0, std::nullopt, std::chrono::milliseconds(20));
+    writer.init(/*track_store_completions=*/true);
+    auto missing_completion = writer.registerStoreCompletion();
+    (void)missing_completion;
+    writer.finishSubmissions();
+
+    EXPECT_THROW(writer.waitStoreCompletions(), std::runtime_error);
+    EXPECT_EQ(writer.finished_store_completion_state_, nullptr);
+
+    writer.init(/*track_store_completions=*/true);
+    writer.finishSubmissions();
+    EXPECT_NO_THROW(writer.waitStoreCompletions());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, LatePublicationCallbackAfterTimeoutIsIgnored) {
+    CacheStoreAsyncWriter writer(
+        /*device_id=*/-1, nullptr, /*cache_model_id=*/0, std::nullopt, std::chrono::milliseconds(20));
+    writer.init(/*track_store_completions=*/true);
+    auto complete = writer.registerStoreCompletion();
+    writer.finishSubmissions();
+
+    EXPECT_THROW(writer.waitStoreCompletions(), std::runtime_error);
+    EXPECT_NO_THROW(complete(nullptr));
+    EXPECT_NO_THROW(complete(std::make_exception_ptr(std::runtime_error("duplicate late failure"))));
+}
+
+TEST_F(CacheStoreAsyncWriterTest, TimeoutRetainsAllocatorBlockUntilLatePublicationCompletes) {
+    auto config    = makeWriterTestCacheConfig("default", /*kv_stride=*/16, /*block_num=*/2);
+    auto allocator = std::make_shared<CoordinatorCacheManager>(config, AllocationType::HOST);
+    ASSERT_TRUE(allocator->init());
+    const auto initial_free_blocks = allocator->freeBlocksNum();
+    ASSERT_GT(initial_free_blocks, 0u);
+
+    ASSERT_EQ(allocator->groupBlockPools().size(), 1u);
+    auto pool      = allocator->groupBlockPools().front();
+    auto allocated = pool->malloc(1);
+    ASSERT_TRUE(allocated.has_value());
+    const auto request_blocks = allocated.value();
+    pool->incRef(request_blocks);
+
+    KVCacheResource resource;
+    resource.initGroups(config.topologyPtr());
+    resource.setCacheKeys({42});
+    resource.mutableBlockIds("default").assign(request_blocks);
+    auto publication_lease = allocator->incrKVCacheRef(resource, {42}, /*is_connector=*/true);
+    ASSERT_NE(publication_lease, nullptr);
+    pool->decRef(request_blocks);  // Request ends; the store still owns its lease.
+    ASSERT_EQ(allocator->freeBlocksNum() + 1, initial_free_blocks);
+
+    CacheStoreAsyncWriter writer(
+        /*device_id=*/-1, nullptr, /*cache_model_id=*/0, std::nullopt, std::chrono::milliseconds(20));
+    writer.init(/*track_store_completions=*/true);
+    auto complete = writer.registerStoreCompletion(std::move(publication_lease));
+    writer.finishSubmissions();
+
+    EXPECT_THROW(writer.waitStoreCompletions(), std::runtime_error);
+    EXPECT_EQ(allocator->freeBlocksNum() + 1, initial_free_blocks)
+        << "the timed-out store can still publish the old key, so its block must not be reusable";
+
+    complete(nullptr);
+    EXPECT_EQ(allocator->freeBlocksNum(), initial_free_blocks);
+}
+
+TEST_F(CacheStoreAsyncWriterTest, OrdinaryWriteRetainsAllocatorBlockUntilStoreCallback) {
+    auto       config    = makeWriterTestCacheConfig("stored", /*kv_stride=*/16, /*block_num=*/3);
+    const auto unrelated = makeWriterTestCacheConfig("unrelated", /*kv_stride=*/16, /*block_num=*/3);
+    config.setTopology({unrelated.topology().groups().front(), config.topology().groups().front()},
+                       {{0, {"unrelated", "stored"}}});
+    auto cache_manager = std::make_shared<KVCacheManager>(config, /*warmup=*/false);
+    ASSERT_TRUE(cache_manager->init());
+    const auto initial_free_blocks = cache_manager->freeBlocksNum();
+    ASSERT_EQ(cache_manager->coordinator_manager_->groupBlockPools().size(), 2u);
+    auto       other_pool        = cache_manager->coordinator_manager_->groupBlockPools().front();
+    auto       pool              = cache_manager->coordinator_manager_->groupBlockPools().back();
+    const auto other_free_before = other_pool->freeBlocksNum();
+    auto       allocated         = pool->malloc(1);
+    ASSERT_TRUE(allocated.has_value());
+    const auto request_blocks = allocated.value();
+    pool->incRef(request_blocks);
+    auto cache_store = std::make_shared<DelayedCacheStore>();
+    cache_manager->setCacheStore(cache_store);
+
+    torch_ext::PyCacheStoreInputs inputs;
+    inputs.input_lengths_host    = torch::tensor({1}, torch::kInt32);
+    inputs.prefix_lengths_host   = torch::tensor({0}, torch::kInt32);
+    inputs.host_kv_cache_offset  = torch::tensor({request_blocks.front()}, torch::kInt32).reshape({1, 1});
+    inputs.request_id            = torch::tensor({int64_t{42}}, torch::kInt64);
+    inputs.request_pd_separation = torch::tensor({true}, torch::kBool);
+    inputs.cache_keys            = torch::tensor({int64_t{7001}}, torch::kInt64).reshape({1, 1});
+
+    auto                    layout = cache_manager->getMainModelGroupedCacheLayerLayout();
+    torch_ext::LayerKVCache layer_cache;
+    layer_cache.kv_cache_base      = layout.at("stored", 0).kv_addr;
+    layer_cache.seq_size_per_block = 1;
+    layer_cache.layer_id           = 0;
+    layer_cache.tag                = "stored";
+
+    CacheStoreAsyncWriter writer(/*device_id=*/-1, cache_manager, /*cache_model_id=*/0);
+    writer.init(/*track_store_completions=*/false);
+    writer.write(inputs, layer_cache);
+    writer.waitAllDone();
+    pool->decRef(request_blocks);  // Only the pending store may keep the block alive.
+    EXPECT_EQ(other_pool->freeBlocksNum(), other_free_before);
+
+    ASSERT_TRUE(cache_store->hasPendingStore());
+    EXPECT_EQ(cache_manager->freeBlocksNum() + 1, initial_free_blocks)
+        << "ordinary forward completion must not release an in-flight store's KV block";
+
+    ASSERT_TRUE(cache_store->completeStore());
+    EXPECT_EQ(cache_manager->freeBlocksNum(), initial_free_blocks);
+    EXPECT_EQ(other_pool->freeBlocksNum(), other_free_before);
+}
+
+class CacheStoreAsyncWriterTpTest: public ::testing::TestWithParam<std::tuple<int, bool, bool>> {};
+
+TEST_P(CacheStoreAsyncWriterTpTest, PublicationPinsOnlyAllocatorOwner) {
+    const auto [tp_rank, tracked, store_success] = GetParam();
+    auto              config = makeWriterTestCacheConfig("default", /*kv_stride=*/16, /*block_num=*/2);
+    ParallelismConfig parallelism;
+    parallelism.tp_size = 4;
+    parallelism.tp_rank = tp_rank;
+    parallelism.dp_size = 2;
+    parallelism.dp_rank = 1;
+    // Skip constructor collectives, then initialize real pools on every simulated rank.
+    auto cache_manager = std::make_shared<KVCacheManager>(
+        config, /*warmup=*/true, /*metrics_reporter=*/nullptr, KVCacheConfig{}, parallelism);
+    ASSERT_TRUE(cache_manager->init());
+    ASSERT_TRUE(cache_manager->initialized());
+    const auto initial_free_blocks = cache_manager->freeBlocksNum();
+    ASSERT_EQ(cache_manager->coordinator_manager_->groupBlockPools().size(), 1u);
+    auto    pool     = cache_manager->coordinator_manager_->groupBlockPools().front();
+    int32_t block_id = 1;
+    if (tp_rank == 0) {
+        auto allocated = pool->malloc(1);
+        ASSERT_TRUE(allocated.has_value());
+        block_id = allocated->front();
+        pool->incRef(block_id);
+    }
+    // Followers receive a valid physical ID without a local allocator allocation.
+    ASSERT_EQ(pool->isAllocated(block_id), tp_rank == 0);
+    auto cache_store = std::make_shared<DelayedCacheStore>();
+    cache_manager->setCacheStore(cache_store);
+
+    torch_ext::PyCacheStoreInputs inputs;
+    inputs.input_lengths_host    = torch::tensor({1}, torch::kInt32);
+    inputs.prefix_lengths_host   = torch::tensor({0}, torch::kInt32);
+    inputs.host_kv_cache_offset  = torch::tensor({block_id}, torch::kInt32).reshape({1, 1});
+    inputs.request_id            = torch::tensor({int64_t{42}}, torch::kInt64);
+    inputs.request_pd_separation = torch::tensor({true}, torch::kBool);
+    inputs.cache_keys            = torch::tensor({int64_t{7001}}, torch::kInt64).reshape({1, 1});
+
+    const auto              layout = cache_manager->getMainModelGroupedCacheLayerLayout();
+    torch_ext::LayerKVCache layer_cache;
+    layer_cache.kv_cache_base      = layout.at("default", 0).kv_addr;
+    layer_cache.seq_size_per_block = 1;
+    layer_cache.layer_id           = 0;
+    layer_cache.tag                = "default";
+
+    CacheStoreAsyncWriter writer(/*device_id=*/-1, cache_manager);
+    writer.init(tracked);
+    ASSERT_NO_THROW(writer.write(inputs, layer_cache));
+    if (tracked) {
+        ASSERT_NO_THROW(writer.finishSubmissions());
+        ASSERT_NE(writer.finished_store_completion_state_, nullptr);
+        EXPECT_EQ(writer.finished_store_completion_state_->pending_count, 1);
+    } else {
+        ASSERT_NO_THROW(writer.waitAllDone());
+    }
+    ASSERT_TRUE(cache_store->hasPendingStore());
+    if (tp_rank == 0) {
+        pool->decRef(block_id);
+        EXPECT_EQ(pool->refCount(block_id), 1);
+    }
+    EXPECT_EQ(cache_manager->freeBlocksNum(), initial_free_blocks - (tp_rank == 0 ? 1 : 0));
+
+    ASSERT_TRUE(cache_store->completeStore(store_success));
+    if (tracked) {
+        if (store_success) {
+            EXPECT_NO_THROW(writer.waitStoreCompletions());
+        } else {
+            EXPECT_THROW(writer.waitStoreCompletions(), std::runtime_error);
+        }
+    }
+    EXPECT_EQ(cache_manager->freeBlocksNum(), initial_free_blocks);
+    EXPECT_FALSE(pool->isAllocated(block_id));
+    writer.init(tracked);
+    EXPECT_NO_THROW(writer.waitAllDone());
+}
+
+INSTANTIATE_TEST_SUITE_P(TpRanks,
+                         CacheStoreAsyncWriterTpTest,
+                         ::testing::Combine(::testing::Values(0, 1, 2, 3), ::testing::Bool(), ::testing::Bool()));
+
+TEST_F(CacheStoreAsyncWriterTest, PublicationCancellationFailsWaitAndReleasesCycle) {
+    CacheStoreAsyncWriter writer(
+        /*device_id=*/-1, nullptr, /*cache_model_id=*/0, std::nullopt, std::chrono::seconds(1));
+    writer.init(/*track_store_completions=*/true);
+    auto complete = writer.registerStoreCompletion();
+    writer.finishSubmissions();
+
+    writer.cancelStoreCompletions(std::make_exception_ptr(std::runtime_error("publication cancelled")));
+    EXPECT_THROW(writer.waitStoreCompletions(), std::runtime_error);
+    EXPECT_NO_THROW(complete(nullptr));
+
+    writer.init(/*track_store_completions=*/true);
+    writer.finishSubmissions();
+    EXPECT_NO_THROW(writer.waitStoreCompletions());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, ShutdownMakesOutstandingCallbackHarmless) {
+    CacheStoreAsyncWriter::StoreCompletionCallback complete;
+    {
+        CacheStoreAsyncWriter writer;
+        writer.init(/*track_store_completions=*/true);
+        complete = writer.registerStoreCompletion();
+        writer.finishSubmissions();
+    }
+
+    EXPECT_NO_THROW(complete(nullptr));
+}
+
+TEST_F(CacheStoreAsyncWriterTest, PublicationFailurePropagatesOnceAndCycleIsReusable) {
+    CacheStoreAsyncWriter writer;
+    writer.init(/*track_store_completions=*/true);
+    auto complete = writer.registerStoreCompletion();
+    writer.finishSubmissions();
+    complete(std::make_exception_ptr(std::runtime_error("publication failed")));
+
+    EXPECT_THROW(writer.waitStoreCompletions(), std::runtime_error);
+    EXPECT_NO_THROW(writer.waitStoreCompletions());
+
+    writer.init(/*track_store_completions=*/true);
+    writer.finishSubmissions();
+    EXPECT_NO_THROW(writer.waitStoreCompletions());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, DuplicatePublicationCompletionIsIgnored) {
+    CacheStoreAsyncWriter writer;
+    writer.init(/*track_store_completions=*/true);
+    auto complete = writer.registerStoreCompletion();
+    writer.finishSubmissions();
+
+    complete(nullptr);
+    complete(std::make_exception_ptr(std::runtime_error("duplicate failure")));
+
+    EXPECT_NO_THROW(writer.waitStoreCompletions());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, TrackedZeroStoreConsecutiveCyclesDoNotLeakState) {
+    CacheStoreAsyncWriter writer;
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        writer.init(/*track_store_completions=*/true);
+        writer.finishSubmissions();
+        EXPECT_NO_THROW(writer.waitStoreCompletions());
+        EXPECT_EQ(CacheStoreAsyncWriter::State::IDLE, writer.state_);
+        EXPECT_EQ(writer.finished_store_completion_state_, nullptr);
+    }
+}
+
+TEST_F(CacheStoreAsyncWriterTest, ManyCycles) {
+    CacheStoreAsyncWriter writer;
+    std::atomic<int>      total{0};
+
+    for (int cycle = 0; cycle < 50; ++cycle) {
+        writer.init();
+        for (int i = 0; i < 5; ++i) {
+            writer.submit([&total]() { total.fetch_add(1); });
+        }
+        writer.waitAllDone();
+    }
+    ASSERT_EQ(250, total.load());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, DoubleWaitAllDoneThrows) {
+    CacheStoreAsyncWriter writer;
+    writer.init();
+    writer.waitAllDone();
+    ASSERT_ANY_THROW(writer.waitAllDone());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, TrackedWriteWithoutCacheStoreFailsClosed) {
+    CacheStoreAsyncWriter         writer;  // default writer -> null cache manager/store
+    torch_ext::PyCacheStoreInputs cache_store_inputs;
+    torch_ext::LayerKVCache       layer_kv;
+
+    writer.init(/*track_store_completions=*/true);
+    // A silent skip here would leave zero pending callbacks, so the executor's
+    // publication wait would falsely report success while nothing was transferred.
+    EXPECT_ANY_THROW(writer.write(cache_store_inputs, layer_kv));
+    writer.finishSubmissions();
+    EXPECT_NO_THROW(writer.waitStoreCompletions());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, UntrackedWriteWithoutCacheStoreIsSilentNoOp) {
+    CacheStoreAsyncWriter         writer;  // default writer -> null cache manager/store
+    torch_ext::PyCacheStoreInputs cache_store_inputs;
+    torch_ext::LayerKVCache       layer_kv;
+
+    writer.init(/*track_store_completions=*/false);
+    // Legacy non-PD path: a missing store is expected and stays a no-op.
+    EXPECT_NO_THROW(writer.write(cache_store_inputs, layer_kv));
+    writer.waitAllDone();
+}
+
+TEST_F(CacheStoreAsyncWriterTest, WorkerThreadPublicationRegistrationCompletesCycle) {
+    CacheStoreAsyncWriter writer(
+        /*device_id=*/-1, nullptr, /*cache_model_id=*/0, std::nullopt, std::chrono::milliseconds(5000));
+    writer.init(/*track_store_completions=*/true);
+    auto completion_state = writer.active_store_completion_state_;
+    ASSERT_NE(completion_state, nullptr);
+
+    std::atomic<int> registered{0};
+    for (int i = 0; i < 16; ++i) {
+        writer.submit([completion_state, &registered]() {
+            auto complete = CacheStoreAsyncWriter::registerStoreCompletionOn(completion_state);
+            registered.fetch_add(1);
+            complete(nullptr);
+        });
+    }
+
+    writer.finishSubmissions();
+    EXPECT_EQ(16, registered.load());
+    EXPECT_NO_THROW(writer.waitStoreCompletions());
+}
+
+TEST_F(CacheStoreAsyncWriterTest, WorkerExceptionTerminatesPublicationWithoutWaitingForTimeout) {
+    CacheStoreAsyncWriter writer(
+        /*device_id=*/-1, nullptr, /*cache_model_id=*/0, std::nullopt, std::chrono::milliseconds(30000));
+    writer.init(/*track_store_completions=*/true);
+    // Registered but never completed: the failing task is what would have published it.
+    auto complete = writer.registerStoreCompletion();
+    writer.submit([]() { throw std::runtime_error("worker boom"); });
+
+    writer.finishSubmissions();
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_THROW(writer.waitStoreCompletions(), std::runtime_error);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 5000);
+
+    // The orphaned callback must stay harmless after the cycle was terminated.
+    EXPECT_NO_THROW(complete(nullptr));
+}
+
+}  // namespace rtp_llm

@@ -1,0 +1,193 @@
+load("//:def.bzl", "copts")
+load(
+    "@arch_config//:arch_select.bzl",
+    "no_block_copy_link_deps",
+    "select_py_bindings",
+    "torch_deps",
+)
+
+package(default_visibility = ["//:__subpackages__"])
+
+py_test(
+    name = "config_pickle_test",
+    srcs = ["config_pickle_test.py"],
+    data = [
+        "//:rtp_compute_ops",
+        "//:th_transformer_config",
+    ],
+    deps = ["//rtp_llm:ops"],
+)
+
+cc_library(
+    name = "py_utils",
+    hdrs = [
+        "PyUtils.h",
+    ],
+    srcs = [
+        "PyUtils.cc",
+    ],
+    deps = [
+        "//:rtp_compute_ops",
+    ],
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "config_extract",
+    hdrs = ["ConfigExtract.h"],
+    deps = [
+        "//rtp_llm/cpp/config:config_modules",
+        "//rtp_llm/cpp/config:mm_transport_mode",
+        "//:rtp_compute_ops",
+    ],
+    visibility = ["//visibility:public"],
+    copts = copts(),
+)
+
+cc_library(
+    name = "th_transformer_config_lib",
+    srcs = [
+        "common/blockUtil.cc",
+        "ConfigInit.cc",
+    ],
+    hdrs = [
+        "common/blockUtil.h",
+    ],
+    deps = [
+        ":py_utils",
+        "//rtp_llm/cpp/cache:cache_types",
+        "//rtp_llm/cpp/multimodal_processor:multimodal_input_class",
+        "//rtp_llm/cpp/config:config_modules",
+        "//rtp_llm/cpp/config:model_config",  # Add ModelConfig implementation
+        "//rtp_llm/cpp/model_utils:model_utils",
+        "//rtp_llm/cpp/config:eplb_config",
+        "//rtp_llm/cpp/utils:core_utils",
+        "//rtp_llm/cpp/utils:hash_util",
+    ],
+    copts = copts(),
+    alwayslink = True,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "th_compute_lib",
+    srcs = [
+        "ComputeInit.cc",
+    ],
+    hdrs = [],
+    deps = [
+        "//rtp_llm/cpp/cache:batch_kv_cache_resource",
+        "//rtp_llm/cpp/cache:block_info",
+        "//rtp_llm/cpp/cache:cache_config",
+        "//rtp_llm/cpp/cache:cp_slot_mapper",
+        "//rtp_llm/cpp/cache:kv_cache_transfer_planner",
+        "//rtp_llm/cpp/distribute:cpu_tp_broadcaster",
+        "//rtp_llm/cpp/utils:core_utils",
+        "//rtp_llm/cpp/utils:debug_utils",
+        "//rtp_llm/cpp/utils:device_perf_wrapper",
+        "//rtp_llm/cpp/utils:kv_cache_utils",
+        "@havenask//aios/autil:base64",
+        "@havenask//aios/autil:zlib",
+    ] + torch_deps() + select_py_bindings() + select({
+        "@//:using_cuda12": [
+            "//rtp_llm/cpp/utils:device_pin",
+            "//rtp_llm/models_py/bindings/core:exec_ctx_state",
+            "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
+            "//rtp_llm/models_py/bindings/cuda/ops:gpu_base",
+        ],
+        "@//:using_rocm": ["//rtp_llm/models_py/bindings/core:exec_ctx_rocm"],
+        "@//:using_ascend": [
+            "//rtp_llm/models_py/bindings/core:exec_ctx_state",
+            "//rtp_llm/cpp/disaggregate/cache_store:cache_store_interface",
+            "@havenask//aios/autil:stack_tracer",
+            "//rtp_llm/models_py/bindings/ascend:ascend_host_utils",
+            "//rtp_llm/models_py/bindings/core:exec_ctx_ops",
+        ],
+        "//conditions:default": [],
+    }) + no_block_copy_link_deps(),
+    copts = copts(),
+    alwayslink = True,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "mm_rdma_exporter_pybind",
+    srcs = ["MMRdmaExporterInit.cc"],
+    deps = [
+        "//rtp_llm/cpp/multimodal_processor/transport/rdma:mm_rdma_exporter",
+    ] + torch_deps(),
+    copts = copts(),
+    alwayslink = True,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "th_transformer_lib",
+    srcs = [
+        "init.cc",
+        "common/InitEngineOps.cc",
+        "multi_gpu_gpt/RtpEmbeddingOp.cc",
+        "multi_gpu_gpt/RtpLLMOp.cc",
+    ],
+    hdrs = [
+        "common/InitEngineOps.h",
+        "common/blockUtil.h",
+        "multi_gpu_gpt/RtpEmbeddingOp.h",
+        "multi_gpu_gpt/RtpLLMOp.h",
+    ],
+    deps = [
+        "//rtp_llm/cpp/api_server:http_api_server",
+        "//rtp_llm/cpp/model_rpc:model_rpc_server",
+        "//rtp_llm/cpp/engine_base/schedulers:schedulers",
+        "//rtp_llm/cpp/cache:cache",
+        "//rtp_llm/cpp/telemetry",
+        "//rtp_llm/cpp/multimodal_processor:multimodal_processor",
+        ":config_extract",
+        "//rtp_llm/cpp/utils:signal_utils",
+        "//:rtp_compute_ops",
+        "@xgrammar//:xgrammar",
+    ] + torch_deps() + select({
+        "//:using_cuda": [
+            "//rtp_llm/models_py/bindings/cuda/ops:gpu_base",
+            "//rtp_llm/cpp/cuda_graph:cuda_graph_impl",
+        ],
+        # libth_transformer.so does NOT contain its own copy of
+        # globalRuntime().  Those symbols are resolved at load-time
+        # from librtp_compute_ops.so.
+        "@//:using_rocm": [
+            "//rtp_llm/models_py/bindings/core:exec_ctx_ops",
+            "//rtp_llm/models_py/bindings/core:exec_ops_hdr",
+            "//rtp_llm/cpp/cuda_graph:cuda_graph_impl",
+        ],
+        "@//:using_ascend": [
+            "//rtp_llm/models_py/bindings/core:exec_ctx_ops",
+            "//rtp_llm/models_py/bindings/core:exec_ops_hdr",
+        ],
+        "//conditions:default": [],
+    }),
+    copts = copts(),
+    alwayslink = True,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "th_transformer_gpu",
+    srcs = [],
+    deps = [] + torch_deps(),
+    copts = copts(),
+    alwayslink = True,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "th_utils",
+    hdrs = [
+        "th_utils.h",
+    ],
+    deps = [
+        "//rtp_llm/cpp/utils:core_utils",
+    ],
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)

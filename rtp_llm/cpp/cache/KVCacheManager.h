@@ -1,0 +1,202 @@
+#pragma once
+
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "rtp_llm/cpp/cache/Types.h"
+#include "rtp_llm/cpp/cache/BufferTypes.h"
+#include "rtp_llm/cpp/cache/CacheConfig.h"
+#include "rtp_llm/cpp/cache/AsyncContext.h"
+#include "rtp_llm/cpp/cache/CoordinatorCacheManager.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
+#include "rtp_llm/cpp/config/ConfigModules.h"
+#include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.grpc.pb.h"
+#include "kmonitor/client/MetricsReporter.h"
+
+namespace rtp_llm {
+
+class RtpLLMCacheReuseMetricsCollector;
+class CPSlotMapper;
+class CacheStore;
+class BroadcastManager;
+class PrefillCacheHitMetricsReporter;
+class KVCacheAllocationWaitState;
+
+class KVCacheManager {
+public:
+    KVCacheManager(const CacheConfig&                 config,
+                   bool                               warmup                       = false,
+                   const kmonitor::MetricsReporterPtr metrics_reporter             = nullptr,
+                   const KVCacheConfig&               kv_cache_config              = KVCacheConfig{},
+                   const ParallelismConfig&           parallelism_config           = ParallelismConfig{},
+                   const RuntimeConfig&               runtime_config               = RuntimeConfig{},
+                   const SpeculativeExecutionConfig&  sp_config                    = SpeculativeExecutionConfig{},
+                   const PDSepConfig&                 pd_sep_config                = PDSepConfig{},
+                   const CacheStoreConfig&            cache_store_config           = CacheStoreConfig{},
+                   bool                               use_device_malloc_block_pool = false);
+    ~KVCacheManager();
+
+    // 初始化和配置相关
+    bool init();
+    bool initialized() const {
+        return coordinator_manager_ != nullptr;
+    }
+
+    // TP0 owns request block allocation; other ranks only receive the block IDs.
+    bool isAllocatorOwner() const {
+        return parallelism_config_.tp_rank == 0;
+    }
+
+    const CacheConfig& cacheConfig() const;
+    const CacheConfig& getMTPModuleCacheConfig(int mtp_module_id) const;
+
+    // 显存管理和缓存分配
+    MallocResult malloc(const MallocInfo& malloc_info);
+    void         free(const FreeInfo& free_info);
+    bool         abortPendingLoad(const std::shared_ptr<AsyncContext>& context);
+    // Outputs the resident key-prefix count; ordinary inserts report zero.
+    void insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length);
+
+    // Decode-side P/D admission allocates destination blocks before cache handoff.  When pools are
+    // temporarily full, waiters use this generation instead of polling malloc in a tight loop.
+    // Capture the generation before an allocation attempt; waitForAllocationChange() then cannot
+    // miss a release racing with that attempt.
+    uint64_t allocationGeneration() const;
+    bool     waitForAllocationChange(uint64_t observed_generation, int64_t timeout_ms, int64_t minimum_wait_ms = 0);
+
+    int
+    singleBatchNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource, int seq_len, int reserve_step) const;
+
+    int estimatePeakNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
+                               int                            seq_len,
+                               int                            common_seq_len,
+                               int                            remaining_tokens,
+                               int                            reserve_step,
+                               bool                           enable_reuse_cache,
+                               int                            target_batch_size) const;
+
+    // 块操作相关
+    void blockCopy(int src_block_index, int dest_block_index);
+    void blockBatchCopy(const std::vector<BlockIdPair>& copy_mapping);
+    void blockBatchCopy(const torch::Tensor& copy_mapping);
+    void blockBatchCopy(const BlockIdPair* copy_mapping_begin, const BlockIdPair* copy_mapping_end);
+    void blockBatchCopyByGroup(const std::vector<TaggedBlockIdPair>& copy_mapping);
+
+    bool updateKVBlock(const BatchKVCacheResourcePtr&  batch_kv_cache_resource,
+                       const std::vector<int>&         block_src_batch,
+                       bool                            copy_last_block,
+                       std::vector<TaggedBlockIdPair>& block_update_mapping);
+
+    // 地址转换和缓冲区访问
+    BlockAddrInfo          convertIndexToAddr(int block_index, int layer_id) const;
+    std::vector<BlockInfo> convertIndexToBuffer(int block_index, int layer_id) const;
+    std::vector<BlockInfo>
+                  convertIndexToBuffer(int block_index, int layer_id, int partition_count, int partition_id) const;
+    BlockAddrInfo convertIndexToAddr(int layer_id, const std::string& group_tag, int block_id) const;
+    std::vector<BlockInfo> convertIndexToBuffer(int layer_id, const std::string& group_tag, int block_id) const;
+    std::vector<BlockInfo> convertIndexToBuffer(
+        int layer_id, const std::string& group_tag, int block_id, int partition_count, int partition_id) const;
+
+    GroupedCacheLayerLayout allLayerCacheBase() const;
+
+    // for main model; grouped layout preserves layers that own multiple cache groups
+    GroupedCacheLayerLayout getMainModelGroupedCacheLayerLayout() const;
+    // for mtp module
+    GroupedCacheLayerLayout getMTPModuleGroupedCacheLayerLayout(int mtp_module_id) const;
+
+    // 资源统计和信息查询
+    size_t      freeBlocksNum() const;
+    size_t      availableBlocksNum() const;
+    size_t      reserveBlocksNum() const;
+    size_t      availableTokensNum() const;
+    size_t      totalBlocksNum() const;
+    size_t      maxAvailableTokensNum() const;
+    KVCacheInfo getKVCacheInfo(int64_t latest_version, bool need_cache_keys) const;
+    void        refreshKVCacheInfoSnapshot();
+    KVCacheInfo buildKVCacheInfo(int64_t latest_version, bool need_cache_keys) const;
+
+    // 系统资源管理
+    void regUserMr(size_t model_id, std::shared_ptr<CacheStore> cache_store = nullptr);
+    void stopMetricsReporter();
+    void recordCacheHitTokens(int64_t input_length, const RtpLLMCacheReuseMetricsCollector& metrics);
+
+    // CacheStore ownership (set by RemoteRpcServer, read during model forward)
+    void                        setCacheStore(std::shared_ptr<CacheStore> cache_store);
+    std::shared_ptr<CacheStore> getCacheStore() const;
+
+    // for every single rank
+    // Returns whether a trustworthy mem_response was formed, not whether the transfer
+    // succeeded; the transfer outcome is reported through mem_response.code.
+    bool executeFunction(const FunctionRequestPB& request, FunctionResponsePB& response);
+
+    BlockTreeCachePtr blockTreeCache() const {
+        return block_tree_cache_;
+    }
+
+    // Increment KV cache reference count for PD separation (connector refcount)
+    std::shared_ptr<KVCacheResource>
+    incrKVCacheRef(const KVCacheResource& resource, const CacheKeysType& cache_keys, bool is_connector = true);
+
+    // CP page-level RR sharding context. Returns nullptr when sharding is not active
+    // (single-rank or kv_cache_sharded=false).  Used by connector / cache_store to
+    // remap cacheKeys -> last-rank-key namespace.
+    std::shared_ptr<CPSlotMapper> cpSlotMapper() const {
+        return cp_slot_mapper_;
+    }
+
+private:
+    std::function<void()> allocationChangeCallback() const;
+    void                  reportMetricsLoop();
+    bool collectCacheHitRates(std::chrono::steady_clock::time_point now, RtpLLMCacheReuseMetricsCollector& metrics);
+    void reportPrefillCacheHitMetrics(const MallocInfo& malloc_info, bool is_first_malloc);
+    std::shared_ptr<BroadcastManager> createMultiRankBlockTransferManager() const;
+
+    // 成员变量
+    CacheConfig                config_;
+    CoordinatorCacheManagerPtr coordinator_manager_;
+
+    const kmonitor::MetricsReporterPtr metrics_reporter_;
+    const KVCacheConfig                kv_cache_config_;
+    const ParallelismConfig            parallelism_config_;
+    const RuntimeConfig                runtime_config_;
+    const SpeculativeExecutionConfig   sp_config_;
+    const PDSepConfig                  pd_sep_config_;
+    const bool                         use_device_malloc_block_pool_;
+    const bool                         warmup_;
+    KVCacheEventPublisherPtr           cache_event_publisher_;
+    bool                               hasTailSparseReuseGroup() const;
+    void                               initCacheEventPublisher();
+    void                               stopCacheEventPublisher();
+
+    std::shared_ptr<CPSlotMapper>                   cp_slot_mapper_;
+    std::unique_ptr<PrefillCacheHitMetricsReporter> prefill_cache_hit_metrics_reporter_;
+
+    std::mutex                            cache_hit_mutex_;
+    std::chrono::steady_clock::time_point cache_hit_window_start_  = std::chrono::steady_clock::now();
+    int64_t                               cache_hit_input_tokens_  = 0;
+    int64_t                               cache_hit_reuse_tokens_  = 0;
+    int64_t                               cache_hit_device_tokens_ = 0;
+    int64_t                               cache_hit_host_tokens_   = 0;
+    int64_t                               cache_hit_disk_tokens_   = 0;
+
+    std::atomic<bool> stop_{false};
+    std::thread       metrics_reporter_thread_;
+
+    BlockTreeCachePtr                           block_tree_cache_;
+    std::shared_ptr<KVCacheAllocationWaitState> allocation_wait_state_;
+
+    mutable std::mutex                 cache_status_snapshot_mutex_;
+    std::shared_ptr<const KVCacheInfo> cache_status_snapshot_;
+
+    mutable std::mutex          cache_store_mutex_;
+    std::shared_ptr<CacheStore> cache_store_;
+};
+
+}  // namespace rtp_llm

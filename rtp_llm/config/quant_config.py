@@ -1,0 +1,1044 @@
+import json
+import logging
+import os
+import weakref
+from abc import ABC, abstractmethod
+from enum import Enum
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import torch
+
+
+def _validate_compressed_targets(group_name: str, group_config: Dict[str, Any]) -> None:
+    targets = group_config.get("targets")
+    if targets is None:
+        return
+    if not isinstance(targets, (list, tuple)) or sorted(targets) != ["Linear"]:
+        raise ValueError(
+            f"compressed-tensors group {group_name} limits quantization to "
+            f"targets={targets}, which is not supported; only a whole-model "
+            '["Linear"] scope can be applied'
+        )
+
+
+def _pick_config_group(config_groups: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Resolve the config group a compressed-tensors checkpoint describes.
+
+    ``group_0`` still wins whenever it is present, so every checkpoint that loads
+    today keeps loading identically. The fallback only covers what the previous
+    hardcoded ``config_groups["group_0"]`` lookup could not read at all: a single
+    group under a checkpoint-defined name, which is how Qwen3.5 ships W8A8.
+    """
+    if "group_0" in config_groups:
+        if len(config_groups) > 1:
+            # Only group_0 is read, exactly as before. Say so, because a
+            # multi-scheme checkpoint would otherwise load as if the other
+            # groups did not exist.
+            logging.getLogger(__name__).warning(
+                "compressed-tensors config_groups %s: only group_0 is applied, "
+                "the rest are ignored",
+                sorted(config_groups),
+            )
+        group_name = "group_0"
+        group_config = config_groups[group_name]
+        return group_name, group_config
+    if len(config_groups) != 1:
+        raise ValueError(
+            "compressed-tensors needs a group_0 entry or exactly one named group, "
+            f"got {sorted(config_groups)}"
+        )
+    group_name, group_config = next(iter(config_groups.items()))
+    # targets describes which modules the group covers and nothing reads it, so
+    # only a whole-model scope can be honoured. Anything narrower would be
+    # applied as if it covered everything and fail later asking a BF16 module
+    # for a weight scale.
+    _validate_compressed_targets(group_name, group_config)
+    return group_name, group_config
+
+
+class QuantizationType(str, Enum):
+    """
+    Enum storing quantization type options
+    """
+
+    INT = "int"
+    FLOAT = "float"
+
+
+class QuantizationConfig(ABC):
+    """Base class for quantization configs."""
+
+    _registry = weakref.WeakValueDictionary()
+
+    def __init__(self, bits: int, group_size: int, is_quanted: bool, **kwargs: Any):
+        super().__init__()
+        # mapping is updated by models as they initialize
+        self.packed_modules_mapping: Dict[str, List[str]] = dict()
+        self._bits = bits
+        self._group_size = group_size
+        self._is_quanted = is_quanted
+        self.exclude_modules: set = set()
+
+    @property
+    def bits(self):
+        return self._bits
+
+    @classmethod
+    @abstractmethod
+    def get_method(cls) -> str:
+        """Name of the quantization method."""
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def get_algo(cls) -> str:
+        """Name of quant_algo in c++"""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        """List of supported activation dtypes."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        """List of supported kv cache dtypes."""
+        raise NotImplementedError
+
+    def verify_compute_dtype_and_kv_cache_dtype(self, compute_dtype, kv_cache_dtype):
+        if compute_dtype not in self.get_supported_compute_dtypes():
+            raise ValueError(
+                f"compute_dtype: {compute_dtype} must in {self.__class__}'s {self.get_supported_compute_dtypes()}"
+            )
+        if kv_cache_dtype not in self.get_supported_kv_cache_dtypes():
+            raise ValueError(
+                f"kv_cache_dtype: {kv_cache_dtype} must in {self.__class__}'s {self.get_supported_kv_cache_dtypes()}"
+            )
+
+    @classmethod
+    @abstractmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        """Create a config class from the model's quantization config."""
+        raise NotImplementedError
+
+    def __init_subclass__(cls, **kwargs: Any):
+        super().__init_subclass__(**kwargs)
+        cls._registry[cls.__name__] = cls
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]):
+        for _, c in cls._registry.items():
+            if (
+                c.get_method().upper()
+                == config.get("method", config.get("quant_algo")).upper()
+            ):
+                return c._from_config(config)
+        raise ValueError(
+            f"config: {config}'s method is not support in {cls._registry.keys()}"
+        )
+
+    def is_quanted(self) -> bool:
+        return self._is_quanted
+
+    def group_size(self) -> int:
+        return self._group_size
+
+    @classmethod
+    def load_from_ckpt(cls, ckpt_path: str) -> Optional["QuantizationConfig"]:
+        """
+        Load quantization config from checkpoint directory.
+
+        Args:
+            ckpt_path: Path to checkpoint directory
+
+        Returns:
+            QuantizationConfig instance if found, None otherwise
+        """
+        quant_config_path = os.path.join(ckpt_path, "smoothquant.ini")
+        if os.path.exists(quant_config_path):
+            return cls.from_config(
+                {
+                    "bits": 0,
+                    "method": "smooth_quant",
+                    "group_size": 0,
+                    "is_quanted": True,
+                }
+            )
+
+        per_tensor_config_path = os.path.join(ckpt_path, "pertensorquant.ini")
+
+        if os.path.exists(per_tensor_config_path):
+            return cls.from_config(
+                {
+                    "bits": 0,
+                    "method": "pertensor_quant",
+                    "group_size": 0,
+                    "is_quanted": True,
+                }
+            )
+
+        config_path = os.path.join(ckpt_path, "config.json")
+        if not os.path.exists(config_path):
+            return None
+
+        with open(config_path, "r") as f:
+            config_json = json.load(f)
+        quant_config = None
+        quant_method = None
+        if config_json.get("quantization_config", None):
+            quant_config = config_json["quantization_config"]
+            quant_method = quant_config["quant_method"].lower()
+
+        if config_json.get("quantization", None):
+            quant_config = config_json["quantization"]
+            quant_method = quant_config["quant_algo"].lower()
+
+        # Kimi-K2.5 nests `text_config.quantization_config` (compressed-tensors).
+        # Promote it so the unified parsing path below applies.
+        if quant_config is None:
+            text_config = config_json.get("text_config")
+            if isinstance(text_config, dict) and text_config.get(
+                "quantization_config", None
+            ):
+                quant_config = text_config["quantization_config"]
+                quant_method = quant_config["quant_method"].lower()
+
+        if quant_config is None:
+            return None
+        group_size = quant_config["group_size"] if "group_size" in quant_config else 0
+        bits = quant_config["bits"] if "bits" in quant_config else 0
+        if quant_method == "fp8":
+            bits = 8
+            if "weight_block_size" in quant_config:
+                weight_block = quant_config.get("weight_block_size")
+                assert isinstance(weight_block, list) and all(
+                    element == weight_block[0] for element in weight_block
+                ), f"weight_block_size: {weight_block} must be same"
+                group_size = weight_block[0]
+                quant_method = Fp8BlockWiseQuantConfig.get_method()
+        if quant_method == "compressed-tensors":
+            group_name, group_config = _pick_config_group(
+                quant_config["config_groups"]
+            )
+            weights_config = group_config["weights"]
+            # Absent or explicitly null when the checkpoint quantizes weights
+            # only. Legacy FP8 per-channel checkpoints accept that shape, while
+            # activation-dependent schemes below require a dict.
+            activation_config = group_config.get("input_activations")
+            bits = weights_config.get("num_bits")
+            weight_type = weights_config.get("type")
+            weight_strategy = weights_config.get("strategy")
+            weight_dynamic = weights_config.get("dynamic", False)
+            if (
+                weight_type == "float"
+                and bits == 8
+                and weight_strategy == "channel"
+            ):
+                if activation_config is None:
+                    logging.getLogger(__name__).warning(
+                        "compressed-tensors group %s has no input_activations; "
+                        "preserving legacy FP8 per-channel weight-only loading",
+                        group_name,
+                    )
+                quant_method = Fp8PerChannelCompressedQuantConfig.get_method()
+            elif (
+                weight_type == "float"
+                and bits == 8
+                and weight_strategy == "tensor"
+                and isinstance(activation_config, dict)
+            ):
+                quant_method = Fp8PerTensorCompressedQuantConfig.get_method()
+                return Fp8PerTensorCompressedQuantConfig.from_config(
+                    {
+                        "bits": bits,
+                        "method": quant_method,
+                        "group_size": group_size,
+                        "is_quanted": True,
+                        "dynamic": activation_config.get("dynamic", False),
+                        "act_scale_suffix": ".input_scale",
+                        "weight_scale_suffix": ".weight_scale",
+                    }
+                )
+            elif (
+                weight_type == "int"
+                and bits == 8
+                and weight_strategy == "channel"
+                and not weight_dynamic
+                # Weight-only INT8 checkpoints leave input_activations null; they
+                # fall through to the generic paths below instead of subscripting
+                # a None here.
+                and isinstance(activation_config, dict)
+                and activation_config.get("type") == "int"
+                and activation_config.get("num_bits") == 8
+                and activation_config.get("strategy") == "token"
+                and activation_config.get("dynamic", False)
+            ):
+                _validate_compressed_targets(group_name, group_config)
+                if not weights_config.get(
+                    "symmetric", True
+                ) or not activation_config.get("symmetric", True):
+                    raise ValueError(
+                        f"compressed-tensors group {group_name} uses asymmetric INT8, "
+                        "but only symmetric W8A8 is supported"
+                    )
+                ignore_patterns = quant_config.get("ignore") or []
+                quant_method = CompressedW8A8Int8PerChannelQuantConfig.get_method()
+                return CompressedW8A8Int8PerChannelQuantConfig.from_config(
+                    {
+                        "bits": bits,
+                        "method": quant_method,
+                        "group_size": 0,
+                        "is_quanted": True,
+                        "ignore_patterns": ignore_patterns,
+                    }
+                )
+            elif (
+                weight_type == "int"
+                and bits == 4
+                and weight_strategy == "group"
+            ):
+                # Kimi-K2.5 routed-expert MoE: int4 g32 symmetric, dyn fp8 act.
+                group_size = int(weights_config.get("group_size", 32))
+                ignore_patterns = quant_config.get("ignore", [])
+                quant_method = (
+                    CompressedW4A8Int4PerChannelQuantConfig.get_method()
+                )
+                return CompressedW4A8Int4PerChannelQuantConfig.from_config(
+                    {
+                        "bits": bits,
+                        "method": quant_method,
+                        "group_size": group_size,
+                        "is_quanted": True,
+                        "ignore_patterns": ignore_patterns,
+                    }
+                )
+            if quant_method == "compressed-tensors":
+                # Nothing above recognised the scheme. The generic tail would
+                # otherwise try to instantiate the abstract
+                # CompressedTensorsQuantConfig and surface a TypeError, so name
+                # the unsupported combination instead.
+                raise ValueError(
+                    f"unsupported compressed-tensors scheme in group {group_name}: "
+                    f"weights={weights_config}, input_activations={activation_config}"
+                )
+
+        if quant_method == "quark":
+            quark_weights_config = quant_config["global_quant_config"]["weight"]
+            if quark_weights_config["dtype"] == "fp8_e4m3":
+                bits = 8
+            elif quark_weights_config["dtype"] == "fp4":
+                bits = 4
+            if (
+                quark_weights_config["dtype"] == "fp8_e4m3"
+                and quark_weights_config["qscheme"] == "per_channel"
+            ):
+                quant_method = Fp8PerChannelQuarkQuantConfig.get_method()
+            if (
+                quark_weights_config["dtype"] == "fp4" 
+                and quark_weights_config["qscheme"] == "per_group"
+            ):
+                quant_method = MXFp4QuarkQuantConfig.get_method()
+                group_size = quark_weights_config["group_size"]
+                
+        if quant_method == "modelopt":
+            config_groups = quant_config["config_groups"]
+            weights_config = config_groups["group_0"]["weights"]
+            activation_config = config_groups["group_0"]["input_activations"]
+            bits = weights_config["num_bits"]
+            activation_bits = activation_config["num_bits"]
+            group_size = weights_config["group_size"]
+            if (
+                weights_config["type"] == "float"
+                and bits == 4 and activation_bits == 4
+                and group_size == 16
+            ):
+                quant_method = ModelOptFp4Config.get_method()
+                mixed_attention = False
+                text_config = config_json.get("text_config", None)
+                if text_config is not None:
+                    full_attention_interval = text_config.get("full_attention_interval", 0)
+                    if full_attention_interval != 0:
+                        mixed_attention = True
+                return ModelOptFp4Config.from_config(
+                    {
+                        "bits": bits,
+                        "method": quant_method,
+                        "group_size": group_size,
+                        "is_quanted": True,
+                        "mixed_attention": mixed_attention,
+                    }
+                )
+            
+
+        result = cls.from_config(
+            {
+                "bits": bits,
+                "method": quant_method,
+                "group_size": group_size,
+                "is_quanted": True,
+            }
+        )
+        if quant_config and "exclude" in quant_config:
+            result.exclude_modules = set(quant_config["exclude"])
+        return result
+
+
+class WeightOnlyInt8PerChannelQuantConfig(QuantizationConfig):
+    def __init__(self):
+        super().__init__(bits=8, group_size=0, is_quanted=False)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "INT8"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "weight_only_per_col"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float32, torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float32, torch.float16, torch.bfloat16, torch.int8]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return WeightOnlyInt8PerChannelQuantConfig()
+
+
+DEFAULT_WEIGHT_ONLY_INT8_PER_CHANNEL_QUANT_CONFIG = (
+    WeightOnlyInt8PerChannelQuantConfig()
+)
+
+
+class Fp8PerTensorQuantConfig(QuantizationConfig):
+    def __init__(
+        self,
+        bits: int = 8,
+        group_size: int = 0,
+        is_quanted: bool = False,
+        **kwargs: Any,
+    ):
+        assert (
+            bits == 8 and group_size == 0
+        ), f"invalid params {bits} != 8 or {group_size} != 0"
+        super().__init__(bits=8, group_size=0, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "FP8"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "fp8"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float8_e4m3fn]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return Fp8PerTensorQuantConfig(**config)
+
+
+DEFAULT_FP8_PER_TENSOR_QUANT_CONFIG = Fp8PerTensorQuantConfig(is_quanted=False)
+
+
+class Fp8DynamicPerTensorQuantConfig(QuantizationConfig):
+    def __init__(
+        self,
+        bits: int = 8,
+        group_size: int = 0,
+        is_quanted: bool = False,
+        **kwargs: Any,
+    ):
+        assert (
+            bits == 8 and group_size == 0
+        ), f"invalid params {bits} != 8 or {group_size} != 0"
+        super().__init__(bits=8, group_size=0, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "FP8_DYNAMIC_PER_TENSOR"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "fp8_dynamic_per_tensor"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float8_e4m3fn, torch.float16, torch.bfloat16]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return Fp8DynamicPerTensorQuantConfig(**config)
+
+
+DEFAULT_FP8_DYNAMIC_PER_TENSOR_QUANT_CONFIG = Fp8DynamicPerTensorQuantConfig(
+    is_quanted=False
+)
+
+
+class Fp8BlockWiseQuantConfig(QuantizationConfig):
+    DEFAULT_FP8_QUANT_BLOCK_SIZE = 128
+
+    def __init__(
+        self,
+        bits: int = 8,
+        group_size: int = 128,
+        is_quanted: bool = False,
+        **kwargs: Any,
+    ):
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "FP8_PER_BLOCK"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "fp8"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return Fp8BlockWiseQuantConfig(**config)
+
+
+class CompressedTensorsQuantConfig(QuantizationConfig):
+    def __init__(self, bits: int = 0, is_quanted: bool = False):
+        super().__init__(bits=bits, group_size=0, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "compressed-tensors"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "compressed-tensors"
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return CompressedTensorsQuantConfig()
+
+
+class Fp8PerTensorCompressedQuantConfig(CompressedTensorsQuantConfig):
+    def __init__(self, bits: int = 8, is_quanted: bool = False, **kwargs: Any):
+        super().__init__(bits=bits, is_quanted=is_quanted)
+        self._dynamic = kwargs.get("dynamic", False)
+        self._weight_s_suffix = kwargs.get("weight_scale_suffix", None)
+        self._act_s_suffix = kwargs.get("act_scale_suffix", None)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "FP8_PER_TENSOR_COMPRESSED"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "fp8"
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+
+    def is_dynamic(self) -> bool:
+        return self._dynamic
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return Fp8PerTensorCompressedQuantConfig(**config)
+
+
+class Fp8PerChannelCompressedQuantConfig(CompressedTensorsQuantConfig):
+    def __init__(self, bits: int = 8, is_quanted: bool = False, **kwargs: Any):
+        super().__init__(bits=bits, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "FP8_PER_CHANNEL_COMPRESSED"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "fp8-perchannel-compressed-tensors"
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return Fp8PerChannelCompressedQuantConfig(**config)
+
+
+class QuarkQuantConfig(QuantizationConfig):
+    def __init__(
+        self, bits: int = 0, group_size: int = 0, is_quanted: bool = False, **kwargs: Any
+    ):
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "quark"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "quark"
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return QuarkQuantConfig(**config)
+
+
+class Fp8PerChannelQuarkQuantConfig(QuarkQuantConfig):
+    def __init__(self, bits: int = 8, is_quanted: bool = False, **kwargs: Any):
+        super().__init__(bits=bits, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "FP8_PER_CHANNEL_QUARK"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "fp8-perchannel-quark"
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return Fp8PerChannelQuarkQuantConfig(**config)
+
+class MXFp4QuarkQuantConfig(QuarkQuantConfig):
+    def __init__(
+        self,
+        bits: int = 4,
+        group_size: int = 0,
+        is_quanted: bool = False,
+        **kwargs: Any,
+    ):
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "QuarkMXFP4"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "mxfp4-quark"
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return MXFp4QuarkQuantConfig(**config)
+
+
+class SmoothQuantConfig(QuantizationConfig):
+    def __init__(self):
+        super().__init__(bits=0, group_size=0, is_quanted=True)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "smooth_quant"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "smooth_quant"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.int8]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return SmoothQuantConfig()
+
+
+class OmniQuantConfig(QuantizationConfig):
+    def __init__(self):
+        super().__init__(bits=0, group_size=0, is_quanted=True)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "omni_quant"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "omni_quant"
+
+    def type(self) -> str:
+        return "int"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.int8]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return OmniQuantConfig()
+
+
+class Int8PerTensorQuantConfig(QuantizationConfig):
+    def __init__(self):
+        super().__init__(bits=0, group_size=0, is_quanted=True)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "pertensor_quant"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "pertensor_quant"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.float32]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.int8, torch.float32]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return Int8PerTensorQuantConfig()
+
+
+class AWQConfig(QuantizationConfig):
+    def __init__(self, bits: int, group_size: int, is_quanted: bool, **kwargs: Any):
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "awq"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "awq"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.int8]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return AWQConfig(**config)
+
+
+class GPTQConfig(QuantizationConfig):
+    def __init__(self, bits: int, group_size: int, is_quanted: bool, **kwargs: Any):
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "gptq"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "gptq"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.int8]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return GPTQConfig(**config)
+
+
+class ModelOptFp4Config(QuantizationConfig):
+    """Config class for FP4."""
+
+    def __init__(self, bits: int, group_size: int, is_quanted: bool, **kwargs: Any):
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+        self.mixed_attention = kwargs.get('mixed_attention', False)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "modelopt_fp4"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "modelopt_fp4"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return ModelOptFp4Config(**config)
+
+
+class W4a8Int4PerChannelQuantConfig(QuantizationConfig):
+    def __init__(
+        self,
+        bits: int = 4,
+        group_size: int = 128,
+        is_quanted: bool = False,
+        **kwargs: Any,
+    ):
+        assert (
+            bits == 4 and group_size > 0
+        ), f"invalid params {bits} != 4 or {group_size} <= 0"
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "W4A8_INT4_PER_CHANNEL"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "w4a8_int4_per_channel"
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float8_e4m3fn, torch.float16, torch.bfloat16]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return W4a8Int4PerChannelQuantConfig(**config)
+
+
+class CompressedW4A8Int4PerChannelQuantConfig(QuantizationConfig):
+    """compressed-tensors INT4 (group=32) symmetric pre-quantized weights.
+
+    Used by Kimi-K2.5 routed-expert MoE:
+      - weights: int4 packed (`weight_packed`) + bf16 scales (`weight_scale`)
+      - input_activations: dynamic on-line per-token fp8 quant
+      - ignore: lm_head / self_attn / shared_experts / dense FFN keep BF16
+    """
+
+    DEFAULT_WEIGHT_PACK_SUFFIX = ".weight_packed"
+    DEFAULT_SCALE_SUFFIX = ".weight_scale"
+
+    def __init__(
+        self,
+        bits: int = 4,
+        group_size: int = 32,
+        is_quanted: bool = True,
+        **kwargs: Any,
+    ):
+        assert (
+            bits == 4 and group_size > 0
+        ), f"invalid params {bits} != 4 or {group_size} <= 0"
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+        self._weight_pack_suffix = kwargs.get(
+            "weight_pack_suffix", self.DEFAULT_WEIGHT_PACK_SUFFIX
+        )
+        self._scale_suffix = kwargs.get("scale_suffix", self.DEFAULT_SCALE_SUFFIX)
+        self._ignore_patterns: List[str] = list(kwargs.get("ignore_patterns", []))
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "W4A8_INT4_PER_CHANNEL_COMPRESSED"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        # C++ reuses the existing W4A8 INT4 algo enum; group_size discriminates.
+        return "w4a8_int4_per_channel"
+
+    @property
+    def weight_pack_suffix(self) -> str:
+        return self._weight_pack_suffix
+
+    @property
+    def scale_suffix(self) -> str:
+        return self._scale_suffix
+
+    @property
+    def ignore_patterns(self) -> List[str]:
+        return self._ignore_patterns
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float8_e4m3fn, torch.float16, torch.bfloat16]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return CompressedW4A8Int4PerChannelQuantConfig(**config)
+
+
+class CompressedW8A8Int8PerChannelQuantConfig(QuantizationConfig):
+    """Pre-quantized compressed-tensors W8A8 INT8 configuration.
+
+    Weights are static symmetric INT8 per output channel and activations are
+    dynamically quantized to symmetric INT8 per token.
+    """
+
+    def __init__(
+        self,
+        bits: int = 8,
+        group_size: int = 0,
+        is_quanted: bool = True,
+        ignore_patterns: Optional[Sequence[str]] = None,
+    ):
+        assert (
+            bits == 8 and group_size == 0
+        ), f"invalid params {bits} != 8 or {group_size} != 0"
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+        # Every parameter is named and there is no kwargs sink, so a misspelled
+        # key raises instead of silently leaving the exclude set empty.
+        self._ignore_patterns: List[str] = list(ignore_patterns or [])
+        # WeightModule support checks use exclude_modules for checkpoint paths and
+        # {i}-templated model weight definitions. Concrete layer entries are
+        # allowed here because compressed-tensors checkpoints also list ignored
+        # non-quantized parameters. Regex entries are interpreted against the
+        # template by the loader; a concrete partial-layer entry still fails
+        # fast when it intersects a quantizable template.
+        self.exclude_modules = set(self._ignore_patterns)
+
+    @classmethod
+    def get_method(cls) -> str:
+        # Not registered in preset_quant_config: this scheme is recognised from
+        # the checkpoint's own quantization_config, not selected by hand through
+        # --quantization.
+        return "W8A8_INT8_PER_CHANNEL_COMPRESSED"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "w8a8_int8_per_channel"
+
+    @property
+    def ignore_patterns(self) -> List[str]:
+        return self._ignore_patterns
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        # Narrower than the sibling per-channel schemes, which also accept
+        # float8_e4m3fn: linear-layer INT8 and attention KV cache dtype are
+        # independent, but this combination has not been verified here, so a
+        # deployment carrying --fp8_kv_cache is failed at startup rather than
+        # served on an unvalidated path. Widen it with evidence, not by default.
+        return [torch.float16, torch.bfloat16]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        allowed_keys = {
+            "bits",
+            "method",
+            "group_size",
+            "is_quanted",
+            "ignore_patterns",
+        }
+        unknown_keys = set(config) - allowed_keys
+        if unknown_keys:
+            raise TypeError(
+                f"unexpected W8A8 quantization config keys: {sorted(unknown_keys)}"
+            )
+        return cls(
+            bits=config.get("bits", 8),
+            group_size=config.get("group_size", 0),
+            is_quanted=config.get("is_quanted", True),
+            ignore_patterns=config.get("ignore_patterns"),
+        )
+
+
+DEFAULT_FP8_BLOCK_WISE_QUANT_CONFIG = Fp8BlockWiseQuantConfig(
+    bits=8,
+    group_size=Fp8BlockWiseQuantConfig.DEFAULT_FP8_QUANT_BLOCK_SIZE,
+    is_quanted=False,
+)
+DEFAULT_FP8_PER_CHANNEL_COMPRESSED_QUANT_CONFIG = Fp8PerChannelCompressedQuantConfig(
+    bits=8, is_quanted=False
+)
+DEFAULT_FP8_PER_CHANNEL_QUARK_QUANT_CONFIG = Fp8PerChannelQuarkQuantConfig(
+    bits=8, is_quanted=False
+)
+DEFAULT_QUARK_MXFP4_QUANT_CONFIG = MXFp4QuarkQuantConfig(
+    bits=4, group_size=32, is_quanted=False
+)
+DEFAULT_MODELOPT_FP4_QUANT_CONFIG = ModelOptFp4Config(
+    bits=4, group_size=16, is_quanted=False
+)
+
+DEFAULT_W4A8_INT4_PER_CHANNEL_QUANT_CONFIG = W4a8Int4PerChannelQuantConfig(
+    bits=4,
+    group_size=128,
+    is_quanted=False
+)
+
+DEFAULT_COMPRESSED_W4A8_INT4_PER_CHANNEL_QUANT_CONFIG = (
+    CompressedW4A8Int4PerChannelQuantConfig(bits=4, group_size=32, is_quanted=True)
+)
+
+preset_quant_config = {
+    "INT8": DEFAULT_WEIGHT_ONLY_INT8_PER_CHANNEL_QUANT_CONFIG,
+    "FP8": DEFAULT_FP8_PER_TENSOR_QUANT_CONFIG,
+    "FP8_DYNAMIC_PER_TENSOR": DEFAULT_FP8_DYNAMIC_PER_TENSOR_QUANT_CONFIG,
+    "FP8_PER_BLOCK": DEFAULT_FP8_BLOCK_WISE_QUANT_CONFIG,
+    "FP8_PER_CHANNEL_COMPRESSED": DEFAULT_FP8_PER_CHANNEL_COMPRESSED_QUANT_CONFIG,
+    "FP8_PER_CHANNEL_QUARK": DEFAULT_FP8_PER_CHANNEL_QUARK_QUANT_CONFIG,
+    "QUARKMXFP4": DEFAULT_QUARK_MXFP4_QUANT_CONFIG,
+    "MODELOPT_FP4": DEFAULT_MODELOPT_FP4_QUANT_CONFIG,
+    "W4A8_INT4_PER_CHANNEL": DEFAULT_W4A8_INT4_PER_CHANNEL_QUANT_CONFIG,
+    "W4A8_INT4_PER_CHANNEL_COMPRESSED": (
+        DEFAULT_COMPRESSED_W4A8_INT4_PER_CHANNEL_QUANT_CONFIG
+    ),
+}
+
+
+def init_quant_config(quantization: str):
+    try:
+        quant_config_dict = json.loads(quantization)
+        quant_config: QuantizationConfig = QuantizationConfig.from_config(
+            quant_config_dict
+        )
+    except Exception:
+        quant_config = preset_quant_config.get(quantization.upper(), None)
+        if quant_config is None:
+            raise ValueError(
+                f"{quantization.upper()} is not support now, quantization must in {list(preset_quant_config.keys())}"
+            )
+    return quant_config

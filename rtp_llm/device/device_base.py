@@ -1,0 +1,107 @@
+import logging
+from typing import Optional
+
+import torch
+
+from rtp_llm.config.py_config_modules import PyEnvConfigs
+from rtp_llm.device.device_type import DeviceType, get_device_type
+from rtp_llm.ops.compute_ops import (
+    get_device_id,
+    preprocess_gemm_weight_by_key,
+    preprocess_weight_scale,
+)
+
+
+class MemInfo:
+    used: int = 0
+    free: int = 0
+
+    def __init__(self, used: int, free: int):
+        self.used = used
+        self.free = free
+
+
+class DeviceBase:
+    def __init__(self):
+        from rtp_llm.config.server_config_setup import auto_configure_deepep
+        from rtp_llm.server.server_args.server_args import setup_args
+
+        self.py_env_configs = setup_args()
+        auto_configure_deepep(
+            moe_config=self.py_env_configs.moe_config,
+            deep_ep_config=self.py_env_configs.deep_ep_config,
+            parallelism_config=self.py_env_configs.parallelism_config,
+            role_type=self.py_env_configs.role_config.role_type,
+        )
+
+    def get_device_type(self) -> DeviceType:
+        return get_device_type()
+
+    def get_device_id(self) -> int:
+        return get_device_id()
+
+    @property
+    def support_dio_load(self) -> bool:
+        return False
+
+    def _get_mem_info(self) -> MemInfo:
+        raise NotImplementedError("_get_mem_info is not implemented")
+
+    def get_mem_info(self) -> MemInfo:
+        try:
+            return self._get_mem_info()
+        except Exception as e:
+            logging.warning(f"get_mem_info failed: {e}")
+            return None
+
+    def preprocess_groupwise_weight_params(
+        self,
+        qweight_int32,
+        qzeros_int32,
+        scales_fp16,
+        device: str,
+        gptq: bool,
+        awq: bool,
+        weight_bits: int,
+    ):
+        raise NotImplementedError(
+            "preprocess_groupwise_weight_params is not implemented"
+        )
+
+    def preprocess_moe_groupwise_weight_params(
+        self,
+        qweight_int32,
+        qzeros_int32,
+        scales_fp16,
+        device: str,
+        gptq: bool,
+        awq: bool,
+        weight_bits: int,
+    ):
+        raise NotImplementedError(
+            "preprocess_moe_groupwise_weight_params is not implemented"
+        )
+
+    def apply_int8(self, tensor: torch.Tensor, device: str):
+        raise NotImplementedError("apply_int8 is not implemented")
+
+    def moe_apply_int8(self, tensor: torch.Tensor, device: str):
+        raise NotImplementedError("moe_apply_int8 is not implemented")
+
+    def maybe_rewrite_weight_by_key(
+        self,
+        key: str,
+        weight: torch.Tensor,
+        use_swizzle_a: Optional[bool] = None,
+    ) -> torch.Tensor:
+        return weight
+
+    def maybe_prepare_static_weights_for_fp4_moe(
+        self,
+        kernel_name: str,
+        scale_name: str,
+        kernel: torch.Tensor,
+        scale: torch.Tensor,
+        **kwargs,
+    ):
+        return kernel, scale

@@ -1,0 +1,7 @@
+# Large binary files are managed via oss-lfs (scripts/oss-lfs/).
+# Run: git config core.hooksPath .githooks
+# Then: scripts/oss-lfs/oss-lfs-pull.sh
+*.pt binary
+*.bin binary
+*.model binary
+*.safetensors binary

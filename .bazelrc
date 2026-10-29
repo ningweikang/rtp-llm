@@ -1,0 +1,404 @@
+common --experimental_downloader_config=bazel/bazel_downloader.cfg
+fetch:downloader --experimental_remote_downloader=grpc://com.taobao.search.bazel.server:9092 --remote_cache=grpc://com.taobao.search.bazel.server:9092
+
+build --python_top=//:python310 --incompatible_use_python_toolchains=false # force use /opt/conda310/bin/python3
+
+build --spawn_strategy=local # avoid nvcc conflicts
+build --action_env PYTHON_BIN_PATH="/opt/conda310/bin/python3"
+build --cxxopt="-std=c++17" --copt="-DGTEST_USE_OWN_TR1_TUPLE=0" --copt="-DEIGEN_MAX_CPP_VER=11"
+build -c opt
+build --copt -O2
+build --copt -g --strip=never
+build --copt -Wall
+build --copt -Werror
+build --copt -Wno-unknown-pragmas # omp
+build --copt -Wno-sign-compare # alog
+build --copt -Wno-attributes # pybind11
+build --copt -Wno-stringop-truncation # grpc
+build --copt -Wno-stringop-overflow # grpc
+build --copt -Wno-maybe-uninitialized # protobuf
+build --copt -Wno-format-overflow # cm2
+build --cxxopt -Wno-class-memaccess # grpc
+build --copt -Wno-deprecated-declarations
+build --experimental_cc_implementation_deps
+build --copt -DOPENSSL_IS_BORINGSSL
+build --experimental_cc_shared_library
+build --linkopt="-lm"
+build --define=grpc_no_ares=true
+build --define=xft_use_icx=true
+build --define=frontend=false
+build --linkopt -ldl # exception backtrace
+build --define=NVSHMEM_DIR=/
+build --action_env PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/tmp/cache_bust_20260321"
+build --host_action_env PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/tmp/cache_bust_20260321"
+
+build:cuda --copt="-DENABLE_BF16=1"
+build:cuda --copt="-DBUILD_CUTLASS_MIXED_GEMM=ON"
+build:cuda --copt="-DC10_CUDA_NO_CMAKE_CONFIGURE_FILE"
+build:cuda --copt="-DUSING_CUDA=1"
+build:cuda --define=using_cuda=true --define=using_cuda_nvcc=true
+build:cuda --crosstool_top=@local_config_cuda//crosstool:toolchain
+build:cuda --action_env CUDA_TOOLKIT_PATH="/usr/local/cuda/"
+build:cuda --host_action_env CUDA_TOOLKIT_PATH="/usr/local/cuda/"
+build:cuda --action_env TF_CUDA_PATHS="/usr/local/cuda/"
+build:cuda --host_action_env TF_CUDA_PATHS="/usr/local/cuda/"
+build:cuda --action_env TF_CUDA_CLANG="0"
+build:cuda --host_action_env TF_CUDA_CLANG="0"
+build:cuda --action_env TF_NEED_CUDA="1"
+build:cuda --host_action_env TF_NEED_CUDA="1"
+build:cuda --action_env LD_LIBRARY_PATH="/lib64:/opt/conda310/lib/:/usr/local/cuda/compat/:/usr/local/nvidia/lib64:/usr/lib64:/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs/:/usr/local/cuda/extras/CUPTI/lib64/"
+build:cuda --host_action_env LD_LIBRARY_PATH="/lib64:/opt/conda310/lib/:/usr/local/cuda/compat/:/usr/local/nvidia/lib64:/usr/lib64:/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs/:/usr/local/cuda/extras/CUPTI/lib64/"
+build:cuda --linkopt="-L/usr/local/cuda/lib64/stubs/"
+build:cuda --action_env NCCL_INSTALL_PATH="/usr/local/cuda/"
+build:cuda --action_env NCCL_HDR_PATH="/usr/local/cuda/include"
+build:cuda --action_env TF_NCCL_VERSION="2"
+build:cuda --action_env CUDNN_INSTALL_PATH="/usr/local/cuda/"
+
+# 6.0 = P100, 7.0 = V100, 7.5 = T4, 8.6 = A10, 8.0 = A100 8.9 = L, 9.0 = H800
+build:cuda12 --config=cuda
+build:cuda12 --action_env TF_CUDA_COMPUTE_CAPABILITIES="7.0,7.5,8.0,8.6,8.9,9.0"
+build:cuda12 --host_action_env TF_CUDA_COMPUTE_CAPABILITIES="7.0,7.5,8.0,8.6,8.9,9.0"
+build:sm7x --action_env TF_CUDA_COMPUTE_CAPABILITIES="7.0,7.5"
+build:sm7x --action_env  TF_CUDA_COMPUTE_CAPABILITIES="7.0,7.5"
+build:sm8x --action_env TF_CUDA_COMPUTE_CAPABILITIES="8.0,8.6,8.9"
+build:sm8x --action_env  TF_CUDA_COMPUTE_CAPABILITIES="8.0,8.6,8.9"
+build:sm9x --action_env TF_CUDA_COMPUTE_CAPABILITIES="9.0"
+build:sm9x --action_env  TF_CUDA_COMPUTE_CAPABILITIES="9.0"
+build:sm10x --action_env  TF_CUDA_COMPUTE_CAPABILITIES="10.0"
+build:sm12x --action_env TF_CUDA_COMPUTE_CAPABILITIES="12.0"
+build:sm12x --host_action_env TF_CUDA_COMPUTE_CAPABILITIES="12.0"
+build:cuda12 --action_env TF_CUDA_VERSION="12.4"
+build:cuda12 --host_action_env TF_CUDA_VERSION="12.4"
+build:cuda12 --define=using_cuda12=true
+build:cuda12 --define=using_cuda12_9_x86=false
+build:cuda12 --define=using_cuda12_x86=true
+build:cuda12 --define=using_cuda12_arm=false
+# cuda_pre_12_9 (BUILD) matches only when all three defines are explicitly
+# false; cuda13 configs inherit cuda12 and override this to true.
+build:cuda12 --define=using_cuda13_x86=false
+build:cuda12 --copt="-DUSING_CUDA12=1"
+build:cuda12 --copt="-DFMHA_SUPPORT_SPLIT=1"
+build:cuda12 --copt="-DENABLE_FP8=1"
+build:cuda12 --config=remote_kv_cache
+
+build:cuda12_2 --config=cuda12
+build:cuda12_2 --action_env TF_CUDA_VERSION="12.2"
+build:cuda12_2 --host_action_env TF_CUDA_VERSION="12.2"
+
+build:cuda12_6 --config=cuda12
+build:cuda12_6 --action_env TF_CUDA_VERSION="12.6"
+build:cuda12_6 --host_action_env TF_CUDA_VERSION="12.6"
+build:cuda12_6 --copt="-D_GLIBCXX_USE_CXX11_ABI=1"
+
+build:cuda12_9_base --config=cuda12
+build:cuda12_9_base --copt="-DUSING_CUDA12_9=1"
+build:cuda12_9_base --action_env TF_CUDA_VERSION="12.9"
+build:cuda12_9_base --host_action_env TF_CUDA_VERSION="12.9"
+build:cuda12_9_base --copt="-D_GLIBCXX_USE_CXX11_ABI=1"
+build:cuda12_9_base --copt="-DENABLE_FP4=1"
+
+build:cuda12_9 --config=cuda12_9_base
+build:cuda12_9 --define=using_cuda12_9_x86=true
+
+# cuda12_9_arm: kept from main — the internal CI's build-gpu_cuda12_arm job
+# still builds with this config (the DSv4 ARM path moved to cuda13_arm below,
+# but this merge keeps main's pipeline yaml and therefore main's config).
+build:cuda12_9_arm --config=cuda12_9_base
+build:cuda12_9_arm --config=sm10x
+build:cuda12_9_arm --copt=-Wno-tautological-compare
+build:cuda12_9_arm --copt=-Wno-array-bounds
+build:cuda12_9_arm --copt=-Wno-unused-result
+build:cuda12_9_arm --copt=-Wno-array-parameter
+build:cuda12_9_arm --copt=-Wno-narrowing
+build:cuda12_9_arm --define=using_cuda12_arm=true
+build:cuda12_9_arm --define=using_cuda12_9_x86=false
+build:cuda12_9_arm --action_env TF_CUDA_COMPUTE_CAPABILITIES="10.0"
+build:cuda12_9_arm --host_action_env TF_CUDA_COMPUTE_CAPABILITIES="10.0"
+build:cuda12_9_arm --copt -DUSE_CUDA_ARM=0
+build:cuda12_9_arm --define=use_remote_kv_cache=false
+build:cuda12_9_arm --copt="-DENABLE_FP4=1"
+
+
+# cuda13_base reuses the generic NVIDIA selections from cuda12 while targeting
+# the CUDA 13.2 toolchain. Keep the Bazel using_cuda12 define as a compatibility
+# selector, but expose USING_CUDA13 instead of USING_CUDA12 to C++ sources.
+build:cuda13_base --config=cuda12
+build:cuda13_base --copt="-UUSING_CUDA12"
+build:cuda13_base --copt="-DUSING_CUDA13=1"
+build:cuda13_base --action_env TF_CUDA_VERSION="13.2"
+build:cuda13_base --host_action_env TF_CUDA_VERSION="13.2"
+build:cuda13_base --repo_env=TF_CUDA_VERSION=13.2
+build:cuda13_base --copt="-D_GLIBCXX_USE_CXX11_ABI=1"
+build:cuda13_base --copt="-DENABLE_FP4=1"
+
+# cuda13_arm: replaces the former cuda12_9_arm config.  Build one SBSA
+# ARM image/config for GB200 (10.0) and GB300/B300 (10.3) instead of
+# splitting separate sm100/sm103 configs.  The ARM CUDA 13 test pools are
+# GB200 (SM100_ARM_CU13, sm_100); the sm_103 code path is compiled ahead of
+# a matching GB300 pool.
+build:cuda13_arm --config=cuda13_base
+build:cuda13_arm --config=sm10x
+build:cuda13_arm --cpu=aarch64
+build:cuda13_arm --host_cpu=aarch64
+build:cuda13_arm --copt=-Wno-tautological-compare
+build:cuda13_arm --copt=-Wno-array-bounds
+build:cuda13_arm --copt=-Wno-unused-result
+build:cuda13_arm --copt=-Wno-array-parameter
+build:cuda13_arm --copt=-Wno-narrowing
+build:cuda13_arm --define=using_cuda12_arm=true
+build:cuda13_arm --define=using_cuda13_arm=true
+build:cuda13_arm --define=using_cuda12_9_x86=false
+build:cuda13_arm --define=using_cuda12_x86=false
+build:cuda13_arm --repo_env=TF_CUDA_COMPUTE_CAPABILITIES=10.0,10.3
+build:cuda13_arm --action_env TF_CUDA_COMPUTE_CAPABILITIES="10.0,10.3"
+build:cuda13_arm --host_action_env TF_CUDA_COMPUTE_CAPABILITIES="10.0,10.3"
+build:cuda13_arm --copt -DUSE_CUDA_ARM=0
+build:cuda13_arm --define=use_remote_kv_cache=false
+build:cuda13_arm --copt="-DENABLE_FP4=1"
+# Suppress missing-field-initializers being promoted to an error (newer
+# Python/gcc combo on CUDA 13 ARM trips on PyModuleDef's trailing fields).
+build:cuda13_arm --copt=-Wno-missing-field-initializers
+build:cuda13_arm --copt=-Wno-error=missing-field-initializers
+build:cuda13_arm --host_copt=-Wno-missing-field-initializers
+
+# cuda13: x86_64 counterpart to cuda13_arm.  Same CUDA 13.2 toolchain and
+# first-party patches; target compute capabilities span H100/H200 (9.0) and
+# B100/B200 (10.0) plus older SMs kept for ecosystem compat, mirroring
+# cuda12_9. Uses its own using_cuda13_x86 define so BUILD-file select()s
+# can choose CUDA-13-specific dependencies without being tied to the ARM
+# path's using_cuda13_arm.
+build:cuda13 --config=cuda13_base
+build:cuda13 --cpu=k8
+build:cuda13 --host_cpu=k8
+# Same -Wno-* set as cuda13_arm — gcc 10 (al8) on the CUDA 13 toolchain is
+# strict enough to flag warnings in third-party code (grpc tcp_posix.cc:
+# `(flag & MSG_CTRUNC) == 1` triggers -Werror=tautological-compare; etc.).
+build:cuda13 --copt=-Wno-tautological-compare
+build:cuda13 --copt=-Wno-array-bounds
+build:cuda13 --copt=-Wno-unused-result
+build:cuda13 --copt=-Wno-array-parameter
+build:cuda13 --copt=-Wno-narrowing
+# cuda13 owns its own dep chain: torch 2.11+cu130, triton 3.6.0, dedicated
+# pip_gpu_cuda13_torch / torch_2.11_py310_cuda repos and a dedicated whl_deps
+# branch in arch_select.bzl.  Selects that need to treat cu13 the same as
+# cu12_9 use the using_cu12_9_or_13_x86 config_setting_group (BUILD).
+build:cuda13 --define=using_cuda13_x86=true
+build:cuda13 --define=using_cuda12_9_x86=false
+build:cuda13 --define=using_cuda12_x86=false
+# remote_kv_cache 3rdparty prebuilt (kv_cache_manager_client.so) is linked
+# against libcudart.so.12 — pulls a missing dep into libth_transformer.so on
+# cu13 toolchain. cuda13_arm already disables it; mirror here.
+build:cuda13 --define=use_remote_kv_cache=false
+# nvcc 13 dropped Volta (sm_70) and Turing (sm_75); supported set on
+# CUDA 13.x is sm_80..sm_120.  With sm_70/sm_75 left in the list nvcc
+# fatals out at:  Unsupported gpu architecture 'compute_70'.
+# The CUDA 13 x86 test pools execute sm_86 (A10_CU13) and sm_103
+# (L20D_TEST/B300) cubins.  sm_100 and sm_120 are compiled for compatibility
+# only on x86: sm_100 execution coverage comes from the ARM GB200 lane
+# (SM100_ARM_CU13), and sm_120 has no execution pool yet.
+build:cuda13 --repo_env=TF_CUDA_COMPUTE_CAPABILITIES=8.0,8.6,8.9,9.0,10.0,10.3,12.0
+build:cuda13 --action_env TF_CUDA_COMPUTE_CAPABILITIES="8.0,8.6,8.9,9.0,10.0,10.3,12.0"
+build:cuda13 --host_action_env TF_CUDA_COMPUTE_CAPABILITIES="8.0,8.6,8.9,9.0,10.0,10.3,12.0"
+build:cuda13 --copt="-DENABLE_FP4=1"
+build:cuda13 --copt=-Wno-missing-field-initializers
+build:cuda13 --copt=-Wno-error=missing-field-initializers
+build:cuda13 --host_copt=-Wno-missing-field-initializers
+build:cuda13_arm --host_copt=-Wno-error=missing-field-initializers
+
+# Triton 3.6.0 (shipped with cuda13 lock) supports CUDA 13.x ptxas natively;
+# the ptxas wrapper that triton 3.4 needed is no longer required.  The wrapper
+# is still baked into the prod image — keep it there harmlessly, just don't
+# point TRITON_PTXAS_PATH at it.
+# CUDA 13 ARM base image ships glibc 2.32, but the CUDA-12 PyTorch wheels we
+# depend on (via pip_cuda12_arm_torch_*) include libcufile.so.0 which assumes
+# glibc >= 2.34 (shm_open moved to libc there).  Preload librt.so.1 so the
+# symbol resolves without having to rebuild the wheels.
+test:cuda13_arm --test_env=LD_PRELOAD=/usr/lib64/librt.so.1
+
+# deep_gemm JIT spawns nvcc at runtime to build SM100/SM103a kernels (called
+# from V4 weight loader → get_mn_major_tma_aligned_packed_ue8m0_tensor and
+# fp8_fp4_mega_moe in the routed-experts forward path). nvcc needs a host C++
+# compiler reachable via -ccbin / CUDAHOSTCXX.
+#
+# The fp8_fp4_mega_moe kernel uses a C++20 floating-point non-type template
+# parameter (`float kActivationClamp`). nvcc 13.2 + gcc 10.2.1 (the system
+# /usr/bin/g++) rejects this even with -std=c++20 — the FP-NTTP feature needs
+# gcc 12+ as host. Container ships /opt/rh/gcc-toolset-12/root/usr/bin/g++
+# (gcc 12.3.0), so point the JIT at that. gcc-toolset-12 lives outside PATH
+# by default, hence the explicit PATH / LD_LIBRARY_PATH overrides.
+#
+# These were previously hard-coded into smoke defs.bzl pointing at user-
+# private conda envs (/home/tanboyu.tby/..., /home/serina.wzq/...) which
+# only worked on those specific dev boxes. Centralize here so every cu13
+# test sees the same toolchain.
+test:cuda13_arm --test_env=DG_JIT_CPP_STANDARD=20
+test:cuda13_arm --test_env=CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc
+test:cuda13_arm --test_env=CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++
+test:cuda13_arm --test_env=CUDAHOSTCXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++
+test:cuda13_arm --test_env=NVCC_PREPEND_FLAGS=-ccbin=/opt/rh/gcc-toolset-12/root/usr/bin/g++
+test:cuda13_arm --test_env=PATH=/opt/rh/gcc-toolset-12/root/usr/bin:/opt/conda310/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+test:cuda13_arm --test_env=LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/usr/local/cuda/lib64:/opt/conda310/lib:/usr/lib64
+test:cuda13_arm --test_env=TRITON_PTXAS_PATH=/usr/local/bin/triton_ptxas_cuda_wrapper.sh
+test:cuda13 --test_env=DG_JIT_CPP_STANDARD=20
+test:cuda13 --test_env=CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc
+test:cuda13 --test_env=CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++
+test:cuda13 --test_env=CUDAHOSTCXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++
+test:cuda13 --test_env=NVCC_PREPEND_FLAGS=-ccbin=/opt/rh/gcc-toolset-12/root/usr/bin/g++
+test:cuda13 --test_env=PATH=/opt/rh/gcc-toolset-12/root/usr/bin:/opt/conda310/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+test:cuda13 --test_env=LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/usr/local/cuda/lib64:/opt/conda310/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/lib64
+test:cuda13 --test_env=RAYON_NUM_THREADS=8
+
+build:cpu --copt="-DENABLE_BF16=1"
+build:cpu --define=using_cuda=false --define=using_cuda_nvcc=false --define=using_cpu=true
+build:cpu --action_env TF_NEED_CUDA="0"
+build:cpu --host_action_env TF_NEED_CUDA="0"
+build:cpu --crosstool_top=@bazel_tools//tools/cpp:toolchain
+build:cpu --host_crosstool_top=@bazel_tools//tools/cpp:toolchain
+build:cpu --copt="-DUSING_CUDA=0"
+build:cpu --copt="-D_GLIBCXX_USE_CXX11_ABI=0"
+
+# NOTE: intel xfastertransformer package has two version,
+# icx version is for 1-3 gen intel xeon cpu, non-icl version is for 4th gen and later.
+build:cpu_latest --define=xft_use_icx=false
+
+build:rocm --copt="-DENABLE_BF16=1"
+build:rocm --action_env TF_NEED_CUDA="0"
+build:rocm --host_action_env TF_NEED_CUDA="0"
+build:rocm --crosstool_top=@local_config_rocm//crosstool:toolchain
+build:rocm --host_crosstool_top=@local_config_rocm//crosstool:toolchain
+build:rocm --define=using_cuda=false --define=using_cuda_nvcc=false
+build:rocm --define=using_rocm=true --define=using_rocm_hipcc=true
+build:rocm --action_env TF_NEED_ROCM=1
+build:rocm --action_env GPU_ARCHS=gfx942
+build:rocm --copt="-DUSING_CUDA=0"
+build:rocm --copt="-DUSING_ROCM=1"
+# Pin the OTel STL mode to a literal value. The default "best" mode defines
+# OPENTELEMETRY_STL_VERSION=(__cplusplus/100); the parentheses make shlex.quote
+# wrap the -D argument in single quotes inside crosstool_wrapper_driver_rocm,
+# so the hipcc branch silently drops it. TUs built with -x rocm then fall back
+# to the nostd ABI while the gcc-built OTel SDK static lib uses the std ABI,
+# leaving libth_transformer.so with undefined nostd symbols at dlopen time.
+# 2017 matches the --cxxopt=-std=c++17 result of "best" on the gcc side.
+build:rocm --@io_opentelemetry_cpp//api:with_cxx_stdlib=2017
+
+build:rocm_gfx950 --config=rocm
+build:rocm_gfx950 --action_env GPU_ARCHS=gfx950
+build:rocm_gfx950 --copt="-DROCM_GFX950=1"
+build:rocm_gfx950 --define=gfx950=true
+build:rocm --copt="-DUSING_CK_INT4=1"
+build:rocm --copt="-D__HIP_PLATFORM_AMD__=1"
+build:rocm --copt="-DTORCH_CUDA_CPP_API=" # PyTorch 2.9 ROCm compatibility
+build:rocm --copt="-DTORCH_CUDA_CU_API=" # PyTorch 2.9 ROCm compatibility
+
+## ROCm clang may emit compiler-rt builtins (e.g. __truncsfbf2) that are not
+## pulled in automatically for shared objects in this toolchain setup.
+## NOTE: The clang version number (22) must be updated when upgrading ROCm.
+## Known mapping: ROCm 5.x → clang 17, ROCm 6.x → clang 18, ROCm 7.x → clang 22.
+build:rocm --linkopt="/opt/rocm/lib/llvm/lib/clang/22/lib/linux/libclang_rt.builtins-x86_64.a"
+build:rocm --copt="-DLEGACY_HIPBLAS_DIRECT"
+build:rocm --copt -Wno-tautological-compare # grpc
+build:rocm --copt="-Wno-array-parameter"
+build:rocm --copt="-Wno-error=array-bounds"
+build:rocm --copt="-Wno-error=unused-result"
+build:rocm --copt="-Wno-error=uninitialized"
+build:rocm --copt="-Wno-deprecated-builtins"  # absl uses deprecated __has_trivial_assign
+build:rocm --copt="-D_GLIBCXX_USE_CXX11_ABI=1"
+#build:rocm --action_env ROCM_HIPBLASLT_CONFIG="/ali/rtp-llm/gemm_config_bert61.csv" # blasLt config
+#build:rocm --action_env ROCM_DISABLE_HIPBLASLT=1 # to use blas only
+#build:rocm --action_env HIPBLASLT_LOG_MASK="32" # to log blasLt
+#build:rocm --action_env ROCBLAS_LAYER="4"
+#build:rocm --copt="-DENABLE_PROF=1"
+build:rocm --action_env LD_LIBRARY_PATH="/opt/rh/gcc-toolset-12/root/usr/lib64:/lib64:/opt/conda310/lib/:/opt/rocm/lib/:/opt/taobao/java/jre/lib/amd64/server/:/opt/amdgpu/lib64/"
+build:rocm --host_action_env LD_LIBRARY_PATH="/opt/rocm/lib/:/opt/taobao/java/jre/lib/amd64/server/:/opt/amdgpu/lib64/"
+build:rocm --action_env PATH="/opt/rh/gcc-toolset-12/root/usr/bin:/opt/conda310/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/tmp/cache_bust_20260321"
+build:rocm --host_action_env PATH="/opt/rh/gcc-toolset-12/root/usr/bin:/opt/conda310/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/tmp/cache_bust_20260321"
+build:rocm --copt="-DUSE_ROCM=1"
+build:rocm --copt="-DFORCE_NVSHMEM_API=1"
+build:rocm --copt="-DFLASHINFER_CUB_SUBTRACTLEFT_DEFINED"  # ROCm 7.2 hipcub uses SubtractLeft instead of FlagHeads
+test:rocm --test_env="/opt/rocm/lib/:/opt/taobao/java/jre/lib/amd64/server/:/opt/amdgpu/lib64/"
+
+# ==================== Ascend NPU ====================
+build:ascend --copt="-DENABLE_BF16=1"
+build:ascend --action_env TF_NEED_CUDA="0"
+build:ascend --host_action_env TF_NEED_CUDA="0"
+build:ascend --crosstool_top=@bazel_tools//tools/cpp:toolchain
+build:ascend --host_crosstool_top=@bazel_tools//tools/cpp:toolchain
+build:ascend --define=using_cuda=false --define=using_cuda_nvcc=false
+build:ascend --define=using_ascend=true
+build:ascend --action_env TF_NEED_ASCEND=1
+build:ascend --host_action_env TF_NEED_ASCEND=1
+build:ascend --action_env ASCEND_TOOLKIT_PATH="/usr/local/Ascend/ascend-toolkit/latest"
+build:ascend --host_action_env ASCEND_TOOLKIT_PATH="/usr/local/Ascend/ascend-toolkit/latest"
+build:ascend --copt="-DUSING_CUDA=0"
+build:ascend --copt="-DUSING_ASCEND=1"
+build:ascend --copt="-D_GLIBCXX_USE_CXX11_ABI=1"
+build:ascend --linkopt="-L/usr/local/Ascend/ascend-toolkit/latest/lib64"
+build:ascend --linkopt="-lascendcl"
+build:ascend --linkopt="-lhccl"
+build:ascend --copt=-Wno-deprecated-declarations
+build:ascend --copt="-Wno-error=unused-result"
+build:ascend --copt="-Wno-error=array-bounds"
+build:ascend --copt=-Wno-tautological-compare
+build:ascend --copt=-Wno-array-parameter
+build:ascend --copt=-Wno-unused-variable
+build:ascend --action_env LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/add-ons/"
+build:ascend --host_action_env LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/add-ons/"
+
+test:ascend --test_env LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/driver/:/usr/local/Ascend/add-ons/:/opt/conda310/lib/python3.10/site-packages/torch/lib:/opt/conda310/lib/python3.10/site-packages/torch_npu/lib:/opt/conda310/lib"
+test:ascend --test_env PYTHONHOME="/opt/conda310"
+test:ascend --test_env TORCH_DEVICE_BACKEND_AUTOLOAD="0"
+test:ascend --test_env TEST_USING_DEVICE="ASCEND"
+
+build:arm --copt="-DENABLE_BF16=1"
+build:arm --define=using_cuda=false --define=using_cuda_nvcc=false
+build:arm --define=using_arm=true
+build:arm --copt="-DBUILDING_ARM_ONLY=1"
+build:arm --action_env TF_NEED_CUDA="0"
+build:arm --host_action_env TF_NEED_CUDA="0"
+build:arm --crosstool_top=@bazel_tools//tools/cpp:toolchain
+build:arm --host_crosstool_top=@bazel_tools//tools/cpp:toolchain
+build:arm --copt="-DUSING_CUDA=0"
+build:arm --copt="-D_GLIBCXX_USE_CXX11_ABI=0"
+build:arm --define=xft_use_icx=false
+build:arm --copt=-Wno-tautological-compare
+build:arm --copt=-Wno-array-bounds # aios
+build:arm --copt=-Wno-unused-result # grpc
+build:arm --copt=-Wno-array-parameter # boringssl
+
+# remote_kv_cache
+build:remote_kv_cache --define=use_remote_kv_cache=true
+
+build:debug --copt -g --copt -O0 --copt -U_FORTIFY_SOURCE --copt -DEXCLUDE_SM_100=1 --copt -DEXCLUDE_SM_120=1
+build:trace --copt="-DCUTLASS_DEBUG_TRACE_LEVEL=1"
+
+build:cicd --remote_upload_local_results
+build:cicd --worker_verbose
+build:cicd --show_result=0 --auto_output_filter=all
+test:cicd --test_output=errors --max_test_output_bytes=10240000 --experimental_ui_max_stdouterr_bytes=31457280
+
+# asan
+build:asan --copt -fsanitize=address
+build:asan --copt -DADDRESS_SANITIZER
+build:asan --copt -DFL_ASAN_ENABLED
+build:asan --copt -fno-omit-frame-pointer
+build:asan --copt -fPIC # for "fix relocation truncated to fit: R_X86_64_32 against `.debug_info'" collect2 error
+build:asan --copt -fdebug-types-section # for "fix relocation truncated to fit: R_X86_64_32 against `.debug_info'" collect2 error
+build:asan --linkopt -fsanitize=address
+
+test:rocm --test_env PATH="/opt/rocm/bin:/opt/rh/gcc-toolset-12/root/usr/bin:/opt/conda310/bin:/opt/conda310/condabin:/usr/share/Modules/bin:/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/usr/X11R6/bin:/opt/cmake/cmake-3.26.4/bin"
+test:rocm --test_env LD_LIBRARY_PATH="/opt/rh/gcc-toolset-12/root/usr/lib64:/opt/rocm/lib:/opt/conda310/lib/:/usr/lib64:/opt/amdgpu/lib64"
+test --test_env LD_LIBRARY_PATH="/opt/rocm/lib:/opt/conda310/lib/:/usr/local/nvidia/lib64:/usr/lib64:/usr/local/cuda/lib64:/opt/amdgpu/lib64:/usr/local/cuda/extras/CUPTI/lib64"
+test --test_env OMP_NUM_THREADS=8
+test --test_env FT_SERVER_TEST="1"
+test --test_env LOG_LEVEL="INFO"
+test --test_env NCCL_DEBUG="INFO"
+# for dp scatter add stable result
+test --test_env TZ=Asia/Shanghai
+# for flashinfer find cuda; scope to CUDA-specific test runs
+test:cuda --test_env CUDA_HOME=/usr/local/cuda
+# compat for low driver < 535
+test:compat --test_env LD_LIBRARY_PATH="/opt/rocm/lib:/opt/conda310/lib/:/usr/local/cuda/compat/:/usr/local/nvidia/lib64:/usr/lib64:/usr/local/cuda/lib64:/opt/amdgpu/lib64:/usr/local/cuda/extras/CUPTI/lib64:/usr/local/cuda/lib64/stubs"
+
+# internal source overrides (only loaded when internal_source symlink exists)
+try-import %workspace%/internal_source/.internal_bazelrc
+try-import %workspace%/internal_source/.cicd_bazelrc

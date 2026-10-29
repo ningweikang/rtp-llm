@@ -1,0 +1,131 @@
+#pragma once
+
+#include "rtp_llm/cpp/utils/ErrorCode.h"
+#include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.grpc.pb.h"
+#include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
+#include "rtp_llm/cpp/disaggregate/cache_store/CommonDefine.h"
+
+namespace rtp_llm {
+
+inline grpc::StatusCode transErrorCodeToGrpc(ErrorCode error_code) {
+    const static std::unordered_map<ErrorCode, grpc::StatusCode> error_code_map = {
+        {ErrorCode::CANCELLED, grpc::StatusCode::CANCELLED},
+        {ErrorCode::MALLOC_FAILED, grpc::StatusCode::RESOURCE_EXHAUSTED},
+        {ErrorCode::DECODE_MALLOC_FAILED, grpc::StatusCode::RESOURCE_EXHAUSTED},
+        // AutoTPM Cancel: victim terminal maps to
+        // RESOURCE_EXHAUSTED (HTTP 429 upstream); exact 8429 travels in
+        // ErrorDetailsPB trailing metadata.
+        {ErrorCode::PRIORITY_PREEMPTED, grpc::StatusCode::RESOURCE_EXHAUSTED},
+        {ErrorCode::GRAMMAR_COMPILE_OVERLOADED, grpc::StatusCode::RESOURCE_EXHAUSTED},
+        {ErrorCode::GENERATE_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::CONNECT_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::DEADLINE_EXCEEDED, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::WAIT_TO_RUN_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::KEEP_ALIVE_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::LOAD_CACHE_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::CACHE_STORE_CALL_PREFILL_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::CACHE_STORE_LOAD_BUFFER_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::P2P_CONNECTOR_WORKER_READ_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
+        {ErrorCode::OUT_OF_VOCAB_RANGE, grpc::StatusCode::OUT_OF_RANGE},
+        {ErrorCode::LONG_PROMPT_ERROR, grpc::StatusCode::OUT_OF_RANGE},
+    };
+    auto it = error_code_map.find(error_code);
+    if (it != error_code_map.end()) {
+        return it->second;
+    } else {
+        return grpc::StatusCode::INTERNAL;
+    }
+}
+
+inline ErrorCode transRPCErrorCode(ErrorCodePB error_code) {
+    const static std::unordered_map<ErrorCodePB, ErrorCode> error_code_map = {
+        {ErrorCodePB::NONE_ERROR, ErrorCode::NONE_ERROR},
+        {ErrorCodePB::UNKNOWN_ERROR, ErrorCode::UNKNOWN_ERROR},
+        {ErrorCodePB::CANCELLED, ErrorCode::CANCELLED},
+        {ErrorCodePB::LOAD_CACHE_TIMEOUT, ErrorCode::LOAD_CACHE_TIMEOUT},
+        {ErrorCodePB::CACHE_STORE_LOAD_CONNECT_FAILED, ErrorCode::CACHE_STORE_LOAD_CONNECT_FAILED},
+        {ErrorCodePB::CACHE_STORE_LOAD_SEND_REQUEST_FAILED, ErrorCode::CACHE_STORE_LOAD_SEND_REQUEST_FAILED},
+        {ErrorCodePB::CACHE_STORE_CALL_PREFILL_TIMEOUT, ErrorCode::CACHE_STORE_CALL_PREFILL_TIMEOUT},
+        {ErrorCodePB::CACHE_STORE_LOAD_RDMA_CONNECT_FAILED, ErrorCode::CACHE_STORE_LOAD_RDMA_CONNECT_FAILED},
+        {ErrorCodePB::CACHE_STORE_LOAD_RDMA_WRITE_FAILED, ErrorCode::CACHE_STORE_LOAD_RDMA_WRITE_FAILED},
+        {ErrorCodePB::CACHE_STORE_LOAD_BUFFER_TIMEOUT, ErrorCode::CACHE_STORE_LOAD_BUFFER_TIMEOUT},
+        {ErrorCodePB::P2P_CONNECTOR_CALL_PREFILL_FAILED, ErrorCode::P2P_CONNECTOR_CALL_PREFILL_FAILED},
+        {ErrorCodePB::P2P_CONNECTOR_LOAD_FROM_PREFILL_FAILED, ErrorCode::P2P_CONNECTOR_LOAD_FROM_PREFILL_FAILED},
+        {ErrorCodePB::P2P_CONNECTOR_SCHEDULER_CALL_WORKER_FAILED,
+         ErrorCode::P2P_CONNECTOR_SCHEDULER_CALL_WORKER_FAILED},
+        {ErrorCodePB::P2P_CONNECTOR_SCHEDULER_STREAM_RESOURCE_FAILED,
+         ErrorCode::P2P_CONNECTOR_SCHEDULER_STREAM_RESOURCE_FAILED},
+        {ErrorCodePB::P2P_CONNECTOR_SCHEDULER_FILL_RESPONSE_FAILED,
+         ErrorCode::P2P_CONNECTOR_SCHEDULER_FILL_RESPONSE_FAILED},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_ASYMMETRIC_TP_FAILED, ErrorCode::P2P_CONNECTOR_WORKER_ASYMMETRIC_TP_FAILED},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_HANDLE_READ_TIMEOUT, ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_TIMEOUT},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_HANDLE_READ_CANCELLED,
+         ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_CANCELLED},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_FAILED,
+         ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_FAILED},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_READ_TRANSFER_RDMA_FAILED,
+         ErrorCode::P2P_CONNECTOR_WORKER_READ_TRANSFER_RDMA_FAILED},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_READ_BUFFER_MISMATCH, ErrorCode::P2P_CONNECTOR_WORKER_READ_BUFFER_MISMATCH},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_TIMEOUT,
+         ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_TIMEOUT},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_READ_FAILED, ErrorCode::P2P_CONNECTOR_WORKER_READ_FAILED},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_READ_CANCELED, ErrorCode::P2P_CONNECTOR_WORKER_READ_CANCELLED},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_READ_TIMEOUT, ErrorCode::P2P_CONNECTOR_WORKER_READ_TIMEOUT},
+        {ErrorCodePB::P2P_CONNECTOR_WORKER_READ_TRANSFER_NOT_DONE,
+         ErrorCode::P2P_CONNECTOR_WORKER_READ_TRANSFER_NOT_DONE},
+    };
+    auto it = error_code_map.find(error_code);
+    if (it != error_code_map.end()) {
+        return it->second;
+    } else {
+        return ErrorCode::UNKNOWN_ERROR;
+    }
+}
+
+inline ErrorCodePB transErrorCodeToRPC(ErrorCode error_code) {
+    const static std::unordered_map<ErrorCode, ErrorCodePB> error_code_map = {
+        {ErrorCode::NONE_ERROR, ErrorCodePB::NONE_ERROR},
+        {ErrorCode::UNKNOWN_ERROR, ErrorCodePB::UNKNOWN_ERROR},
+        {ErrorCode::CANCELLED, ErrorCodePB::CANCELLED},
+        {ErrorCode::LOAD_CACHE_TIMEOUT, ErrorCodePB::LOAD_CACHE_TIMEOUT},
+        {ErrorCode::CACHE_STORE_LOAD_CONNECT_FAILED, ErrorCodePB::CACHE_STORE_LOAD_CONNECT_FAILED},
+        {ErrorCode::CACHE_STORE_LOAD_SEND_REQUEST_FAILED, ErrorCodePB::CACHE_STORE_LOAD_SEND_REQUEST_FAILED},
+        {ErrorCode::CACHE_STORE_CALL_PREFILL_TIMEOUT, ErrorCodePB::CACHE_STORE_CALL_PREFILL_TIMEOUT},
+        {ErrorCode::CACHE_STORE_LOAD_RDMA_CONNECT_FAILED, ErrorCodePB::CACHE_STORE_LOAD_RDMA_CONNECT_FAILED},
+        {ErrorCode::CACHE_STORE_LOAD_RDMA_WRITE_FAILED, ErrorCodePB::CACHE_STORE_LOAD_RDMA_WRITE_FAILED},
+        {ErrorCode::CACHE_STORE_LOAD_BUFFER_TIMEOUT, ErrorCodePB::CACHE_STORE_LOAD_BUFFER_TIMEOUT},
+        {ErrorCode::P2P_CONNECTOR_CALL_PREFILL_FAILED, ErrorCodePB::P2P_CONNECTOR_CALL_PREFILL_FAILED},
+        {ErrorCode::P2P_CONNECTOR_LOAD_FROM_PREFILL_FAILED, ErrorCodePB::P2P_CONNECTOR_LOAD_FROM_PREFILL_FAILED},
+        {ErrorCode::P2P_CONNECTOR_SCHEDULER_CALL_WORKER_FAILED,
+         ErrorCodePB::P2P_CONNECTOR_SCHEDULER_CALL_WORKER_FAILED},
+        {ErrorCode::P2P_CONNECTOR_SCHEDULER_STREAM_RESOURCE_FAILED,
+         ErrorCodePB::P2P_CONNECTOR_SCHEDULER_STREAM_RESOURCE_FAILED},
+        {ErrorCode::P2P_CONNECTOR_SCHEDULER_FILL_RESPONSE_FAILED,
+         ErrorCodePB::P2P_CONNECTOR_SCHEDULER_FILL_RESPONSE_FAILED},
+        {ErrorCode::P2P_CONNECTOR_WORKER_ASYMMETRIC_TP_FAILED, ErrorCodePB::P2P_CONNECTOR_WORKER_ASYMMETRIC_TP_FAILED},
+        {ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_TIMEOUT, ErrorCodePB::P2P_CONNECTOR_WORKER_HANDLE_READ_TIMEOUT},
+        {ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_CANCELLED,
+         ErrorCodePB::P2P_CONNECTOR_WORKER_HANDLE_READ_CANCELLED},
+        {ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_FAILED,
+         ErrorCodePB::P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_FAILED},
+        {ErrorCode::P2P_CONNECTOR_WORKER_READ_TRANSFER_RDMA_FAILED,
+         ErrorCodePB::P2P_CONNECTOR_WORKER_READ_TRANSFER_RDMA_FAILED},
+        {ErrorCode::P2P_CONNECTOR_WORKER_READ_BUFFER_MISMATCH, ErrorCodePB::P2P_CONNECTOR_WORKER_READ_BUFFER_MISMATCH},
+        {ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_TIMEOUT,
+         ErrorCodePB::P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_TIMEOUT},
+        {ErrorCode::P2P_CONNECTOR_WORKER_READ_FAILED, ErrorCodePB::P2P_CONNECTOR_WORKER_READ_FAILED},
+        {ErrorCode::P2P_CONNECTOR_WORKER_READ_CANCELLED, ErrorCodePB::P2P_CONNECTOR_WORKER_READ_CANCELED},
+        {ErrorCode::P2P_CONNECTOR_WORKER_READ_TIMEOUT, ErrorCodePB::P2P_CONNECTOR_WORKER_READ_TIMEOUT},
+        {ErrorCode::P2P_CONNECTOR_WORKER_READ_TRANSFER_NOT_DONE,
+         ErrorCodePB::P2P_CONNECTOR_WORKER_READ_TRANSFER_NOT_DONE},
+    };
+    auto it = error_code_map.find(error_code);
+    if (it != error_code_map.end()) {
+        return it->second;
+    } else {
+        return ErrorCodePB::UNKNOWN_ERROR;
+    }
+}
+}  // namespace rtp_llm

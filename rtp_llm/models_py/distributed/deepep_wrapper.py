@@ -1,0 +1,608 @@
+"""DeepEP wrapper with singleton pattern and simplified configuration.
+
+This module provides a unified interface for DeepEP initialization and management,
+combining the functionality of the previous DeepEPInitializer and DeepEPWrapper classes.
+"""
+
+import gc
+import logging
+import os
+import threading
+from dataclasses import dataclass
+from enum import IntEnum, auto
+from pathlib import Path
+from typing import Optional, Tuple
+
+import torch
+from torch.distributed import ProcessGroup
+
+
+def _configure_deepep_nccl_root() -> None:
+    """Pin EP_NCCL_ROOT_DIR to the NCCL library that is actually loaded.
+
+    deep_ep byte-compares the loaded libnccl against find_nccl_root()'s pick
+    and EP_NCCL_ROOT_DIR takes precedence in find_nccl_root, so the env must
+    name the root of the LOADED library (torch's, usually the wheel from the
+    runfiles/venv).  Never guess from installed package metadata: a
+    conda/site-packages copy can differ byte-wise from the loaded wheel.  If
+    no loaded libnccl is mapped yet, leave the env unset and let deep_ep
+    auto-detect with its own sys.path-priority logic.
+    """
+    if "EP_NCCL_ROOT_DIR" in os.environ:
+        return
+    try:
+        loaded_nccl = sorted(
+            {
+                Path(line.rsplit(maxsplit=1)[-1]).resolve()
+                for line in Path("/proc/self/maps").read_text().splitlines()
+                if "/libnccl.so" in line
+            }
+        )
+    except OSError:
+        return
+    for nccl in loaded_nccl:
+        nccl_root = nccl.parent.parent
+        if (nccl_root / "lib").is_dir() and (nccl_root / "include").is_dir():
+            os.environ["EP_NCCL_ROOT_DIR"] = str(nccl_root)
+            logging.info("DeepEP will use NCCL from %s", nccl_root)
+            return
+
+
+# Must run before `from deep_ep import ...`: deep_ep byte-compares the loaded
+# libnccl against find_nccl_root() at import time, and EP_NCCL_ROOT_DIR takes
+# precedence there.  This module is imported after torch.distributed has
+# loaded the runtime NCCL, so the maps scan below sees the right library.
+_configure_deepep_nccl_root()
+
+try:
+    from deep_ep import Buffer as DeepEPBuffer
+    from deep_ep import Config as DeepEPConfig
+except ImportError as _deep_ep_import_err:
+    # Some CPU and non-NVIDIA builds intentionally omit deep_ep. Keep unrelated
+    # startup paths importable and fail only when a DeepEP path is selected.
+    _DEEP_EP_IMPORT_ERROR = _deep_ep_import_err
+
+    class _DeepEPUnavailable:
+        """Stub for deep_ep.Buffer / deep_ep.Config when the wheel is missing."""
+
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError(
+                "deep_ep is not available in this build "
+                "(likely cuda13 lock: torch 2.11+cu130 wheel not yet rebuilt). "
+                f"Original import error: {_DEEP_EP_IMPORT_ERROR}"
+            )
+
+        def __init_subclass__(cls, **kwargs):
+            raise NotImplementedError("deep_ep is not available in this build.")
+
+        @classmethod
+        def get_low_latency_rdma_size_hint(cls, *args, **kwargs):
+            raise NotImplementedError("deep_ep is not available in this build.")
+
+    DeepEPBuffer = _DeepEPUnavailable  # type: ignore[assignment,misc]
+    DeepEPConfig = _DeepEPUnavailable  # type: ignore[assignment,misc]
+
+from rtp_llm.config.engine_config import EngineConfig
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.config.quant_config import QuantizationConfig
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
+    MoEConfigAdapter,
+)
+from rtp_llm.ops import SpeculativeType
+
+__all__ = [
+    "DeepepWrapperConfig",
+    "DeepEPWrapper",
+    "DeepEPBuffer",
+    "DeepEPConfig",
+    "DeepEPMode",
+    "init_deepep_wrapper",
+]
+
+
+class DeepEPMode(IntEnum):
+    """The mode of deep_ep."""
+
+    NORMAL = auto()
+    LOW_LATENCY = auto()
+
+
+@dataclass
+class DeepepWrapperConfig:
+    """Simplified configuration for DeepEP containing only required parameters.
+
+    This class extracts only the necessary parameters from MoEConfigAdapter
+    to reduce coupling and make configuration comparison easier.
+    """
+
+    # Parallelism parameters
+    ep_rank: int
+    ep_size: int
+    tp_size: int
+    local_rank: int
+    world_size: int
+
+    # Model parameters
+    hidden_size: int
+    expert_num: int
+    moe_k: int
+
+    # MoE-specific parameters
+    deep_ep_num_sm: int
+    use_deepep_low_latency: bool
+    use_deepep_internode: bool
+
+    # Generation parameters
+    ll_num_max_token: int
+
+    # Low-latency generation parameter
+    ll_num_max_token_per_rank: int = 0
+
+    @classmethod
+    def from_config_adapter(
+        cls, config_adapter: MoEConfigAdapter, ll_num_max_token_per_rank: int = 0
+    ) -> "DeepepWrapperConfig":
+        """Create DeepepWrapperConfig from MoEConfigAdapter.
+
+        Args:
+            config_adapter: The full configuration adapter
+
+        Returns:
+            A new DeepepWrapperConfig instance with extracted parameters
+        """
+        model_config = config_adapter.model_config
+        parallelism_config = config_adapter.parallelism_config
+        moe_config = config_adapter.moe_config
+
+        ffn_config = parallelism_config.ffn_disaggregate_config
+        if ffn_config is not None and ffn_config.enable_ffn_disaggregate:
+            raise RuntimeError(
+                "enable_ffn_disaggregate needs the ACCL-EP M2N DeepEP buffer and is "
+                "not supported by the official DeepEP provider"
+            )
+
+        return cls(
+            # Parallelism parameters
+            ep_rank=parallelism_config.ep_rank,
+            ep_size=parallelism_config.ep_size,
+            tp_size=parallelism_config.tp_size,
+            local_rank=parallelism_config.local_rank,
+            world_size=parallelism_config.world_size,
+            # Model parameters
+            hidden_size=model_config.hidden_size,
+            expert_num=model_config.expert_num,
+            moe_k=model_config.moe_k,
+            # MoE-specific parameters
+            deep_ep_num_sm=moe_config.deep_ep_num_sm,
+            use_deepep_low_latency=moe_config.use_deepep_low_latency,
+            use_deepep_internode=moe_config.use_deepep_internode,
+            # Generation parameters
+            ll_num_max_token=config_adapter.ll_num_max_token,
+            ll_num_max_token_per_rank=ll_num_max_token_per_rank,
+        )
+
+    def equal(self, other: "DeepepWrapperConfig") -> bool:
+        """Compare if two DeepepWrapperConfig instances are equal.
+
+        Args:
+            other: Another DeepepWrapperConfig instance to compare with
+
+        Returns:
+            True if all parameters are equal, False otherwise
+        """
+        return (
+            self.ep_rank == other.ep_rank
+            and self.ep_size == other.ep_size
+            and self.tp_size == other.tp_size
+            and self.local_rank == other.local_rank
+            and self.world_size == other.world_size
+            and self.hidden_size == other.hidden_size
+            and self.expert_num == other.expert_num
+            and self.moe_k == other.moe_k
+            and self.deep_ep_num_sm == other.deep_ep_num_sm
+            and self.use_deepep_low_latency == other.use_deepep_low_latency
+            and self.use_deepep_internode == other.use_deepep_internode
+            and self.ll_num_max_token == other.ll_num_max_token
+            and self.ll_num_max_token_per_rank == other.ll_num_max_token_per_rank
+        )
+
+    @staticmethod
+    def calc_low_latency_max_token_per_rank(
+        ll_num_max_token: int,
+        tp_size: int,
+        quant_config: QuantizationConfig,
+    ) -> int:
+        ll_num_max_token_per_rank = (ll_num_max_token + tp_size - 1) // tp_size
+        # deepgemm masked with max_m < 64 get incorrect result, related: https://github.com/deepseek-ai/DeepGEMM/issues/268
+        is_quantized = quant_config is not None and quant_config.is_quanted()
+        is_block_quantized = (
+            quant_config is not None and quant_config.get_method() == "FP8_PER_BLOCK"
+        )
+        is_per_act_token = quant_config is not None and quant_config.get_method() in (
+            "FP8_PER_TENSOR_COMPRESSED",
+            "FP8_DYNAMIC_PER_TENSOR",
+            "W4A8_INT4_PER_CHANNEL",
+            "W4A8_INT4_PER_CHANNEL_COMPRESSED",
+            "W8A8_INT8_PER_CHANNEL_COMPRESSED",
+        )
+        is_per_group_fp4 = (
+            quant_config is not None and quant_config.get_method() == "modelopt_fp4"
+        )
+        if not is_quantized or is_block_quantized or is_per_group_fp4:
+            matched_tokens = [64, 128]
+        elif is_per_act_token:
+            matched_tokens = [
+                16,
+                24,
+                32,
+                40,
+                48,
+                56,
+                64,
+                72,
+                80,
+                88,
+                96,
+                104,
+                112,
+                120,
+                128,
+            ]
+        else:
+            raise ValueError("Unsupported quantization config")
+        if ll_num_max_token_per_rank > 128:
+            ll_num_max_token_per_rank = ((ll_num_max_token_per_rank + 127) // 128) * 128
+            return ll_num_max_token_per_rank
+        for t in matched_tokens:
+            if ll_num_max_token_per_rank <= t:
+                ll_num_max_token_per_rank = t
+                return ll_num_max_token_per_rank
+        return 128
+
+    def __str__(self) -> str:
+        """Return a string representation of the DeepepWrapperConfig."""
+        return f"DeepepWrapperConfig(ep_rank={self.ep_rank}, ep_size={self.ep_size}, tp_size={self.tp_size}, local_rank={self.local_rank}, world_size={self.world_size}, hidden_size={self.hidden_size}, expert_num={self.expert_num}, moe_k={self.moe_k}, deep_ep_num_sm={self.deep_ep_num_sm}, use_deepep_low_latency={self.use_deepep_low_latency}, use_deepep_internode={self.use_deepep_internode}, ll_num_max_token={self.ll_num_max_token}, ll_num_max_token_per_rank={self.ll_num_max_token_per_rank})"
+
+
+class DeepEPWrapper:
+    """Unified DeepEP wrapper with singleton pattern (thread-safe).
+
+    This class combines the functionality of DeepEPInitializer and DeepEPWrapper,
+    providing both initialization management and DeepEP functionality.
+    """
+
+    _instance: Optional["DeepEPWrapper"] = None
+    _lock: threading.Lock = threading.Lock()
+    _initialized: bool = False
+
+    def __init__(self, group: ProcessGroup, config: DeepepWrapperConfig) -> None:
+        """Initialize DeepEPWrapper with ProcessGroup and DeepepWrapperConfig.
+
+        Note: Use get_instance() instead of calling this directly.
+
+        Args:
+            group: ProcessGroup for distributed communication
+            config: DeepepWrapperConfig containing all necessary configuration
+        """
+        self._config = config
+        self._mode, self._buffer = self._init_deepep_buffer(group)
+
+    @classmethod
+    def supported(cls) -> bool:
+        """Check if DeepEP is supported on current device.
+
+        Returns:
+            True if DeepEP is supported, False otherwise
+        """
+        try:
+            import deep_ep
+
+            return True
+        except ImportError:
+            return False
+
+    @classmethod
+    def is_initialized(cls) -> bool:
+        """Check if DeepEP is initialized.
+
+        Returns:
+            True if initialized, False otherwise
+        """
+        return cls._initialized
+
+    @classmethod
+    def get_instance(
+        cls,
+        config: DeepepWrapperConfig,
+    ) -> "DeepEPWrapper":
+        """Return the initialized DeepEP wrapper instance (thread-safe).
+
+        Does not perform initialization. Call init_deepep_wrapper before calling this.
+
+        Args:
+            config: DeepepWrapperConfig to verify against current instance
+
+        Returns:
+            The initialized DeepEPWrapper instance
+
+        Raises:
+            RuntimeError: If DeepEP is not initialized, or config mismatch
+        """
+        with cls._lock:
+            if not cls._initialized:
+                raise RuntimeError(
+                    "DeepEPWrapper is not initialized. Call init_deepep_wrapper first."
+                )
+            if cls._instance is None:
+                raise RuntimeError(
+                    "DeepEP state is inconsistent, _initialized is True but _instance is None"
+                )
+            if not cls._instance._config.equal(config):
+                raise RuntimeError(
+                    "DeepEP already initialized with different config, origin: {}, new: {}".format(
+                        cls._instance._config, config
+                    )
+                )
+            return cls._instance
+
+    @staticmethod
+    def create(config: DeepepWrapperConfig) -> None:
+        """Create a new DeepEPWrapper instance.
+
+        Args:
+            config: DeepepWrapperConfig
+
+        Returns:
+            None
+
+        Raises:
+            RuntimeError: If DeepEP is not initialized, or config mismatch
+        """
+        try:
+            if not torch.distributed.is_initialized():
+                raise RuntimeError("Distributed environment is not initialized")
+            with DeepEPWrapper._lock:
+                if DeepEPWrapper._initialized:
+                    if DeepEPWrapper._instance is None:
+                        raise RuntimeError(
+                            "DeepEP state is inconsistent, _initialized is True but _instance is None"
+                        )
+                    if not DeepEPWrapper._instance._config.equal(config):
+                        raise RuntimeError(
+                            "DeepEP already initialized with different config, origin: {}, new: {}".format(
+                                DeepEPWrapper._instance._config, config
+                            )
+                        )
+                    else:
+                        logging.warning(
+                            "DeepEP already initialized with the same config"
+                        )
+                else:
+                    if DeepEPWrapper._instance is not None:
+                        raise RuntimeError(
+                            "DeepEP state is inconsistent, _initialized is False but _instance is not None"
+                        )
+                    logging.info("Start initialize DeepEP wrapper")
+                    DeepEPWrapper._instance = DeepEPWrapper(
+                        torch.distributed.group.WORLD, config
+                    )
+                    DeepEPWrapper._initialized = True
+                    logging.info("Finish initialize DeepEP wrapper")
+        except Exception as e:
+            logging.error(f"Failed to initialize DeepEP wrapper: {e}")
+            raise e
+
+    @classmethod
+    def reset(cls) -> None:
+        """Reset DeepEP singleton state (for testing only).
+
+        Warning: This should only be used in tests.
+        """
+        with cls._lock:
+            if cls._instance is not None:
+                cls._instance._destroy_buffer()
+                cls._instance = None
+            cls._initialized = False
+
+    @property
+    def buffer(self) -> DeepEPBuffer:
+        """Get the DeepEP buffer.
+
+        Returns:
+            The initialized DeepEP buffer
+        """
+        if self._buffer is None:
+            raise RuntimeError("DeepEP buffer is not initialized")
+        return self._buffer
+
+    @property
+    def mode(self) -> DeepEPMode:
+        """Get the DeepEP mode."""
+        return self._mode
+
+    @property
+    def config(self) -> DeepepWrapperConfig:
+        """Get the DeepEP configuration."""
+        return self._config
+
+    @property
+    def ep_rank(self) -> int:
+        """Get expert parallel rank."""
+        return self._config.ep_rank
+
+    @property
+    def ep_size(self) -> int:
+        """Get expert parallel size."""
+        return self._config.ep_size
+
+    @property
+    def hidden_size(self) -> int:
+        """Get hidden size."""
+        return self._config.hidden_size
+
+    @property
+    def num_experts(self) -> int:
+        """Get number of experts."""
+        return self._config.expert_num
+
+    @property
+    def num_topk(self) -> int:
+        """Get top-k value."""
+        return self._config.moe_k
+
+    @property
+    def ll_num_max_token_per_rank(self) -> int:
+        """Get max tokens per rank for low-latency mode."""
+        return self._config.ll_num_max_token_per_rank
+
+    @property
+    def num_sms(self) -> int:
+        """Get number of SMs."""
+        return self._config.deep_ep_num_sm
+
+    def _init_deepep_buffer(
+        self, group: ProcessGroup
+    ) -> Tuple[DeepEPMode, DeepEPBuffer]:
+        """Initialize DeepEP buffer based on configuration.
+
+        Args:
+            group: ProcessGroup for distributed communication
+
+        Returns:
+            Tuple of (DeepEPMode, DeepEPBuffer)
+        """
+        config = self._config
+
+        if config.use_deepep_low_latency:
+            return DeepEPMode.LOW_LATENCY, self._init_low_latency_buffer(group)
+        return DeepEPMode.NORMAL, self._init_normal_buffer(group)
+
+    def _init_normal_buffer(self, group: ProcessGroup) -> DeepEPBuffer:
+        """Initialize buffer for normal mode."""
+        config = self._config
+        num_nvl_bytes = 0
+        num_rdma_bytes = 0
+        num_qps_per_rank = 1
+
+        # Normal-kernel internode
+        if config.use_deepep_internode:
+            accl_normal_mode = os.environ.get("ACCL_NORMAL_MODE")
+            if accl_normal_mode:
+                logging.warning(
+                    f"ACCL_NORMAL_MODE={accl_normal_mode} is no longer consulted: "
+                    "the DeepEP provider is the upstream package and "
+                    "num_qps_per_rank now always uses deep_ep_num_sm // 2."
+                )
+            num_nvl_bytes = int(2e9)
+            num_rdma_bytes = int(1e9)
+            num_qps_per_rank = config.deep_ep_num_sm // 2
+        # Normal-kernel intranode
+        else:
+            num_nvl_bytes = int(2e9)
+            num_qps_per_rank = 1
+
+        init_kwargs = {
+            "group": group,
+            "num_nvl_bytes": num_nvl_bytes,
+            "num_rdma_bytes": num_rdma_bytes,
+            "low_latency_mode": False,
+            "num_qps_per_rank": num_qps_per_rank,
+        }
+
+        return DeepEPBuffer(**init_kwargs)  # type: ignore
+
+    def _init_low_latency_buffer(self, group: ProcessGroup) -> DeepEPBuffer:
+        """Initialize buffer for low-latency mode."""
+        config = self._config
+        num_rdma_bytes = DeepEPBuffer.get_low_latency_rdma_size_hint(
+            config.ll_num_max_token_per_rank,
+            config.hidden_size,
+            config.ep_size,
+            config.expert_num,
+        )
+
+        if config.local_rank == 0:
+            print(
+                f"Allocating buffer size: {num_rdma_bytes / 1e6} MB, "
+                f"ll_num_max_token_per_rank: {config.ll_num_max_token_per_rank}, "
+                f"hidden_size: {config.hidden_size}, "
+                f"ep_size: {config.ep_size}, "
+                f"num_experts: {config.expert_num}",
+                flush=True,
+            )
+
+        num_qps_per_rank = config.expert_num / config.ep_size
+
+        init_kwargs = {
+            "group": group,
+            "num_nvl_bytes": 0,
+            "num_rdma_bytes": num_rdma_bytes,
+            "low_latency_mode": True,
+            "num_qps_per_rank": num_qps_per_rank,
+        }
+        return DeepEPBuffer(**init_kwargs)  # type: ignore
+
+    def _destroy_buffer(self) -> None:
+        """Destroy the DeepEP buffer and free resources."""
+        if self._buffer is not None:
+            del self._buffer
+            self._buffer = None
+        gc.collect()
+
+
+def init_deepep_wrapper(
+    engine_config: EngineConfig,
+    model_config: ModelConfig,
+) -> None:
+    """Initialize DeepEP wrapper if MOE model and DeepEP is enabled.
+
+    Performs full initialization internally. Call this before any
+    DeepEPWrapper.get_instance(). Thread-safe. Requires torch.distributed
+    to be initialized; group is taken from torch.distributed.group.WORLD.
+
+    Args:
+        engine_config: EngineConfig
+        model_config: ModelConfig
+
+    Returns:
+        None
+    """
+
+    if not DeepEPWrapper.supported():
+        logging.warning(
+            "DeepEP is not supported on this device, skipping initialization"
+        )
+        return
+
+    enable_cuda_graph = (
+        engine_config.hw_kernel_config.enable_cuda_graph
+        if engine_config.hw_kernel_config is not None
+        else False
+    )
+
+    deepep_config_adapter = MoEConfigAdapter(
+        model_config=model_config,
+        parallelism_config=engine_config.parallelism_config,
+        moe_config=engine_config.moe_config,
+        quant_config=model_config.quant_config,
+        enable_cuda_graph=enable_cuda_graph,
+    )
+
+    ll_num_max_token_per_rank = 0
+    if engine_config.moe_config.use_deepep_low_latency:
+        ll_num_max_token = engine_config.runtime_config.max_generate_batch_size
+        if engine_config.sp_config.type != SpeculativeType.NONE:
+            ll_num_max_token *= engine_config.sp_config.gen_num_per_cycle + 1
+        ll_num_max_token_per_rank = (
+            DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
+                ll_num_max_token,
+                engine_config.parallelism_config.tp_size,
+                model_config.quant_config,
+            )
+        )
+
+    deepep_config = DeepepWrapperConfig.from_config_adapter(
+        deepep_config_adapter, ll_num_max_token_per_rank
+    )
+
+    DeepEPWrapper.create(deepep_config)

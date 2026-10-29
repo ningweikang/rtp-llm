@@ -1,0 +1,179 @@
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <deque>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_set>
+#include <vector>
+#include "grpc++/grpc++.h"
+#include "kmonitor/client/MetricsReporter.h"
+#include "rtp_llm/cpp/utils/AtomicUtil.h"
+#include "rtp_llm/cpp/engine_base/EngineBase.h"
+#include "rtp_llm/cpp/engine_base/EngineInitParams.h"
+#include "rtp_llm/cpp/engine_base/ProposeModelEngineInitParams.h"
+#include "rtp_llm/cpp/engine_base/WorkerStatusInfo.h"
+#include "rtp_llm/cpp/cache/Types.h"
+#include "rtp_llm/cpp/model_rpc/RpcErrorCode.h"
+#include "rtp_llm/cpp/model_rpc/BroadcastManager.h"
+#include "rtp_llm/cpp/model_rpc/GenerateContext.h"
+#include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.grpc.pb.h"
+#include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
+#include "rtp_llm/cpp/engine_base/schedulers/EngineScheduleInfo.h"
+#include "rtp_llm/cpp/multimodal_processor/LocalMultimodalProcessor.h"
+#include "rtp_llm/cpp/multimodal_processor/RemoteMultimodalProcessor.h"
+#include "rtp_llm/cpp/utils/TimeUtil.h"
+#include "rtp_llm/cpp/utils/AssertUtils.h"
+#include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
+
+namespace rtp_llm {
+class LocalRpcServer {
+public:
+    LocalRpcServer() {}
+    virtual ~LocalRpcServer() {}
+    virtual grpc::Status init(const EngineInitParams&                                maga_init_params,
+                              std::unique_ptr<rtp_llm::ProposeModelEngineInitParams> propose_params,
+                              py::object                                             mm_process_engine);
+
+    grpc::Status
+    GetWorkerStatus(grpc::ServerContext* context, const ::StatusVersionPB* request, ::WorkerStatusPB* response);
+
+    grpc::Status
+    GetCacheStatus(grpc::ServerContext* context, const ::CacheVersionPB* request, ::CacheStatusPB* response);
+
+    virtual grpc::Status GenerateStreamCall(grpc::ServerContext*                   context,
+                                            const GenerateInputPB*                 request,
+                                            grpc::ServerWriter<GenerateOutputsPB>* writer);
+
+    virtual grpc::Status BatchGenerateCall(grpc::ServerContext*        context,
+                                           const BatchGenerateInputPB* request,
+                                           BatchGenerateOutputsPB*     response);
+
+    grpc::Status CheckHealth(grpc::ServerContext* context, const EmptyPB* request, CheckHealthResponsePB* response);
+
+    grpc::Status UpdateWeights(grpc::ServerContext* context, const UpdateWeightsRequestPB* request, EmptyPB* response);
+
+    grpc::Status
+    UpdateEplbConfig(grpc::ServerContext* context, const UpdateEplbConfigRequestPB* request, EmptyPB* response);
+
+    grpc::Status SetPause(grpc::ServerContext* context, const EmptyPB* request, EmptyPB* response);
+
+    grpc::Status SetRestart(grpc::ServerContext* context, const EmptyPB* request, EmptyPB* response);
+
+    grpc::Status SetLogLevel(grpc::ServerContext* context, const SetLogLevelRequestPB* request, EmptyPB* response);
+
+    grpc::Status StartProfile(grpc::ServerContext* context, const StartProfileRequestPB* request, EmptyPB* response);
+
+    grpc::Status
+    StartProfileInternal(grpc::ServerContext* context, const StartProfileInternalRequestPB* request, EmptyPB* response);
+
+    grpc::Status DumpTorchAllocator(grpc::ServerContext*               context,
+                                    const TorchAllocatorDumpRequestPB* request,
+                                    TorchAllocatorDumpResponsePB*      response);
+
+    grpc::Status DumpTorchAllocatorInternal(grpc::ServerContext*               context,
+                                            const TorchAllocatorDumpRequestPB* request,
+                                            TorchAllocatorDumpResultPB*        response);
+
+    grpc::Status
+    UpdateSchedulerInfo(grpc::ServerContext* context, const UpdateSchedulerInfoRequestPB* request, EmptyPB* response);
+
+    KVCacheInfo getCacheStatusInfo(int64_t latest_cache_version, bool need_cache_keys);
+
+    WorkerStatusInfo getWorkerStatusInfo(int64_t latest_finished_version);
+
+    std::shared_ptr<EngineBase> getEngine() const {
+        return engine_;
+    }
+    std::shared_ptr<MultimodalProcessor> getMultimodalProcessor() const {
+        return mm_processor_;
+    }
+
+    int64_t tpSize() const {
+        return maga_init_params_.parallelism_config.tp_size;
+    }
+
+    virtual size_t onflightRequestNum();
+
+    void stop() {
+        (void)engine_->stop();
+    }
+
+    virtual EngineScheduleInfo getEngineScheduleInfo(int64_t latest_finised_version);
+
+    void reportWorkerStatusTime(int64_t request_begin_time_us, int64_t request_after_lb_time_us);
+
+    void reportCacheStatusTime(int64_t request_begin_time_us);
+
+    ::grpc::Status
+    ExecuteFunction(::grpc::ServerContext* context, const ::FunctionRequestPB* request, ::FunctionResponsePB* response);
+
+public:
+    typedef grpc::internal::WriterInterface<GenerateOutputsPB> WriterInterface;
+
+protected:
+    virtual bool isCancelled(grpc::ServerContext* context) const {
+        return context && context->IsCancelled();
+    }
+
+    grpc::Status serializeErrorMsg(const std::string& request_key, ErrorInfo error_info);
+    grpc::Status
+    serializeErrorMsg(const std::string& request_key, const RequestInfo& request_info, ErrorInfo error_info);
+    grpc::Status pollStreamOutput(grpc::ServerContext*             context,
+                                  const std::string&               request_key,
+                                  WriterInterface*                 writer,
+                                  std::shared_ptr<GenerateStream>& stream);
+
+    // Shared helpers for single and batch paths
+    ErrorInfo prepareInput(const GenerateInputPB&                                              input_pb,
+                           std::shared_ptr<GenerateInput>&                                     output,
+                           const opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>& parent_span = {});
+    ErrorInfo
+                 updateMultimodalFeaturesWithTrace(std::shared_ptr<GenerateInput>&                                     input,
+                                                   const opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>& parent_span);
+    ErrorInfo    collectStreamOutput(grpc::ServerContext*                  context,
+                                     std::shared_ptr<GenerateStream>&      stream,
+                                     const std::shared_ptr<GenerateInput>& input,
+                                     GenerateOutputs&                      last_outputs);
+    grpc::Status authorizeTorchAllocatorDump(const TorchAllocatorDumpRequestPB& request) const;
+    grpc::Status authorizeTorchAllocatorDumpInternal(grpc::ServerContext*               context,
+                                                     const TorchAllocatorDumpRequestPB& request) const;
+    virtual bool isTorchAllocatorDumpInternalPeer(grpc::ServerContext* context) const;
+    grpc::Status
+    beginTorchAllocatorDump(const std::string& dump_id, bool internal_fanout = false, bool* owns_admission = nullptr);
+    void                               finishTorchAllocatorDump();
+    grpc::Status                       executeAdmittedTorchAllocatorDump(const TorchAllocatorDumpRequestPB& request,
+                                                                         TorchAllocatorDumpResponsePB*      response);
+    grpc::Status                       aggregateTorchAllocatorDumpResults(const std::string&                             dump_id,
+                                                                          const std::vector<TorchAllocatorDumpResultPB>& results,
+                                                                          TorchAllocatorDumpResponsePB*                  response) const;
+    virtual TorchAllocatorDumpResultPB dumpTorchAllocatorOnCurrentProcess(const std::string& dump_id);
+
+protected:
+    std::shared_ptr<EngineBase>           engine_;
+    std::shared_ptr<MultimodalProcessor>  mm_processor_;
+    EngineInitParams                      maga_init_params_;
+    ProposeModelEngineInitParams*         propose_maga_init_params_;
+    kmonitor::MetricsReporterPtr          metrics_reporter_;
+    std::atomic<size_t>                   onflight_requests_{0};
+    std::shared_ptr<RpcServerRuntimeMeta> meta_;
+    py::object                            weight_manager_;
+    std::shared_ptr<BroadcastManager>     tp_broadcaster_;
+    bool                                  torch_allocator_dump_enabled_{false};
+    std::string                           torch_allocator_dump_auth_token_;
+    double                                torch_allocator_dump_cooldown_seconds_{60.0};
+    std::mutex                            torch_allocator_dump_mutex_;
+    bool                                  torch_allocator_dump_in_progress_{false};
+    bool                                  torch_allocator_dump_has_completed_{false};
+    bool                                  torch_allocator_dump_active_started_by_public_{false};
+    bool                                  torch_allocator_dump_active_internal_started_{false};
+    std::string                           torch_allocator_dump_active_id_;
+    std::chrono::steady_clock::time_point torch_allocator_dump_last_completed_at_;
+    std::unordered_set<std::string>       torch_allocator_dump_ids_;
+    std::deque<std::string>               torch_allocator_dump_id_order_;
+};
+
+}  // namespace rtp_llm

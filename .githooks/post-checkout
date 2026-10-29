@@ -1,0 +1,10 @@
+#!/bin/bash
+# post-checkout hook: download large files from OSS after checkout.
+# Activated by: git config core.hooksPath .githooks
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PULL_SCRIPT="$REPO_ROOT/scripts/oss-lfs/oss-lfs-pull.sh"
+
+if [ -x "$PULL_SCRIPT" ]; then
+    "$PULL_SCRIPT" 2>&1 | sed 's/^/[oss-lfs] /'
+fi

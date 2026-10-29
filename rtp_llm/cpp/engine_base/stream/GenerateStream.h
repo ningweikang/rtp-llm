@@ -1,0 +1,999 @@
+#pragma once
+
+#include "absl/status/statusor.h"
+#include "autil/TimeUtility.h"
+#include "kmonitor/client/MetricsReporter.h"
+#include "rtp_llm/cpp/models/ModelTypes.h"
+#include "rtp_llm/cpp/config/ModelConfig.h"
+#include "rtp_llm/cpp/models/Sampler.h"
+#include "rtp_llm/cpp/models/logits_processor/BaseLogitsProcessor.h"
+#include "rtp_llm/cpp/engine_base/stream/StreamCacheResource.h"
+#include "rtp_llm/cpp/engine_base/stream/CompleteTokenIds.h"
+#include "rtp_llm/cpp/engine_base/stream/GenerateStateMachine.h"
+#include "rtp_llm/cpp/engine_base/system_prompt/SystemPrompt.h"
+#include "rtp_llm/cpp/models/position_ids/PositionIdsGenerator.h"
+#include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
+#include <atomic>
+#include <condition_variable>
+#include <iterator>
+#include <condition_variable>
+#include <cstdint>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <type_traits>
+#include <utility>
+
+namespace rtp_llm {
+
+// GenerateStream-owned buffers stay on host by default; KV cache is the device-side exception.
+
+struct StreamUpdateInfo {
+    const torch::Tensor new_tokens;
+    int                 num_new_tokens;
+    const torch::Tensor hidden_states;
+    const torch::Tensor logits;
+    const torch::Tensor softmax_probs;
+    const torch::Tensor cum_log_probs;
+    const torch::Tensor all_probs;
+    const torch::Tensor loss;
+    const torch::Tensor src_batch_indices;
+    // for mtp
+    const torch::Tensor all_hidden_states;
+    bool                update_remote_generate = true;
+    bool                force_update_info      = false;
+    // prompt scoring
+    std::optional<PromptLogitsOutput> prompt_logits;
+    std::optional<ErrorInfo>          error_info;
+    GenerationPrefillCudaGraphStatus  generation_prefill_cuda_graph_status{
+        GenerationPrefillCudaGraphStatus::NOT_REQUESTED};
+    // Appended to preserve existing aggregate initializers. CPU context rows.
+    const torch::Tensor custom_output{};
+};
+
+struct StreamSpecUpdateInfo {
+    const torch::Tensor new_tokens;
+    int                 num_new_tokens;
+
+    int                 draft_token;
+    const torch::Tensor draft_hidden_states;
+    const torch::Tensor draft_token_probs;
+    // GPU proposal update for the next step. The optional is intentionally
+    // tri-state: nullopt keeps the previous mirror, a defined tensor replaces
+    // it, and an undefined tensor explicitly clears it so readers use the
+    // current CPU draft_token instead. Per-stream tensor shape is
+    // [stream_batch, token_stride].
+    std::optional<torch::Tensor> draft_token_gpu = std::nullopt;
+
+    bool                     update_remote_generate = true;
+    bool                     force_update_info      = false;
+    std::optional<ErrorInfo> error_info;
+
+    // Rejection-sampling result for this speculative decode round. Prefill
+    // updates leave speculative_propose_step at zero and are not counted.
+    int speculative_propose_step = 0;
+    int accepted_draft_tokens    = 0;
+};
+
+struct SpeculativeExecutorStreamOutput {
+public:
+    std::string debugString() const {
+        std::stringstream debug_string;
+        debug_string << "SpeculativeExecutorStreamOutput { propose_step : " << propose_step;
+        if (tokens.defined()) {
+            debug_string << ", tokens: tensor[" << tokens.numel() << "]";
+        }
+        if (hidden_states.defined()) {
+            debug_string << ", hidden_states: tensor[" << hidden_states.numel() << "]";
+        }
+        if (all_probs.defined()) {
+            debug_string << ", all_probs: tensor[" << all_probs.numel() << "]";
+        }
+        debug_string << "}";
+        return debug_string.str();
+    }
+
+public:
+    torch::Tensor draftTokens() const {
+        if (!tokens.defined() || tokens.dim() != 2 || tokens.size(1) < 2) {
+            return torch::Tensor();
+        }
+        return tokens.narrow(1, 1, tokens.size(1) - 1);
+    }
+
+    size_t        propose_step = 0;
+    torch::Tensor tokens;  // selected tokens (CPU, preserved for PD-disaggregate / RPC / tests)
+    // GPU mirror of next-step draft tokens only (the target column is excluded),
+    // used by PDFUSION fast paths to avoid a D2H + CPU loop + H2D round trip.
+    torch::Tensor propose_tokens_gpu;
+    torch::Tensor hidden_states;
+    torch::Tensor all_probs;
+
+    // hold tensors from grpc
+    std::vector<torch::Tensor> tensors_holder;
+};
+using SpeculativeExecutorStreamOutputPtr = std::shared_ptr<SpeculativeExecutorStreamOutput>;
+
+class GenerateStream;
+
+using GenerateStreamPtr = std::shared_ptr<GenerateStream>;
+
+class GenerateStream: public std::enable_shared_from_this<GenerateStream> {
+public:
+    static constexpr uint64_t STREAM_MAGIC = 0xA11CE5DEADBEEF01ULL;
+    GenerateStreamPtr         sharedThis() {
+        // stream construct happen with make_shared, and hold in scheduler
+        return shared_from_this();
+    }
+
+    GenerateStream(const std::shared_ptr<GenerateInput>& query,
+                   const ModelConfig&                    model_config,
+                   const RuntimeConfig&                  runtime_config,
+                   const ResourceContext&                resource_context,
+                   kmonitor::MetricsReporterPtr          metrics_reporter,
+                   size_t                                extra_reserve_token_num = 0,
+                   bool                                  pert_test               = false);
+    virtual ~GenerateStream() {
+        reportMetricOnce();
+        releaseResource();
+        stream_magic_ = 0;
+    }
+
+    bool isStreamAlive() const {
+        return stream_magic_ == STREAM_MAGIC;
+    }
+
+public:
+    void setIsFakeStream(bool is_fake) {
+        is_fake_stream_ = is_fake;
+    }
+
+    bool isFakeStream() const {
+        return is_fake_stream_;
+    }
+
+    // A positive wait_timeout_ms bounds only the consumer condition-variable
+    // wait. Zero waits without a caller interval; a request deadline, when
+    // configured, remains authoritative.
+    virtual ErrorResult<GenerateOutputs> nextOutput(int64_t wait_timeout_ms = 0) = 0;
+    virtual bool                         hasOutput() {
+        return false;
+    }
+
+    virtual void                             updateOutput(const StreamUpdateInfo& update_info) = 0;
+    virtual GenerationPrefillCudaGraphStatus generationPrefillCudaGraphStatus() const {
+        return GenerationPrefillCudaGraphStatus::NOT_REQUESTED;
+    }
+    void update(const StreamUpdateInfo& update_info);
+    void specUpdate(const StreamSpecUpdateInfo& update_info);
+    bool updateKvCacheBlocks(const torch::Tensor& src_batch_indices);
+
+    virtual size_t scoreLen() const {
+        return score_len_ == 0 ? 1 : score_len_;
+    }
+
+    void setScoreLen(size_t score_len) {
+        score_len_ = score_len;
+    }
+
+    // Only used in C++ world.
+    int                  reuseBlockSize() const;
+    void                 fakeInitKVBlock(size_t reserved_blocks = 0);
+    virtual absl::Status initKVBlock();
+    virtual absl::Status incrKVBlock();
+    virtual void         releaseResource();
+    int                  nextNeedBlockNums(int reserve_step) const;
+    int                  estimateInitialNeedBlocks() const;
+    int                  estimatePeakNeedBlocks(int remaining_tokens) const;
+    void                 setNeedReleaseResource(bool need_release_resource);
+    bool                 hasCacheKeys() const;
+    const CacheKeysType& cacheKeys(int32_t batch_id = 0) const;
+
+    std::shared_ptr<GenerateInput>   generateInput() const;
+    std::shared_ptr<GenerateConfig>& generateConfig() const;
+    std::vector<int>                 textTokensMask() const;
+    bool                             isStreaming() const;
+    int64_t                          streamId() const;
+    std::string                      streamLogTag() const;
+    std::string                      adapterName() const;
+    rtp_llm::SpecialTokens           specialTokens() const;
+
+    int batchSize(int output_len) const;
+    int currentBatchSize() const;
+    int nextBatchSize() const;
+    int maxBatchSize() const;
+
+    int  numBeams(int output_len) const;
+    int  currentNumBeams() const;
+    int  nextNumBeams() const;
+    int  maxNumBeams() const;
+    bool hasNumBeams() const;
+    bool usesBeamSearchTokenLayoutForCurrentStep() const;
+
+    bool needTilingForSampling() const;
+
+    int    numReturnSequences() const;
+    bool   calculateLoss() const;
+    bool   calculateSoftmaxProbs() const;
+    bool   returnLogits() const;
+    bool   returnPromptLogits() const;
+    bool   returnCumLogProbs() const;
+    bool   genTimeline() const;
+    bool   genTimelineAtSeqLength(int seq_length) const;
+    int    profileStep() const;
+    void   setGenTimeline(bool gen_timeline);
+    bool   updatePrefix(const std::shared_ptr<SystemPrompt>& system_prompt);
+    size_t maxSeqLen() const;
+    int    inputLength() const;
+    int    seqLength() const;
+    // NOTE: In generatestream, set seq len must use setSeqLength api, we need to save start_check_seq_length_
+    // for checking EOS and stop words
+    void    setSeqLength(int seq_length);
+    int     seqSizePerBlock() const;
+    int     contextLength() const;
+    int     prefixLength() const;
+    int     reuseLength() const;
+    int     initialReuseLength() const;
+    size_t  maxTokenNum() const;
+    void    setReuseLength(int reuse_length);
+    void    setLocalReuseLength(int length);
+    void    setDeviceReuseLength(int length);
+    void    setRemoteReuseLength(int length);
+    int     localReuseLength() const;
+    int     deviceReuseLength() const;
+    int     remoteReuseLength() const;
+    void    setHostReuseLength(int length);
+    int     hostReuseLength() const;
+    void    setDiskReuseLength(int length);
+    int     diskReuseLength() const;
+    void    setInitialReuseLength(int initial_reuse_length);
+    void    incLastOutputPos();
+    void    setPrefillReuseLength(int64_t total, int64_t local, int64_t remote, int64_t memory);
+    int64_t prefillTotalReuseLen() const;
+    int64_t prefillLocalReuseLen() const;
+    int64_t prefillRemoteReuseLen() const;
+    int64_t prefillMemoryReuseLen() const;
+
+    bool                 isContextStream() const;
+    const torch::Tensor& cumLogProbs() const;
+
+    torch::Tensor                     completeTokenIds();
+    std::shared_ptr<CompleteTokenIds> completeTokenIdsPtr() const {
+        return complete_token_ids_;
+    }
+    std::vector<int> completeTokenIdsVec(int batch_idx = 0);
+    int              currentExecuteTokenSize();
+    std::vector<int> currentExecuteTokens(int batch_idx = 0) const;
+
+    void step();
+    void spStep();
+
+    // Raw multimodal accessors — return the full per-image vectors/tensor unfiltered.
+    // Stream is a pure data holder; NormalModelInputGatherer omits fully reused images
+    // and slices partially reused feature/deepstack rows for the current model input.
+    // multimodalFeaturesLength() and hasMultimodalExtraInput() also return RAW counts;
+    // consumers that need post-reuse counts compute them on demand.
+    std::vector<torch::Tensor> multimodalFeatures() const;
+    std::vector<torch::Tensor> multimodalExtraInput() const;
+    bool                       hasMultimodalExtraInput() const;
+    int                        multimodalFeaturesLength() const;
+    torch::Tensor              multimodalLocations() const;
+
+    int64_t getTimeoutMs() const;
+    void    recordWaitLatency();
+    void    recordSchedulerEnqueueTime(int64_t time_us);
+    void    recordCanRunTime();
+    void    recordLoadingCacheStartTime();
+    void    recordLoadingCacheDoneTime();
+    void    recordRunningTime();
+
+    // 统一的事件上报接口，替代原先所有 reportXX 方法。
+    // 外部线程调用时自动加锁保护 error_info 和 events_ 的一致性。
+    template<typename T = std::string>
+    void reportEvent(StreamEvents::EventType event,
+                     ErrorCode               error_code = ErrorCode::NONE_ERROR,
+                     T&&                     error_msg  = std::decay_t<T>{}) {
+        std::lock_guard<std::mutex> lock(*mutex_);
+        reportEventWithoutLock(event, error_code, std::forward<T>(error_msg));
+    }
+
+    // 无锁版本，供已持有 mutex_ 的内部调用路径使用（如 update/specUpdate/moveToNext 链路）。
+    template<typename T = std::string>
+    void reportEventWithoutLock(StreamEvents::EventType event,
+                                ErrorCode               error_code = ErrorCode::NONE_ERROR,
+                                T&&                     error_msg  = std::decay_t<T>{}) {
+        if (event == StreamEvents::CanRun) {
+            recordCanRunTime();
+        }
+        generate_status_->reportEvent(event, error_code, std::forward<T>(error_msg));
+        if (event == StreamEvents::GenerateDone && !generation_done_) {
+            generation_done_         = true;
+            generation_done_time_us_ = autil::TimeUtility::currentTimeInMicroSeconds();
+        }
+        if (event == StreamEvents::Error || event == StreamEvents::GenerateDone
+            || event == StreamEvents::NeedRemoteGenerate) {
+            consumer_cv_->notify_all();
+        }
+    }
+
+    template<typename T = std::string>
+    void reportError(ErrorCode error_code = ErrorCode::NONE_ERROR, T&& error_msg = std::decay_t<T>{}) {
+        std::lock_guard<std::mutex> lock(*mutex_);
+        reportEventWithoutLock(StreamEvents::Error, error_code, std::forward<T>(error_msg));
+    }
+
+    // Caller must already hold mutex_. Use this only on state-machine paths entered through moveToNext().
+    void reportErrorWithoutLock(ErrorCode error_code, const std::string& error_msg) {
+        reportEventWithoutLock(StreamEvents::Error, error_code, error_msg);
+    }
+    bool         hasEvent(StreamEvents::EventType event) const;
+    void         clearCanRun();
+    virtual bool hasError() const;
+    ErrorInfo    statusInfo();
+    std::string  stopReason();
+
+    void   setReserveStep(size_t reserve_step);
+    size_t reserveStep() const {
+        return reserve_step_;
+    }
+    StreamState moveToNext();
+
+    virtual StreamState getStatus() const;
+    bool                isFinished() const;  // Returns true if stream is finished
+    // Complete a Decode stream owned by the RPC handler, before scheduler enqueue.
+    bool                finishWithoutGenerate();
+    bool                isActive() const;    // Returns true if stream is active (no error and not finished)
+
+    // A response consumer may observe GenerateDone before the scheduler has
+    // committed RUNNING -> FINISHED. Preserve that successful completion and
+    // wait for scheduler-owned resource release; otherwise publish cancellation
+    // and wait for the same terminal transition.
+    bool finishOrCancel(int64_t wait_timeout_ms, const std::string& cancel_reason);
+    bool isSubGenerateDoneWithoutLock(int batch_id) const;
+
+    size_t iterCount() const;
+    size_t spIterCount() const;
+    void   setSpIterCount(int sp_iter_count);
+
+    const std::vector<int32_t>& speculativeAcceptedTokensPerPos() const {
+        return speculative_accepted_tokens_per_pos_;
+    }
+
+    const ResourceContext&      resourceContext() const;
+    void                        setKVCache(const BatchKVCacheResource& kv_cache_resource);
+    void                        setLoss(const torch::Tensor& loss);
+    void                        setSoftmaxProbs(const torch::Tensor& softmax_probs,
+                                                int                  start_pos,
+                                                const torch::Tensor& src_batch_indices = torch::Tensor());
+    const BatchKVCacheResource& kvCache() const;
+    BatchKVCacheResource&       kvCacheMutable();
+    BatchKVCacheResourcePtr     kvCachePtr();
+    size_t                      curBlocksNum() const;
+
+    bool needFinish();
+    bool needFinishBySPTokens();
+    void matchEosToken();
+    void matchEosToken(int batch_id);
+    void matchStopWordsList();
+    void matchStopWordsList(int batch_id);
+
+    void        setMetricsReporter(kmonitor::MetricsReporterPtr metrics_reporter);
+    void        reportMetric();
+    std::string debugString() const;
+
+    void resetBeginTime(int64_t begin_time_us);
+
+    // for test
+    void          setIsContextStream(bool is_context_stream);
+    torch::Tensor getLoss();
+    torch::Tensor getLastHiddenStates() const;
+    void          setLastHiddenStates(torch::Tensor hidden_states) {
+        last_hidden_states_ = std::move(hidden_states);
+    };
+    torch::Tensor        getSoftmaxProbs();
+    StreamCacheResource& streamCacheResource();
+    void                 setPerfTest(bool perf_test_);
+    bool                 isPerfTest() const {
+        return perf_test_;
+    }
+
+    void CopyOnWrite(const GenerateStream& other_stream, bool copy_loss = true, bool share = false);
+
+    void setReturnAllProbs(ReturnAllProbsMode return_all_probs) {
+        return_all_probs_ = return_all_probs;
+    }
+
+    ReturnAllProbsMode getReturnAllProbs() const {
+        return return_all_probs_;
+    }
+
+    torch::Tensor generateContextPositionIds();
+
+    void generateNextPositionId(int32_t* now_pos);
+
+    torch::Tensor getContextPositionIds() const {
+        return context_position_ids_.has_value() ? context_position_ids_.value() : torch::Tensor();
+    }
+
+    void setContextPositionIds(torch::Tensor context_position_ids) {
+        context_position_ids_ = std::move(context_position_ids);
+    }
+
+    int64_t vocabSize() const {
+        return vocab_size_;
+    }
+
+    size_t outputVocabSize() const {
+        return output_vocab_size_;
+    }
+
+    size_t outputTokenLen() const {
+        return seqLength() - inputLength();
+    }
+
+    void setReturnLastHiddenStates(bool flag) {
+        return_all_hidden_states_ = flag;
+    }
+
+    bool forceDisableSpRun() const {
+        return generate_input_->generate_config->force_disable_sp_run;
+    }
+
+    bool disableSpRun() const {
+        return hasNumBeams() || forceDisableSpRun();
+    }
+
+    bool needReturnHiddenStates() {
+        return return_all_hidden_states_;
+    }
+
+    void holdKVCacheForPDSep();
+    void releaseKVCacheForPDSep();
+
+    std::vector<int> getLatestTokens(size_t token_num);
+
+    void incBatchWithPrefillTimes(int32_t times);
+    void incBatchWithPrefillLen(int32_t len);
+
+    std::shared_ptr<CompleteTokenIds> getCompleteTokenIds() const {
+        return complete_token_ids_;
+    }
+
+    void setAccepedBounsToken(bool acceped_bouns_token) {
+        acceped_bouns_token_ = acceped_bouns_token;
+    }
+
+    bool getAccepedBounsToken() {
+        return acceped_bouns_token_;
+    }
+
+    size_t spEditSearchIndex() const {
+        return sp_edit_search_index_;
+    }
+
+    void setSpEditRun(bool is_sp_edit_run) {
+        sp_edit_run_ = is_sp_edit_run;
+    }
+
+    void incSpEditSearchIndex(size_t accepted_num) {
+        if (sp_edit_run_) {
+            sp_edit_search_index_ += accepted_num;
+        }
+    }
+
+    bool spEditFirstTime() const {
+        return sp_edit_first_time_;
+    }
+
+    void setSpEditFirstTime(bool sp_edit_first_time) {
+        sp_edit_first_time_ = sp_edit_first_time;
+    }
+
+    void setProposeToken(const std::vector<int>& propose_token) {
+        propose_token_ = propose_token;
+    }
+
+    std::vector<int>& getProposeToken() {
+        return propose_token_;
+    }
+
+    void setContainProposeToken(bool contain_propose_token) {
+        contain_propose_token_ = contain_propose_token;
+    }
+
+    void setMtpTokenIndex(int mtp_token_index) {
+        mtp_token_index_ = mtp_token_index;
+    }
+
+    // Prompt-tail positions of a PD handoff: the target cache loaded from
+    // prefill covers seqLength() - 1 tokens for every speculative mode.
+    // DSpARK handoffs carry no proposal; MTP/Eagle set theirs afterwards.
+    void initSpeculativeHandoffPositions() {
+        setReuseLength(seqLength() - 1);
+        setSpEditRun(false);
+        setMtpTokenIndex(seqLength() - 1);
+    }
+
+    size_t getMtpTokenIndex() {
+        return mtp_token_index_;
+    }
+
+    size_t getProposeStep() const {
+        if (propose_stream_ && propose_stream_->sp_output_buffer_->propose_step > 0) {
+            return propose_stream_->sp_output_buffer_->propose_step;
+        }
+        return 0;
+    }
+
+    bool forceSpAccept() const {
+        return generate_input_->generate_config->force_sp_accept;
+    }
+
+    std::string traceId() const {
+        if (!generate_input_->request_info.trace_id.empty()) {
+            return generate_input_->request_info.trace_id;
+        }
+        return generate_input_->generate_config->trace_id;
+    }
+
+    int groupSize() const {
+        return generate_input_->group_size;
+    }
+
+    // Auto-TPM QoS priority (task40): 0 = not set; TPS metrics tagging only.
+    int32_t priority() const {
+        return generate_input_->priority;
+    }
+
+    int groupTimeout() const {
+        return generate_input_->generate_config->group_timeout.value_or(100);
+    }
+
+    bool isGroup() const {
+        return generate_input_->group_id != -1;
+    }
+
+    int64_t groupId() const {
+        return generate_input_->group_id;
+    }
+
+    int64_t enqueueTime() const {
+        return generate_input_->begin_time_us;
+    }
+    int64_t schedulerEnqueueTimeUs() const {
+        return scheduler_enqueue_time_us_ > 0 ? scheduler_enqueue_time_us_ : enqueueTime();
+    }
+
+    const std::vector<BaseLogitsProcessorPtr>& getAllLogitsProcessorPtr() const {
+        return logits_processor_list_;
+    }
+
+    at::Generator getGenerator() {
+        return generator_;
+    }
+
+    void setSPOutputBuffer(SpeculativeExecutorStreamOutputPtr sp_output_buffer) {
+        sp_output_buffer_ = sp_output_buffer;
+    }
+
+    SpeculativeExecutorStreamOutputPtr getSPOutputBuffer() {
+        return sp_output_buffer_;
+    }
+
+    // Count worker claims on this stream's KV resource.
+    // releaseResource waits for zero so worker-side update/specUpdate cannot
+    // write into blocks already returned to the pool.
+    void incPendingAsyncBookkeeping();
+    void decPendingAsyncBookkeepingAndMaybeRelease();
+    bool hasPendingAsyncBookkeeping() const;
+    void waitPendingAsyncBookkeeping();
+    void markDeferredRelease();
+    bool isDeferredReleasePending() const;
+
+    // Per-stream CUDA state used to prepare the next MTP decode step while host
+    // bookkeeping may still be in flight. It carries accept_len/tokens,
+    // next_seq_len, propose_tokens; epoch guards stale clears in tests.
+    struct MtpAsyncDeviceState {
+        uint64_t      epoch = 0;
+        torch::Tensor accept_len_gpu;
+        torch::Tensor accept_tokens_gpu;
+        torch::Tensor next_seq_len_gpu;
+        // Position tuple of the next round's newest committed token.  DSpARK
+        // carries this beside next_seq_len so MRoPE target-verify graphs can
+        // be prepared without consulting worker-owned host bookkeeping.
+        torch::Tensor next_position_ids_gpu;
+        torch::Tensor propose_tokens_gpu;
+        // Immutable physical and logical-to-kernel page tables for the next
+        // speculative round. The async worker may still be committing the
+        // equivalent host-side swaps; model input gathering consumes this
+        // pair instead of racing the mutable BlockIds object. Keeping the pair
+        // atomic at the state level is required by hybrid models: attention
+        // consumes the physical table while recurrent kernels consume the
+        // kernel-granularity table.
+        torch::Tensor next_kv_cache_block_id_gpu;
+        torch::Tensor next_kv_cache_kernel_block_id_gpu;
+        // Main-thread mirrors used when DROP_BROAD_SYNC lets the next step run
+        // before worker-side specUpdate has written sp_output_buffer fields.
+        torch::Tensor last_hidden_states_gpu;
+        torch::Tensor draft_all_probs_gpu;
+        // Upper bound for the sequence length represented by the previous
+        // round. It equals host seqLength when no worker is pending; otherwise
+        // it chains from the prior published bound so multiple overlapped
+        // bookkeeping rounds can never make cache allocation underestimate
+        // the device sequence.
+        // -1 = unset (first iter / cleared).
+        int previous_seq_len_upper_bound = -1;
+        // Conservative host-visible bound for the next iteration. It advances
+        // monotonically while workers overlap and resets to exact host state
+        // once bookkeeping catches up.
+        // -1 = unset (first iter / cleared).
+        int next_seq_len_upper_bound = -1;
+    };
+
+    uint64_t setMtpAsyncDeviceState(MtpAsyncDeviceState state) {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        state.epoch      = ++mtp_async_epoch_counter_;
+        mtp_async_state_ = std::move(state);
+        return mtp_async_state_.epoch;
+    }
+    MtpAsyncDeviceState getMtpAsyncDeviceState() const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        return mtp_async_state_;
+    }
+    bool clearMtpAsyncDeviceState(uint64_t epoch) {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        // Legacy/testing escape hatch. Active MTP decode paths should keep
+        // device tensors alive and overwrite them on the next publish.
+        if (mtp_async_state_.epoch != epoch) {
+            return false;
+        }
+        mtp_async_state_ = MtpAsyncDeviceState{};
+        return true;
+    }
+
+    // ---- Back-compat wrappers (callers added before) ----
+    void setSpecDecodeDeviceState(torch::Tensor accept_len_gpu,
+                                  torch::Tensor accept_tokens_gpu,
+                                  torch::Tensor next_seq_len_gpu,
+                                  torch::Tensor propose_tokens_gpu = torch::Tensor()) {
+        MtpAsyncDeviceState state;
+        state.accept_len_gpu     = std::move(accept_len_gpu);
+        state.accept_tokens_gpu  = std::move(accept_tokens_gpu);
+        state.next_seq_len_gpu   = std::move(next_seq_len_gpu);
+        state.propose_tokens_gpu = std::move(propose_tokens_gpu);
+        setMtpAsyncDeviceState(std::move(state));
+    }
+    torch::Tensor getAcceptLenGpu() const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        return mtp_async_state_.accept_len_gpu;
+    }
+    torch::Tensor getAcceptTokensGpu() const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        return mtp_async_state_.accept_tokens_gpu;
+    }
+    torch::Tensor getNextSeqLenGpu() const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        return mtp_async_state_.next_seq_len_gpu;
+    }
+    torch::Tensor getNextPositionIdsGpu() const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        return mtp_async_state_.next_position_ids_gpu;
+    }
+    torch::Tensor getProposeTokensGpu() const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        return mtp_async_state_.propose_tokens_gpu;
+    }
+    torch::Tensor getNextKVCacheBlockIdGpu() const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        return mtp_async_state_.next_kv_cache_block_id_gpu;
+    }
+    torch::Tensor getNextKVCacheKernelBlockIdGpu() const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        return mtp_async_state_.next_kv_cache_kernel_block_id_gpu;
+    }
+    static bool hasMtpCacheSnapshot(const MtpAsyncDeviceState& state) {
+        const auto valid = [](const torch::Tensor& table) {
+            return table.defined() && table.is_cuda() && table.scalar_type() == torch::kInt32 && table.dim() == 3
+                   && table.size(1) == 1;
+        };
+        const auto& physical = state.next_kv_cache_block_id_gpu;
+        const auto& kernel   = state.next_kv_cache_kernel_block_id_gpu;
+        return valid(physical) && valid(kernel) && physical.size(0) == kernel.size(0);
+    }
+    bool hasMtpCacheSnapshot() const {
+        return hasMtpCacheSnapshot(getMtpAsyncDeviceState());
+    }
+    void clearMtpCacheSnapshot() {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        mtp_async_state_.next_kv_cache_block_id_gpu        = torch::Tensor();
+        mtp_async_state_.next_kv_cache_kernel_block_id_gpu = torch::Tensor();
+    }
+    torch::Tensor getLastHiddenStatesGpu() const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        return mtp_async_state_.last_hidden_states_gpu;
+    }
+    torch::Tensor getDraftAllProbsGpu() const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        return mtp_async_state_.draft_all_probs_gpu;
+    }
+    void clearSpecDecodeDeviceState() {
+        // Unconditional legacy/testing escape hatch. Active MTP decode paths
+        // should publish/overwrite MtpAsyncDeviceState instead of clearing it.
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        mtp_async_state_ = MtpAsyncDeviceState{};
+    }
+
+    // Normal decode async device state. Unlike MTP, normal decode accepts one
+    // sampler token per step, so the next-step state only needs the sampled
+    // token and the committed sequence length after that token.
+    struct NormalAsyncDeviceState {
+        uint64_t      epoch = 0;
+        torch::Tensor last_sample_token_gpu;  // [1] int32
+        torch::Tensor next_seq_len_gpu;       // [1] int32, seqLength after sample
+        // Host seqLength before the sampled token represented by this state.
+        // -1 = unset (first iter / cleared).
+        int last_real_seq_len = -1;
+        // Host mirror of next_seq_len_gpu, computed at publish time so the
+        // scheduler can drive incrKVBlock without racing the async worker.
+        // -1 = unset (first iter / cleared).
+        int next_real_seq_len = -1;
+    };
+
+    uint64_t setNormalAsyncDeviceState(NormalAsyncDeviceState state) {
+        state.epoch         = ++normal_async_epoch_counter_;
+        normal_async_state_ = std::move(state);
+        return normal_async_state_.epoch;
+    }
+    const NormalAsyncDeviceState& getNormalAsyncDeviceState() const {
+        return normal_async_state_;
+    }
+    void markGrpcNormalDeviceStatePending() {
+        grpc_normal_device_state_pending_->store(true, std::memory_order_release);
+    }
+    bool hasGrpcNormalDeviceStatePending() const {
+        return grpc_normal_device_state_pending_->load(std::memory_order_acquire);
+    }
+    bool consumeGrpcNormalDeviceStatePending() {
+        return grpc_normal_device_state_pending_->exchange(false, std::memory_order_acq_rel);
+    }
+
+    GenerateStreamPtr getProposeStream() {
+        return propose_stream_;
+    }
+
+    bool containProposeStream() {
+        return propose_stream_ != nullptr;
+    }
+
+    bool containScorestream() {
+        return score_stream_ != nullptr;
+    }
+
+    GenerateStreamPtr getScoreStream() {
+        return score_stream_;
+    }
+
+    void setProposeStream(GenerateStreamPtr stream) {
+        propose_stream_ = stream;
+    }
+
+    void setScoreStream(GenerateStreamPtr stream) {
+        score_stream_ = stream;
+    }
+
+    bool reuseCache() const {
+        return generate_input_->generate_config->reuse_cache;
+    }
+
+    bool enableDeviceCache() const {
+        return generate_input_->generate_config->enable_device_cache;
+    }
+
+    bool enableMemoryCache() const {
+        return generate_input_->generate_config->enable_memory_cache;
+    }
+
+    bool enableDiskCache() const {
+        return generate_input_->generate_config->enable_disk_cache;
+    }
+
+    bool enableRemoteCache() const {
+        return generate_input_->generate_config->enable_remote_cache;
+    }
+
+    int64_t deadlineMs() const {
+        auto deadline_ms = generate_input_->generate_config->timeout_ms + begin_time_us_ / 1000;
+        return deadline_ms;
+    }
+
+    std::pair<std::string, uint32_t> prefillAddr() const;
+    std::string                      uniqueKey() const {
+        return generate_input_->generate_config->unique_key;
+    }
+
+    int getPrefillTpSize() const {
+        return prefill_tp_size_;
+    }
+    void setPrefillTpSize(int prefill_tp_size) {
+        prefill_tp_size_ = prefill_tp_size;
+    }
+
+public:
+    struct TimeInfo {
+        int64_t begin_time_us           = 0;
+        int64_t wait_time_us            = 0;  // legacy metric/metadata field
+        bool    running_started         = false;
+        int64_t running_started_time_us = 0;
+        bool    first_token_committed   = false;
+        int64_t first_token_time_us     = 0;
+        int64_t first_token_rt_us       = 0;
+        bool    generation_done         = false;
+        int64_t generation_done_time_us = 0;
+    };
+    TimeInfo getTimeInfo();
+    bool     queryPdSep() const;
+
+protected:
+    // moveToNext() runs under mutex_, while the async MTP worker needs the
+    // same mutex to commit accepted tokens/cache swaps.  Decide whether a
+    // capacity-boundary join is needed before taking mutex_.
+    bool needsAsyncBookkeepingJoinForKvReservation() const;
+
+    // Consumer-visible state is read and written under mutex_. Public readers
+    // acquire the lock; already-locked engine paths use these helpers.
+    void         checkTimeoutWithoutLock();
+    void         reportTimeoutWithoutLock(int64_t running_time_ms, int64_t timeout_ms);
+    bool         hasEventWithoutLock(StreamEvents::EventType event) const;
+    bool         hasErrorWithoutLock() const;
+    ErrorInfo    statusInfoWithoutLock() const;
+    bool         consumerFinishedWithoutLock() const;
+    virtual bool consumerReadyWithoutLock() const;
+
+    int                      estimateKVNeedBlocks(int remaining_tokens, int target_batch_size) const;
+    bool                     reportUpdateErrorWithoutLock(const std::optional<ErrorInfo>& error_info);
+    std::optional<ErrorInfo> updateNormalLogitProcessorStatus(const StreamUpdateInfo& update_info);
+    std::optional<ErrorInfo> updateLogitProcessorStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens);
+    void                     updateLogitProcessorMultiSeqStatus(const torch::Tensor& src_batch_indices);
+    std::optional<ErrorInfo> validateLogitsProcessorState();
+    void                     fillSubGenerateStatus(StreamState state);
+    void                     resizeSubGenerateStatus(size_t new_size);
+
+    void reportStreamMetrics();
+    void reportMetricOnce();
+
+protected:
+    uint64_t                              stream_magic_ = STREAM_MAGIC;
+    std::shared_ptr<GenerateInput>        generate_input_;
+    std::shared_ptr<GenerateStateMachine> generate_status_;
+    std::vector<StreamState>              sub_generate_status_;
+    int                                   max_seq_len_;
+    int64_t                               vocab_size_;
+    size_t                                output_vocab_size_;
+    std::shared_ptr<CompleteTokenIds>     complete_token_ids_;
+    int64_t                               begin_time_us_;
+    int64_t                               wait_time_us_                = 0;
+    bool                                  metrics_reported_            = false;
+    int64_t                               scheduler_enqueue_time_us_   = 0;
+    int64_t                               can_run_time_us_             = 0;
+    int64_t                               loading_cache_start_time_us_ = 0;
+    int64_t                               loading_cache_done_time_us_  = 0;
+    int64_t                               first_running_time_us_       = 0;
+    int64_t                               loading_cache_latency_us_    = 0;
+    int64_t                               load_done_to_running_us_     = 0;
+    bool                                  running_started_             = false;
+    int64_t                               running_started_time_us_     = 0;
+    bool                                  generation_done_             = false;
+    int64_t                               generation_done_time_us_     = 0;
+    std::shared_ptr<StreamCacheResource>  stream_cache_resource_;
+    // Prefill-to-decode transition is committed by the output/bookkeeping
+    // worker and observed by the scheduler thread. Keep this flag atomic; the
+    // shared_ptr preserves the existing CopyOnWrite sharing semantics.
+    std::shared_ptr<std::atomic<bool>> is_context_stream_;
+    size_t                             iter_count_    = 0;
+    size_t                             sp_iter_count_ = 0;
+    std::vector<int32_t>               speculative_accepted_tokens_per_pos_;
+    size_t                             last_output_pos_      = 0;
+    int                                initial_reuse_length_ = 0;
+    int                                reuse_length_         = 0;
+    int                                local_reuse_length_   = 0;
+    int                                device_reuse_length_  = 0;
+    int                                remote_reuse_length_  = 0;
+    int                                host_reuse_length_    = 0;
+    int                                disk_reuse_length_    = 0;
+    // prefill reuse info (PD-sep); read/write only under output_mutex_
+    int64_t prefill_total_reuse_len_  = 0;
+    int64_t prefill_local_reuse_len_  = 0;
+    int64_t prefill_remote_reuse_len_ = 0;
+    int64_t prefill_memory_reuse_len_ = 0;
+    // TOOD(xinfei.sxf) fix state
+    bool done_                  = false;
+    bool released_              = false;
+    bool need_release_resource_ = true;
+
+    ReturnAllProbsMode return_all_probs_ = ReturnAllProbsMode::NONE;
+
+    bool last_block_aligned_ = false;
+
+    bool gen_timeline_ = false;
+
+    // The number of times this stream has been interfered by prefills
+    int32_t batch_with_prefill_times_ = 0;
+    int32_t batch_with_prefill_len_   = 0;
+
+    kmonitor::MetricsReporterPtr metrics_reporter_;
+    rtp_llm::SpecialTokens       special_tokens_;
+
+    // GenerateStream and GenerateStateMachine share StreamCacheResource by
+    // shared_ptr; neither resource nor state machine points back here, so no
+    // ownership cycle is created.
+
+    torch::Tensor                            cum_log_probs_;
+    torch::Tensor                            all_probs_;
+    torch::Tensor                            softmax_probs_;
+    torch::Tensor                            loss_;
+    torch::Tensor                            last_hidden_states_;
+    torch::Tensor                            custom_output_;
+    int                                      loss_index_ = 0;
+    std::shared_ptr<std::mutex>              mutex_;
+    std::shared_ptr<std::condition_variable> consumer_cv_;
+
+    GenerateStreamPtr propose_stream_ = nullptr;
+    GenerateStreamPtr score_stream_   = nullptr;
+
+    size_t                             propose_step_         = 0;
+    size_t                             score_len_            = 0;
+    size_t                             reserve_step_         = 0;
+    bool                               stream_async_reserve_ = false;
+    bool                               acceped_bouns_token_  = false;
+    int                                sp_edit_search_index_ = 0;
+    bool                               sp_edit_first_time_   = true;
+    bool                               sp_edit_run_          = false;
+    std::vector<int>                   propose_token_;
+    bool                               contain_propose_token_ = false;
+    int                                mtp_token_index_       = 0;
+    SpeculativeExecutorStreamOutputPtr sp_output_buffer_      = nullptr;
+    // Separate lock/cv avoids deadlocking releaseResource with worker updates
+    // that need mutex_. Shared ownership preserves the coordinator across
+    // GenerateStream copies captured by async workers.
+    struct AsyncBookkeepingCoordinator {
+        std::atomic<int>        count{0};
+        std::atomic<bool>       defer_release{false};
+        std::mutex              mu;
+        std::condition_variable cv;
+    };
+    std::shared_ptr<AsyncBookkeepingCoordinator> async_bookkeeping_ = std::make_shared<AsyncBookkeepingCoordinator>();
+
+    // Stream-async device-resident state for the next decode step's prepare.
+    // These structs stay default-constructed (epoch=0, undefined tensors) until
+    // their corresponding async/sync publisher installs a usable state.
+    std::shared_ptr<std::mutex>        mtp_async_state_mutex_ = std::make_shared<std::mutex>();
+    MtpAsyncDeviceState                mtp_async_state_;
+    uint64_t                           mtp_async_epoch_counter_ = 0;
+    NormalAsyncDeviceState             normal_async_state_;
+    uint64_t                           normal_async_epoch_counter_       = 0;
+    std::shared_ptr<std::atomic<bool>> grpc_normal_device_state_pending_ = std::make_shared<std::atomic<bool>>(false);
+
+    bool return_all_hidden_states_ = false;
+
+    std::optional<torch::Tensor> context_position_ids_;
+    PositionIdsStyle             mm_position_ids_style_;
+
+    rtp_llm::DataType dtype_;
+    size_t            hidden_size_;
+
+    std::vector<BaseLogitsProcessorPtr> logits_processor_list_;
+    at::Generator                       generator_;
+
+    // just for bool test
+    bool perf_test_ = false;
+    friend class StreamCacheResource;
+    bool is_fake_stream_ = false;
+
+    // prefill TP size queried from prefill server (used for asymmetric TP)
+    int prefill_tp_size_ = -1;
+};
+
+typedef std::shared_ptr<GenerateStream> GenerateStreamPtr;
+
+}  // namespace rtp_llm

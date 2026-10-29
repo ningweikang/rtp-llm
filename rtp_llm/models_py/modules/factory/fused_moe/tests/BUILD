@@ -1,0 +1,76 @@
+load("//rtp_llm/models_py/modules/dsv4/test:defs.bzl", "dsv4_py_test")
+
+py_test(
+    name = "test_config_resolver",
+    srcs = ["test_config_resolver.py"],
+    deps = [
+        "//rtp_llm:testlib",
+    ],
+    exec_properties = {"gpu": "A10_CU13"},
+    tags = ["A10_CU13"],
+)
+
+py_test(
+    name = "test_strategy_registry",
+    srcs = ["test_strategy_registry.py"],
+    deps = [
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
+    name = "test_cuda_strategies",
+    srcs = ["test_cuda_strategies.py"],
+    deps = [
+        "//rtp_llm:testlib",
+    ],
+    tags = [
+        "H20_CU13",
+        "open_skip",
+    ],
+    # Back on H20 after measuring on sm86: 42 tests run, 4 fail on
+    # assertTrue(strategy.can_handle(config)). The test mocks has_deep_gemm but
+    # not the capability gate, and DeepGemmMaskedExecutorV2.check_conditions has
+    # checker.check(get_sm()[0] >= 9) (deepgemm_masked_executor_v2.py:41), so
+    # every DeepGemmMaskedExecutorV2-backed strategy correctly declines below
+    # sm90. Staying on H20 by decision, not as a TODO: the test is correct about
+    # what the executor does, and mocking the capability gate to relocate it would
+    # make it assert something the hardware does not do.
+    exec_properties = {"gpu": "H20_CU13"},
+)
+
+py_test(
+    name = "test_ascend_moe_strategy",
+    srcs = ["test_ascend_moe_strategy.py"],
+    deps = [
+        "//rtp_llm:testlib",
+        # impl/ascend is a standalone bazel package only pulled in by the
+        # using_ascend select in models_py/BUILD; declare it directly so the
+        # test's runfiles contain it under any build config (pure python, no
+        # device side effects).
+        "//rtp_llm/models_py/modules/factory/fused_moe/impl/ascend:ascend_moe",
+    ],
+)
+
+py_test(
+    name = "test_batched_data_router_ep",
+    srcs = ["test_batched_data_router_ep.py"],
+    deps = [
+        "//rtp_llm:testlib",
+    ],
+    # The pin needs a matching tag, otherwise ut-sm8x's -H20 filter does not
+    # exclude this target and it runs there while being dispatched to an H20
+    # worker -- leaking sm8x work onto the pool smoke needs. Keeping upstream's
+    # H20 choice, just making the routing agree with it.
+    tags = ["H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)
+
+dsv4_py_test(
+    name = "test_strategy_select",
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:modules",
+    ],
+    visibility = ["//visibility:public"],
+)

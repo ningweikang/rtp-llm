@@ -1,0 +1,570 @@
+import logging
+from typing import List
+
+from rtp_llm.ops import HWKernelConfig, RoleType, SpeculativeType, TaskType
+from rtp_llm.server.server_args.util import str2bool
+
+GENERATION_PREFILL_CUDA_GRAPH_MAX_CAPTURE_TOKENS = (
+    HWKernelConfig.generation_prefill_cuda_graph_max_capture_tokens
+)
+GENERATION_PREFILL_CUDA_GRAPH_MAX_CAPTURE_BUCKETS = (
+    HWKernelConfig.generation_prefill_cuda_graph_max_capture_buckets
+)
+GENERATION_PREFILL_CUDA_GRAPH_MAX_REQUESTS_LIMIT = (
+    HWKernelConfig.generation_prefill_cuda_graph_max_requests_limit
+)
+CPP_INT_MAX = (1 << 31) - 1
+
+
+def _positive_int(value: str, config_name: str) -> int:
+    import argparse
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as e:
+        raise argparse.ArgumentTypeError(
+            f"{config_name} must be a positive integer, got {value}"
+        ) from e
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            f"{config_name} must be a positive integer, got {value}"
+        )
+    if parsed >= CPP_INT_MAX:
+        raise argparse.ArgumentTypeError(
+            f"{config_name} must be less than the C++ int maximum {CPP_INT_MAX}, got {parsed}"
+        )
+    return parsed
+
+
+def _generation_prefill_cuda_graph_max_requests(value: str) -> int:
+    parsed = _positive_int(
+        value,
+        "generation_prefill_cuda_graph_max_requests",
+    )
+    if parsed > GENERATION_PREFILL_CUDA_GRAPH_MAX_REQUESTS_LIMIT:
+        import argparse
+
+        raise argparse.ArgumentTypeError(
+            "generation_prefill_cuda_graph_max_requests must not exceed the "
+            f"backend limit {GENERATION_PREFILL_CUDA_GRAPH_MAX_REQUESTS_LIMIT}, "
+            f"got {parsed}"
+        )
+    return parsed
+
+
+def validate_hw_kernel_group_args(
+    hw_kernel_config: HWKernelConfig,
+    *,
+    max_context_batch_size: int,
+    concurrency_limit: int,
+    role_type: RoleType,
+    speculative_type: SpeculativeType,
+    task_type: TaskType,
+) -> None:
+    """Validate model-resolved constraints that span multiple option groups.
+
+    This must run only after role and task normalization. In particular,
+    ``VIT_SEPARATION=ROLE`` rewrites the role in ``EngineConfig.create()``, and
+    the final task may be inferred from checkpoint metadata rather than the
+    legacy ``EMBEDDING_MODEL`` switch.
+    """
+    buckets = hw_kernel_config.generation_prefill_capture_token_buckets
+    # A retained child config must not prevent operators from rolling back by
+    # disabling the master switch. The parser above still validates each
+    # option's own syntax/range; only active graphs need cross-option checks.
+    if not hw_kernel_config.enable_cuda_graph or not buckets:
+        return
+
+    # Match the configuration-visible part of the C++ secondary-runner
+    # ownership predicate. Generation runner capacity constraints do not apply
+    # to PD/VIT/frontend processes or non-language wrappers.
+    if role_type != RoleType.PDFUSION or task_type != TaskType.LANGUAGE_MODEL:
+        return
+
+    # Within PDFUSION, NormalEngine rejects an explicitly enabled generation-
+    # prefill graph with speculative execution before warmup and runner creation.
+    # Leave that check to C++, which also knows whether a propose model exists.
+    # Returning here only defers validation; it does not permit the service to
+    # start or ignore the conflicting configuration.
+    if speculative_type != SpeculativeType.NONE:
+        return
+
+    max_requests = hw_kernel_config.generation_prefill_cuda_graph_max_requests
+    reachable_request_capacity = min(max_context_batch_size, concurrency_limit)
+    if max_requests > reachable_request_capacity:
+        raise ValueError(
+            "GENERATION_PREFILL_CUDA_GRAPH_MAX_REQUESTS must not exceed the "
+            "reachable context batch capacity: "
+            f"max_requests={max_requests}, "
+            f"MAX_CONTEXT_BATCH_SIZE={max_context_batch_size}, "
+            f"CONCURRENCY_LIMIT={concurrency_limit}, "
+            f"reachable_capacity={max(0, reachable_request_capacity)}"
+        )
+    max_bucket = max(buckets)
+    last_padded_token_index = (max_requests + 1) * max_bucket - 1
+    if last_padded_token_index > CPP_INT_MAX:
+        raise ValueError(
+            "Generation Prefill CUDA Graph padded token index exceeds int32 "
+            "capacity: "
+            f"max_requests={max_requests}, max_bucket={max_bucket}, "
+            f"last_padded_token_index={last_padded_token_index}"
+        )
+
+
+def init_hw_kernel_group_args(parser, hw_kernel_config):
+    ##############################################################################################################
+    # 硬件/Kernel 特定优化
+    ##############################################################################################################
+    hw_kernel_group = parser.add_argument_group("硬件/Kernel 特定优化")
+
+    hw_kernel_group.add_argument(
+        "--enable_cuda_graph",
+        env_name="ENABLE_CUDA_GRAPH",
+        bind_to=(hw_kernel_config, "enable_cuda_graph"),
+        type=str2bool,
+        default=False,
+        help="系统是否允许使用Cuda Graph",
+    )
+
+    hw_kernel_group.add_argument(
+        "--enable_cuda_graph_debug_mode",
+        env_name="ENABLE_CUDA_GRAPH_DEBUG_MODE",
+        bind_to=(hw_kernel_config, "enable_cuda_graph_debug_mode"),
+        type=str2bool,
+        default=False,
+        help="系统是否允许使用Cuda Graph开启Debug模式来生成可视化文件",
+    )
+
+    hw_kernel_group.add_argument(
+        "--generation_prefill_cuda_graph_max_requests",
+        env_name="GENERATION_PREFILL_CUDA_GRAPH_MAX_REQUESTS",
+        bind_to=(hw_kernel_config, "generation_prefill_cuda_graph_max_requests"),
+        type=_generation_prefill_cuda_graph_max_requests,
+        default=1,
+        help=(
+            "Generation Prefill CUDA Graph 中真实 context sequence row 的最大数量；"
+            "启用时不得超过 MAX_CONTEXT_BATCH_SIZE 与 CONCURRENCY_LIMIT 中的较小值，"
+            f"且后端硬上限为 {GENERATION_PREFILL_CUDA_GRAPH_MAX_REQUESTS_LIMIT}"
+        ),
+    )
+
+    hw_kernel_group.add_argument(
+        "--generation_prefill_capture_config",
+        env_name="GENERATION_PREFILL_CAPTURE_CONFIG",
+        type=_parse_generation_prefill_capture_config,
+        default=None,
+        bind_to=(hw_kernel_config, "generation_prefill_capture_token_buckets"),
+        help=(
+            "Generation Prefill CUDA Graph capture token buckets. A non-empty value, "
+            "together with ENABLE_CUDA_GRAPH=1, enables this graph role. "
+            "Only PDFUSION uses this graph role; other roles ignore the configuration. "
+            "C++ engine initialization on PDFUSION rejects combining it with speculative "
+            "execution (including MTP/DSpARK). Uses the same "
+            "file/list/range syntax as PREFILL_CAPTURE_CONFIG and is limited to "
+            f"{GENERATION_PREFILL_CUDA_GRAPH_MAX_CAPTURE_BUCKETS} buckets."
+        ),
+    )
+
+    hw_kernel_group.add_argument(
+        "--enable_native_cuda_graph",
+        env_name="ENABLE_NATIVE_CUDA_GRAPH",
+        bind_to=(hw_kernel_config, "enable_native_cuda_graph"),
+        type=str2bool,
+        default=False,
+        help="系统是否允许在C++后端使用Cuda Graph",
+    )
+
+    hw_kernel_group.add_argument(
+        "--num_native_cuda_graph",
+        env_name="NUM_NATIVE_CUDA_GRAPH",
+        bind_to=(hw_kernel_config, "num_native_cuda_graph"),
+        type=int,
+        default=200,
+        help="C++后端缓存Cuda Graph数量",
+    )
+
+    hw_kernel_group.add_argument(
+        "--deep_gemm_num_sm",
+        env_name="DEEP_GEMM_NUM_SM",
+        bind_to=(hw_kernel_config, "deep_gemm_num_sm"),
+        type=int,
+        default=None,
+        help="指定 DeepGEMM 使用的 SM (Streaming Multiprocessor) 数量。如果设置，此值将覆盖自动检测的数量。",
+    )
+
+    hw_kernel_group.add_argument(
+        "--arm_gemm_use_kai",
+        env_name="ARM_GEMM_USE_KAI",
+        bind_to=(hw_kernel_config, "arm_gemm_use_kai"),
+        type=str2bool,
+        default=False,
+        help="设置为 `True` 时，为 ARM GEMM 操作启用 KleidiAI 支持。这可能影响权重处理和计算性能。",
+    )
+
+    hw_kernel_group.add_argument(
+        "--enable_multi_block_mode",
+        env_name="ENABLE_MULTI_BLOCK_MODE",
+        bind_to=(hw_kernel_config, "enable_multi_block_mode"),
+        type=str2bool,
+        default=True,
+        help="控制是否为 Multi-Head Attention (MMHA) 启用 multi-block 模式。设置为 'ON' 启用，'OFF' 禁用。",
+    )
+
+    hw_kernel_group.add_argument(
+        "--rocm_hipblaslt_config",
+        env_name="ROCM_HIPBLASLT_CONFIG",
+        bind_to=(hw_kernel_config, "rocm_hipblaslt_config"),
+        type=str,
+        default="gemm_config.csv",
+        help="指定 hipBLASLt GEMM 配置文件的路径。此文件用于优化 ROCm平台上的 GEMM 操作。",
+    )
+
+    hw_kernel_group.add_argument(
+        "--ft_disable_custom_ar",
+        env_name="FT_DISABLE_CUSTOM_AR",
+        bind_to=(hw_kernel_config, "ft_disable_custom_ar"),
+        type=str2bool,
+        default=None,
+        help="设置为 `True` 时，禁用自定义的 AllReduce (AR) 实现，可能回退到标准库（如 NCCL）的 AllReduce。",
+    )
+
+    hw_kernel_group.add_argument(
+        "--use_swizzleA",
+        env_name="USE_SWIZZLEA",
+        bind_to=(hw_kernel_config, "use_swizzleA"),
+        type=str2bool,
+        default=False,
+        help="hipBLASLt GEMM 是否使用 swizzle",
+    )
+
+    hw_kernel_group.add_argument(
+        "--prefill_capture_config",
+        env_name="PREFILL_CAPTURE_CONFIG",
+        type=_parse_prefill_capture_config,
+        default="160:1",
+        bind_to=(hw_kernel_config, "prefill_capture_seq_lens"),
+        help=(
+            "Prefill CUDA Graph capture sequence lengths configuration. "
+            "Supports three formats:\n"
+            "  1. File path: starts with 'file://' or '/', e.g., 'file:///path/to/seq_lens.txt' or '/path/to/seq_lens.txt'\n"
+            "  2. Comma-separated list: e.g., '10,100,500,1000,2000'\n"
+            "  3. Range: format 'max:step', e.g., '16384:128' (generates [128, 256, ..., 16384])"
+        ),
+    )
+
+    hw_kernel_group.add_argument(
+        "--decode_capture_config",
+        env_name="DECODE_CAPTURE_CONFIG",
+        type=_parse_decode_capture_config,
+        default="",
+        bind_to=(hw_kernel_config, "decode_capture_batch_sizes"),
+        help=(
+            "Decode CUDA Graph capture batch sizes configuration. "
+            "Supports comma-separated list format, e.g., '1,2,4,8,16,32'. "
+            "If not set, default logic will be used to generate batch sizes."
+        ),
+    )
+
+    hw_kernel_group.add_argument(
+        "--disable_dpc_random",
+        env_name="DISABLE_DPC_RANDOM",
+        bind_to=(hw_kernel_config, "disable_dpc_random"),
+        type=str2bool,
+        default=None,
+        help="控制是否禁用 DPC 的随机性",
+    )
+
+    hw_kernel_group.add_argument(
+        "--rocm_disable_custom_ag",
+        env_name="ROCM_DISABLE_CUSTOM_AG",
+        bind_to=(hw_kernel_config, "rocm_disable_custom_ag"),
+        type=str2bool,
+        default=None,
+        help="设置为 `True` 时，禁用ROCm平台自定义的 AllGather (AG) 实现，可能回退到标准库（如 RCCL）的 AllGather。",
+    )
+
+
+def _parse_comma_separated_ints(
+    config: str, config_name: str, item_name: str, raise_on_empty: bool = True
+) -> List[int]:
+    """
+    Parse comma-separated list of positive integers from config string.
+
+    Args:
+        config: Configuration string containing comma-separated integers
+        config_name: Name of the configuration (for error messages)
+        item_name: Name of the items being parsed (e.g., "sequence lengths", "batch sizes")
+        raise_on_empty: If True, raise ValueError when no valid items found; if False, return empty list
+
+    Returns:
+        List of positive integers parsed from the config string
+
+    Raises:
+        ValueError: If raise_on_empty=True and no valid items found, or if parsing fails
+    """
+    try:
+        values = [int(x.strip()) for x in config.split(",") if x.strip()]
+        values = [x for x in values if x > 0]
+        if values:
+            logging.info(
+                f"Using {item_name} from comma-separated list: {len(values)} items"
+            )
+            return values
+        else:
+            # Extract base item name (last 2 words, e.g., "sequence lengths" from "prefill capture sequence lengths")
+            words = item_name.split()
+            base_item_name = (
+                " ".join(words[-2:])
+                if len(words) >= 2
+                else words[-1] if words else item_name
+            )
+            error_msg = f"{config_name} contains no valid {base_item_name}"
+            if raise_on_empty:
+                raise ValueError(error_msg)
+            else:
+                logging.warning(f"{error_msg}, using default logic")
+                return []
+    except ValueError as e:
+        # Check if the exception is from our own code (contains config_name)
+        if config_name in str(e):
+            # Re-raise our own exceptions as-is
+            if raise_on_empty:
+                raise
+            else:
+                logging.warning(f"{e}, using default logic")
+                return []
+        else:
+            # For parsing errors (e.g., invalid int), use simpler message
+            words = item_name.split()
+            base_item_name = (
+                " ".join(words[-2:])
+                if len(words) >= 2
+                else words[-1] if words else item_name
+            )
+            error_msg = f"{config_name} contains no valid {base_item_name}"
+            if raise_on_empty:
+                raise ValueError(error_msg)
+            else:
+                logging.warning(f"{error_msg}, using default logic")
+                return []
+
+
+def _parse_prefill_capture_config(
+    config: str,
+    config_name: str = "prefill_capture_config",
+    max_buckets: int | None = None,
+    max_bucket_value: int | None = None,
+    reject_invalid_buckets: bool = False,
+) -> List[int]:
+    """
+    Parse prefill capture sequence lengths configuration string.
+    Supports three formats:
+    1. File path: starts with 'file://' or '/', e.g., 'file:///path/to/seq_lens.txt' or '/path/to/seq_lens.txt'
+    2. Comma-separated list: e.g., '10,100,500,1000,2000'
+    3. Range: format 'max:step', e.g., '16384:128' (generates [128, 256, ..., 16384])
+
+    This function MUST return a non-empty list. If no configuration is provided,
+    it will raise an error.
+
+    Args:
+        config: Configuration string
+
+    Returns:
+        List of positive integers (sequence lengths)
+
+    Raises:
+        argparse.ArgumentTypeError: If configuration is invalid or empty
+    """
+    import argparse
+
+    def validate_bucket_count(seq_lens: List[int]) -> List[int]:
+        if max_buckets is not None and len(seq_lens) > max_buckets:
+            raise argparse.ArgumentTypeError(
+                f"{config_name} produced {len(seq_lens)} buckets; maximum is {max_buckets}"
+            )
+        if max_bucket_value is not None:
+            oversized = next(
+                (bucket for bucket in seq_lens if bucket > max_bucket_value), None
+            )
+            if oversized is not None:
+                raise argparse.ArgumentTypeError(
+                    f"{config_name} bucket must not exceed {max_bucket_value}, got {oversized}"
+                )
+        return seq_lens
+
+    if not config:
+        raise argparse.ArgumentTypeError(
+            f"{config_name} must be set. Supported formats:\n"
+            "  1. File path: 'file:///path/to/seq_lens.txt' or '/path/to/seq_lens.txt'\n"
+            "  2. Comma-separated list: '10,100,500,1000,2000'\n"
+            "  3. Range: '16384:128' (generates [128, 256, ..., 16384])"
+        )
+
+    config = config.strip()
+
+    # Mode 1: File path (starts with 'file://' or '/')
+    if config.startswith("file://") or config.startswith("/"):
+        file_path = config[7:] if config.startswith("file://") else config
+        try:
+            seq_lens = []
+            with open(file_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        try:
+                            seq_len = int(line)
+                        except ValueError as e:
+                            if reject_invalid_buckets:
+                                raise argparse.ArgumentTypeError(
+                                    f"{config_name} contains invalid bucket {line!r}"
+                                ) from e
+                            logging.warning(f"Invalid sequence length in file: {line}")
+                            continue
+                        if seq_len <= 0:
+                            if reject_invalid_buckets:
+                                raise argparse.ArgumentTypeError(
+                                    f"{config_name} bucket must be positive, got {seq_len}"
+                                )
+                            continue
+                        seq_lens.append(seq_len)
+                        if max_buckets is not None and len(seq_lens) > max_buckets:
+                            raise argparse.ArgumentTypeError(
+                                f"{config_name} produced more than {max_buckets} buckets; "
+                                f"maximum is {max_buckets}"
+                            )
+            if seq_lens:
+                logging.info(
+                    f"Loaded {len(seq_lens)} sequence lengths from {file_path}"
+                )
+                return validate_bucket_count(seq_lens)
+            else:
+                raise argparse.ArgumentTypeError(
+                    f"No valid sequence lengths found in file: {file_path}"
+                )
+        except FileNotFoundError as e:
+            if config_name == "prefill_capture_config":
+                raise argparse.ArgumentTypeError(
+                    f"Prefill capture file not found: {file_path}"
+                ) from e
+            raise argparse.ArgumentTypeError(
+                f"{config_name} file not found: {file_path}"
+            ) from e
+        except Exception as e:
+            if isinstance(e, argparse.ArgumentTypeError):
+                raise
+            raise argparse.ArgumentTypeError(
+                f"Error reading {config_name} file: {e}"
+            ) from e
+
+    # Mode 3: Range format (max:step)
+    if ":" in config:
+        try:
+            parts = config.split(":")
+            if len(parts) != 2:
+                raise ValueError("Range format must be 'max:step'")
+            max_seq_len = int(parts[0].strip())
+            step = int(parts[1].strip())
+            if max_seq_len <= 0 or step <= 0:
+                raise ValueError("max_seq_len and step must be positive integers")
+            if max_bucket_value is not None and max_seq_len > max_bucket_value:
+                raise argparse.ArgumentTypeError(
+                    f"{config_name} bucket must not exceed {max_bucket_value}, got {max_seq_len}"
+                )
+            bucket_count = (max_seq_len + step - 1) // step
+            if max_buckets is not None and bucket_count > max_buckets:
+                raise argparse.ArgumentTypeError(
+                    f"{config_name} produced {bucket_count} buckets; maximum is {max_buckets}"
+                )
+            seq_lens = list(range(step, max_seq_len + 1, step))
+            if max_seq_len not in seq_lens:
+                seq_lens.append(max_seq_len)
+            if seq_lens:
+                logging.info(
+                    f"Generated {len(seq_lens)} sequence lengths from range (step={step}, max={max_seq_len})"
+                )
+                return validate_bucket_count(seq_lens)
+            else:
+                raise ValueError(
+                    f"Invalid range parameters: max_seq_len={max_seq_len}, step={step}"
+                )
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(
+                f"Invalid range format '{config}': {e}"
+            ) from e
+
+    # Mode 2: Comma-separated list (default)
+    try:
+        if reject_invalid_buckets:
+            raw_values = [item.strip() for item in config.split(",") if item.strip()]
+            if max_buckets is not None and len(raw_values) > max_buckets:
+                raise argparse.ArgumentTypeError(
+                    f"{config_name} produced {len(raw_values)} buckets; maximum is {max_buckets}"
+                )
+            values = [int(item) for item in raw_values]
+            if not values:
+                raise ValueError(f"{config_name} contains no valid sequence lengths")
+            invalid = next((bucket for bucket in values if bucket <= 0), None)
+            if invalid is not None:
+                raise argparse.ArgumentTypeError(
+                    f"{config_name} bucket must be positive, got {invalid}"
+                )
+            return validate_bucket_count(values)
+        return validate_bucket_count(
+            _parse_comma_separated_ints(
+                config,
+                config_name,
+                f"{config_name} sequence lengths",
+                raise_on_empty=True,
+            )
+        )
+    except ValueError as e:
+        # Convert ValueError to ArgumentTypeError for argparse
+        raise argparse.ArgumentTypeError(str(e)) from e
+
+
+def _parse_generation_prefill_capture_config(config: str) -> List[int]:
+    if not config or not config.strip():
+        return []
+    return _parse_prefill_capture_config(
+        config,
+        config_name="generation_prefill_capture_config",
+        max_buckets=GENERATION_PREFILL_CUDA_GRAPH_MAX_CAPTURE_BUCKETS,
+        max_bucket_value=GENERATION_PREFILL_CUDA_GRAPH_MAX_CAPTURE_TOKENS,
+        reject_invalid_buckets=True,
+    )
+
+
+def _parse_decode_capture_config(config: str) -> List[int]:
+    """
+    Parse decode capture batch sizes configuration string.
+    Only supports comma-separated list format, e.g., '1,2,4,8,16,32'
+
+    Returns empty list if no configuration is provided (will use default logic).
+
+    Args:
+        config: Configuration string
+
+    Returns:
+        List of positive integers (batch sizes), or empty list if config is empty
+    """
+    import argparse
+
+    if not config:
+        # Return empty list to use default logic
+        return []
+
+    config = config.strip()
+    if not config:
+        return []
+
+    # Only support comma-separated list format
+    try:
+        return _parse_comma_separated_ints(
+            config,
+            "decode_capture_config",
+            "decode capture batch sizes",
+            raise_on_empty=False,
+        )
+    except ValueError as e:
+        # Convert ValueError to ArgumentTypeError for argparse
+        raise argparse.ArgumentTypeError(str(e))

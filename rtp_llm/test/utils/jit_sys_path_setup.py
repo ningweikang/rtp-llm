@@ -1,0 +1,341 @@
+"""
+FlashInfer Path Setup Utility
+
+This module ensures flashinfer is imported from the specified custom path
+by inserting it at the beginning of sys.path before any imports.
+
+This is particularly useful in testing environments where you want to use
+a specific version of flashinfer different from the system-installed one.
+"""
+
+import importlib.metadata
+import logging
+import os
+import shutil
+import subprocess
+import sys
+from contextlib import suppress
+from pathlib import Path
+from urllib.parse import urlparse
+
+from filelock import FileLock
+
+from rtp_llm.utils import jit_cache_env as cache_env
+
+
+def get_package_info(package_name):
+    """Get package version and installation path"""
+    try:
+        # Try to import the package first to get its location
+        import importlib
+
+        runfiles_dir = os.environ.get("RUNFILES_DIR") or os.environ.get("TEST_SRCDIR")
+        meta_package_name = package_name
+        if package_name == "tvm_ffi":
+            meta_package_name = "apache-tvm-ffi"
+
+        if runfiles_dir and os.path.exists(runfiles_dir):
+            if runfiles_dir not in sys.path:
+                sys.path.insert(0, runfiles_dir)
+
+            for item in os.listdir(runfiles_dir):
+                if item.startswith("pip_"):
+                    pip_path = os.path.join(runfiles_dir, item, "site-packages")
+                    if os.path.exists(pip_path) and pip_path not in sys.path:
+                        sys.path.insert(0, pip_path)
+
+        module = importlib.import_module(package_name)
+        if hasattr(module, "__file__") and module.__file__:
+            package_path = Path(module.__file__).parent
+            # Get version from metadata
+            try:
+                dist = importlib.metadata.distribution(meta_package_name)
+                version = dist.version
+                return version, str(package_path)
+            except:
+                # If no metadata, use __version__ attribute
+                if hasattr(module, "__version__"):
+                    return module.__version__, str(package_path)
+        return None, None
+    except Exception as e:
+        logging.info(f"[Package Copy] Failed to get info for {package_name}: {e}")
+        return None, None
+
+
+def _build_variant(source_path):
+    """The bazel external repo a package came from, e.g. pip_gpu_rocm_torch_torch.
+
+    A version string is not a build identity. The same version is built per
+    platform into separate external repos -- pip_gpu_cuda12_9_torch_torch,
+    pip_gpu_rocm_torch_torch, the ppu and arm variants -- while the cache below
+    lives in ~/.cache, shared by every job that lands on the host. Keyed on
+    version alone, whichever job populates the cache first decides which build
+    every later job on that host imports, and it does so silently, because the
+    staged directory is prepended to sys.path.
+
+    Returns None when the layout is unrecognised, in which case the caller keeps
+    the old version-only key rather than guessing.
+    """
+    for part in Path(source_path).parts:
+        if part.startswith("pip_"):
+            return part
+    return None
+
+
+def _cache_key(package_name, version, source_path):
+    variant = _build_variant(source_path)
+    if variant is None:
+        return "%s_python-%s" % (package_name, version)
+    return "%s_python-%s__%s" % (package_name, version, variant)
+
+
+def copy_package_with_lock(package_name, cache_dir):
+    """
+    Copy a Python package to cache directory with version in name.
+    Uses file lock to prevent concurrent copies.
+    Returns the path to the copied package's site-packages directory.
+    """
+    logging.info(f"[Package Copy] Processing {package_name}...")
+
+    # Get package version and source path
+    version, source_path = get_package_info(package_name)
+    if not version or not source_path:
+        logging.info(f"[Package Copy] Package {package_name} not found, skipping")
+        return None
+
+    logging.info(f"[Package Copy] Found {package_name} v{version} at {source_path}")
+
+    # Keyed on version AND build variant; see _build_variant.
+    cache_key = _cache_key(package_name, version, source_path)
+    target_base = Path(cache_dir) / cache_key
+    target_site_packages = target_base / "site-packages"
+    target_package_path = target_site_packages / Path(source_path).name
+
+    # Lock file for this specific package and version
+    lock_file = Path(cache_dir) / f".{cache_key}.lock"
+    completion_marker = target_base / ".copy_complete"
+
+    # Check if already copied and complete
+    if completion_marker.exists() and target_package_path.exists():
+        logging.info(
+            f"[Package Copy] {package_name} v{version} already cached at {target_base}"
+        )
+        return str(target_site_packages)
+
+    # Use file lock to prevent concurrent copies
+    with FileLock(str(lock_file), timeout=300):
+        # Double check after acquiring lock
+        if completion_marker.exists() and target_package_path.exists():
+            logging.info(
+                f"[Package Copy] {package_name} v{version} already cached (confirmed after lock)"
+            )
+            return str(target_site_packages)
+
+        logging.info(
+            f"[Package Copy] Copying {package_name} to {target_package_path}..."
+        )
+
+        # Create target directories
+        target_site_packages.mkdir(parents=True, exist_ok=True)
+
+        # Remove incomplete copy if exists
+        if target_package_path.exists():
+            shutil.rmtree(target_package_path)
+
+        # Copy the package
+        try:
+            if Path(source_path).is_dir():
+                shutil.copytree(source_path, target_package_path, symlinks=True)
+            else:
+                shutil.copy2(source_path, target_package_path)
+
+            # Also copy .libs directory if it exists (for torch, flashinfer, etc.)
+            source_parent = Path(source_path).parent
+            libs_dirs = [f"{package_name}.libs", f"{package_name}_libs"]
+            for libs_dir_name in libs_dirs:
+                libs_source = source_parent / libs_dir_name
+                if libs_source.exists() and libs_source.is_dir():
+                    libs_target = target_site_packages / libs_dir_name
+                    if not libs_target.exists():
+                        logging.info(
+                            f"[Package Copy] Copying {libs_dir_name} directory..."
+                        )
+                        shutil.copytree(libs_source, libs_target, symlinks=True)
+
+            # Verify copy
+            if not target_package_path.exists():
+                raise RuntimeError(f"Copy verification failed for {package_name}")
+
+            # Create completion marker
+            completion_marker.write_text(f"{package_name}=={version}\n")
+
+            logging.info(
+                f"[Package Copy] Successfully copied {package_name} v{version}"
+            )
+            return str(target_site_packages)
+
+        except Exception as e:
+            logging.info(f"[Package Copy] Failed to copy {package_name}: {e}")
+            # Clean up incomplete copy
+            if target_package_path.exists():
+                shutil.rmtree(target_package_path, ignore_errors=True)
+            return None
+
+
+def modify_bazel_wrapper_pythonpath(wrapper_path):
+    """
+    Modify Bazel-generated wrapper to inject _JIT_CACHE_PATHS at the beginning of PYTHONPATH.
+
+    Args:
+        wrapper_path: Path to the Bazel-generated wrapper file
+    """
+    try:
+        with open(wrapper_path, "r") as f:
+            lines = f.readlines()
+        # Find the line index where new_env['PYTHONPATH'] = python_path (line 479)
+        target_line_idx = None
+        for i, line in enumerate(lines):
+            if "new_env['PYTHONPATH'] = python_path" in line:
+                target_line_idx = i
+                break
+        if target_line_idx is None:
+            logging.warning(
+                f"[Package Setup] Could not find target line in wrapper: {wrapper_path}"
+            )
+            return False
+
+        # Create injection code to insert before line 479
+        injection_lines = [
+            "  # Inject _JIT_CACHE_PATHS at the beginning of PYTHONPATH\n",
+            "  jit_cache_paths = os.environ.get('_JIT_CACHE_PATHS', '')\n",
+            "  if jit_cache_paths:\n",
+            "    jit_cache_entries = jit_cache_paths.split(os.pathsep)\n",
+            "    # Prepend cache paths to the beginning of python_path\n",
+            "    python_path = os.pathsep.join(jit_cache_entries) + os.pathsep + python_path\n",
+        ]
+
+        # Insert the code before the target line
+        lines[target_line_idx:target_line_idx] = injection_lines
+
+        import stat
+
+        if os.path.exists(wrapper_path):
+            # Make file writable
+            current_permissions = os.stat(wrapper_path).st_mode
+            os.chmod(wrapper_path, current_permissions | stat.S_IWRITE)
+
+        # Write back to file
+        with open(wrapper_path, "w") as f:
+            f.writelines(lines)
+
+        logging.info(f"[Package Setup] Modified Bazel wrapper: {wrapper_path}")
+        logging.info(
+            f"[Package Setup] Injected _JIT_CACHE_PATHS at the beginning of PYTHONPATH"
+        )
+        return True
+
+    except Exception as e:
+        logging.warning(
+            f"[Package Setup] Failed to modify Bazel wrapper {wrapper_path}: {e}"
+        )
+        return False
+
+
+def bootstrap_remote_jit_dir():
+    remote = os.environ.get("REMOTE_JIT_DIR", "").strip()
+    if not remote or urlparse(remote).scheme:
+        return
+    try:
+        root = Path(remote).expanduser()
+        if not root.is_absolute():
+            raise OSError(f"not an absolute path: {remote}")
+        if root.is_symlink() or root.parent.is_symlink():
+            raise OSError(f"symlinked path: {remote}")
+        try:
+            root.mkdir(parents=True)
+        except FileExistsError:
+            if not root.is_dir() or not os.access(root, os.R_OK | os.W_OK | os.X_OK):
+                raise OSError(f"unusable directory: {remote}")
+        else:
+            root.chmod(0o1777)  # protect direct children of a shared root
+        os.environ["REMOTE_JIT_DIR"] = str(root)
+    except (OSError, RuntimeError) as e:
+        os.environ.pop("REMOTE_JIT_DIR", None)  # child servers inherit the env
+        logging.warning(f"[JIT] REMOTE_JIT_DIR refused ({e}); cold start later")
+
+
+def setup_jit_cache(cache_dir=None, packages=None):
+    bootstrap_remote_jit_dir()
+    cache_env.configure_writable_cache_env(
+        "FLASHINFER_WORKSPACE_BASE",
+        Path.home(),
+        "flashinfer",
+        cache_subpath=(".cache", "flashinfer"),
+    )
+    cache_env.configure_writable_cache_env(
+        "TRITON_CACHE_DIR", Path.home() / ".triton" / "cache", "triton"
+    )
+
+    requested_cache_dir = cache_dir or Path.home() / ".cache"
+    cache_dir = cache_env.ensure_writable_directory(requested_cache_dir)
+    if cache_dir is None:
+        cache_dir = cache_env.ensure_writable_directory(
+            cache_env.local_jit_fallback("python_packages")
+        )
+    if cache_dir is None:
+        raise OSError("no writable Python package cache directory")
+
+    # DeepGEMM's NVCC compiler changes into the JIT tmp directory before
+    # compiling. A relative cache path would then be resolved a second time
+    # and make the generated kernel.cu unreachable. Normalize both the default
+    # and caller-provided path before launching the actual test process.
+    cache_env.configure_writable_cache_env(
+        "DG_JIT_CACHE_DIR", Path.home() / ".deep_gemm", "deep_gemm"
+    )
+    logging.info(
+        f"[Package Setup] Set DG_JIT_CACHE_DIR: {os.environ['DG_JIT_CACHE_DIR']}"
+    )
+
+    if packages is None:
+        packages = ["flashinfer", "torch", "deep_gemm", "tvm_ffi"]
+
+    # Copy packages to cache with file locking
+    copied_paths = []
+    for package_name in packages:
+        site_packages_path = copy_package_with_lock(package_name, cache_dir)
+        if site_packages_path:
+            copied_paths.append(site_packages_path)
+
+    if not copied_paths:
+        logging.info("[Package Setup] Warning: No packages were successfully copied")
+        return None
+
+    # Store cached package paths in environment variable for bootstrap script
+    os.environ["_JIT_CACHE_PATHS"] = ":".join(copied_paths)
+    logging.info(
+        f"[Package Setup] Set _JIT_CACHE_PATHS: {os.environ['_JIT_CACHE_PATHS']}"
+    )
+    runfiles_dir = os.environ.get("RUNFILES_DIR")
+    test_binary = sys.argv[1] if len(sys.argv) > 1 else ""
+    if not runfiles_dir or not test_binary:
+        logging.warning(
+            "[Package Setup] Bazel wrapper unavailable; skip cache path injection"
+        )
+        return None
+    bazel_wrapper_path = Path(runfiles_dir) / "rtp_llm" / test_binary
+    suffix = f"_new_{os.getpid()}"
+    bazel_wrapper_path_new = bazel_wrapper_path.with_name(
+        bazel_wrapper_path.name + suffix
+    )
+    try:
+        bazel_wrapper_path_new.unlink(missing_ok=True)
+        shutil.copy2(bazel_wrapper_path, bazel_wrapper_path_new)
+        if not modify_bazel_wrapper_pythonpath(bazel_wrapper_path_new):
+            raise OSError("wrapper injection failed")
+    except Exception as error:
+        with suppress(OSError):
+            bazel_wrapper_path_new.unlink()
+        logging.warning(f"[Package Setup] wrapper setup failed ({error})")
+        return None
+    logging.info(f"[Package Setup] Copied Bazel wrapper to: {bazel_wrapper_path_new}")
+    sys.argv[1] = test_binary + suffix

@@ -1,0 +1,287 @@
+import json
+import logging
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+
+from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
+from rtp_llm.config.generate_config import GenerateConfig, RequestFormat, RoleAddr
+from rtp_llm.structure.request_constants import request_id_field_name
+
+
+class Request(NamedTuple):
+    request_id: int
+    batch_infer: bool
+    input_texts: Any
+    input_urls: Any
+    generate_configs: List[GenerateConfig]
+    is_streaming: bool
+
+    @property
+    def num_return_sequences(self) -> int:
+        return self.generate_configs[0].num_return_sequences
+
+    @property
+    def incremental(self) -> bool:
+        return self.generate_configs[0].return_incremental
+
+
+class RequestExtractor:
+    def __init__(self, default_generate_config: GenerateConfig):
+        self.default_generate_config = default_generate_config
+
+    def extract_request(self, kwargs: Dict[str, Any]) -> Tuple[Request, Dict[str, Any]]:
+        generate_config, remain_args = self._format_request(kwargs)
+        request = self._get_request(generate_config, remain_args)
+        return request, remain_args
+
+    @staticmethod
+    def is_streaming(req: Dict[str, Any]):
+        return req.get(
+            "yield_generator",
+            req.get("generation_config", req.get("generate_config", {})).get(
+                "yield_generator", False
+            ),
+        )
+
+    @staticmethod
+    def _partition_generate_config_fields(
+        values: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        field_names = GenerateConfig.model_fields
+        config_values = {
+            key: value for key, value in values.items() if key in field_names
+        }
+        remain_values = {
+            key: value for key, value in values.items() if key not in field_names
+        }
+        return config_values, remain_values
+
+    def _format_generate_config(
+        self, kwargs: Dict[str, Any]
+    ) -> Tuple[GenerateConfig, Dict[str, Any]]:
+        config_json = kwargs.pop("generate_config", kwargs.pop("generation_config", {}))
+        nested_config, remain_config_json = self._partition_generate_config_fields(
+            config_json
+        )
+        top_level_config, remain_kwargs = self._partition_generate_config_fields(kwargs)
+        config_values = self.default_generate_config.model_dump()
+        config_values.update(nested_config)
+        config_values.update(top_level_config)
+
+        def update_optional(key: str, params: List[str]) -> None:
+            for source in [remain_config_json, remain_kwargs]:
+                for param in params:
+                    if param in source:
+                        config_values[key] = source[param]
+                        return
+
+        update_optional(
+            "return_hidden_states", ["return_hidden_states", "output_hidden_states"]
+        )
+        update_optional("return_all_hidden_states", ["return_hidden_states"])
+        update_optional("return_logits", ["return_logits", "output_logits"])
+        update_optional("return_input_ids", ["return_input_ids", "output_input_ids"])
+        update_optional("max_new_tokens", ["gen_length", "max_new_tokens"])
+        if self.is_streaming(kwargs) or (kwargs.get("stream", False) == True):
+            config_values["is_streaming"] = True
+        try:
+            generate_config = GenerateConfig.model_validate(config_values)
+        except Exception as e:
+            raise FtRuntimeException(
+                ExceptionType.ERROR_GENERATE_CONFIG_FORMAT,
+                f"generate_config validate failed: {str(e)}",
+            ) from e
+        return generate_config, remain_kwargs
+
+    def _format_request(
+        self, kwargs: Dict[str, Any]
+    ) -> Tuple[GenerateConfig, Dict[str, Any]]:
+        generate_config, remain_kwargs = self._format_generate_config(kwargs)
+
+        # Handle role_addrs parsing - convert dict to RoleAddr objects
+        if generate_config.role_addrs:
+            try:
+                # Check if we have dict objects that need conversion
+                if generate_config.role_addrs and isinstance(
+                    generate_config.role_addrs[0], dict
+                ):
+                    generate_config.role_addrs = [
+                        (
+                            RoleAddr(**addr_data)
+                            if isinstance(addr_data, dict)
+                            else addr_data
+                        )
+                        for addr_data in generate_config.role_addrs
+                    ]
+                # Store original role_addrs for PD separation scenario
+                generate_config.original_role_addrs = generate_config.role_addrs.copy()
+            except Exception as e:
+                logging.warning(f"Failed to parse role_addrs: {e}")
+
+        return self._format_chat_api_messages(generate_config, remain_kwargs)
+
+    def _get_text(self, kwargs: Dict[str, Any]):
+        input_texts: Optional[Union[List[str], List[List[Dict[str, str]]]]] = None
+        if "prompt_batch" in kwargs:
+            input_texts = kwargs.pop("prompt_batch")
+            if not isinstance(input_texts, list):
+                raise FtRuntimeException(
+                    ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                    "prompt batch input should be list",
+                )
+        else:
+            prompt: Union[str, List[str], List[Dict[str, str]]]
+            if "prompt" in kwargs:
+                prompt = kwargs.pop("prompt")
+            elif "text" in kwargs:
+                prompt = kwargs.pop("text")
+            else:
+                raise Exception("can not find prompt or text in request")
+            if isinstance(prompt, str):
+                input_texts = [prompt]
+            # for AutoML format
+            elif isinstance(prompt, list) and isinstance(prompt[0], dict):
+                input_texts = [prompt]
+            else:
+                input_texts = prompt
+        if input_texts is None:
+            raise FtRuntimeException(ExceptionType.NO_PROMPT_ERROR, "not input prompt")
+        return input_texts
+
+    def _get_urls(self, input_len: int, kwargs: Dict[str, Any]):
+        mm_urls: Optional[Union[List[str], List[List[str]]]] = None
+        urls = kwargs.pop("images", kwargs.pop("urls", None))
+        if urls is not None and not isinstance(urls, list):
+            raise FtRuntimeException(
+                ExceptionType.ERROR_INPUT_FORMAT_ERROR, "input urls should be list"
+            )
+        if "prompt_batch" in kwargs:
+            if urls is not None:
+                if not isinstance(urls[0], list):
+                    raise FtRuntimeException(
+                        ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                        "prompt batch urls should be list[list]",
+                    )
+                if len(urls) != input_len:
+                    raise FtRuntimeException(
+                        ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                        "prompt batch urls and input should have same length",
+                    )
+                mm_urls = urls
+            else:
+                mm_urls = [[]] * input_len
+        else:
+            if urls == None or len(urls) == 0:
+                mm_urls = [[]] * input_len
+            elif len(urls) > 0 and isinstance(urls[0], str):
+                mm_urls = [urls]
+            else:
+                mm_urls = urls
+        return mm_urls
+
+    def _get_request_id(self, kwargs: Dict[str, Any]) -> int:
+        return kwargs[request_id_field_name]
+
+    def _is_batch(self, kwargs: Dict[str, Any]) -> bool:
+        return "prompt_batch" in kwargs
+
+    def _get_adapter(
+        self, generate_config: GenerateConfig, input_len: int
+    ) -> List[GenerateConfig]:
+        # Each prompt is prepared independently downstream. Keep mutable
+        # GenerateConfig state isolated across the streams in one raw batch.
+        generate_configs = [
+            generate_config.model_copy(deep=True) for _ in range(input_len)
+        ]
+        adapter_name = generate_config.adapter_name
+        if adapter_name != None:
+            if (isinstance(adapter_name, str) and input_len != 1) or (
+                isinstance(adapter_name, list) and input_len != len(adapter_name)
+            ):
+                raise FtRuntimeException(
+                    ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                    "adapter_name is not alignment",
+                )
+            for i in range(input_len):
+                generate_configs[i].adapter_name = (
+                    adapter_name[i] if isinstance(adapter_name, list) else adapter_name
+                )
+        return generate_configs
+
+    def extend_sequences(
+        self, input_texts: Any, input_urls: Any, generate_configs: List[GenerateConfig]
+    ):
+        return input_texts, input_urls, generate_configs
+
+    def _get_request(
+        self, generate_config: GenerateConfig, kwargs: Dict[str, Any]
+    ) -> Request:
+        request_id = self._get_request_id(kwargs)
+        batch_infer = self._is_batch(kwargs)
+        input_texts = self._get_text(kwargs)
+        input_urls = self._get_urls(len(input_texts), kwargs)
+        generate_configs = self._get_adapter(generate_config, len(input_texts))
+        input_texts, input_urls, generate_configs = self.extend_sequences(
+            input_texts, input_urls, generate_configs
+        )
+        is_streaming = RequestExtractor.is_streaming(kwargs)
+        if generate_config.is_streaming:
+            is_streaming = True
+        return Request(
+            request_id,
+            batch_infer,
+            input_texts,
+            input_urls,
+            generate_configs,
+            is_streaming,
+        )
+
+    def _format_chat_api_messages(
+        self, generate_config: GenerateConfig, kwargs: Dict[str, Any]
+    ) -> Tuple[GenerateConfig, Dict[str, Any]]:
+        if "messages" in kwargs:
+            assert "prompt" not in kwargs
+            messages = kwargs.pop("messages")
+            assert isinstance(messages, list)
+            kwargs["prompt"] = messages
+            generate_config.request_format = RequestFormat.CHAT_API
+
+        prompt = kwargs.get("prompt", None)
+        functions = kwargs.get("functions", None)
+        if isinstance(prompt, list) and isinstance(prompt[0], dict):
+            generate_config.request_format = RequestFormat.CHAT_API
+
+        if generate_config.request_format == RequestFormat.CHAT_API:
+            if isinstance(prompt, str):
+                prompt = json.loads(prompt, strict=False)
+            if prompt == None:
+                prompt_batch = kwargs.pop("prompt_batch", None)
+                if not isinstance(prompt_batch, list):
+                    raise FtRuntimeException(
+                        ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                        "prompt_batch should be list",
+                    )
+                if len(prompt_batch) > 1:
+                    raise FtRuntimeException(
+                        ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                        "prompt_batch does not support batch size > 1 now.",
+                    )
+                prompt = prompt_batch[0]
+            if prompt == None:
+                raise FtRuntimeException(
+                    ExceptionType.ERROR_INPUT_FORMAT_ERROR, "No prompt!"
+                )
+            assert isinstance(prompt, list)
+            assert isinstance(prompt[0], dict)
+
+            # if functions passed, temporarily add them to messages to ease passing to next stage
+            if functions:
+                function_message = {"role": "tools", "functions": functions}
+                prompt = [function_message] + prompt
+            kwargs["prompt"] = prompt
+        else:
+            if functions:
+                raise FtRuntimeException(
+                    ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                    "functions only supported in openai api format",
+                )
+        return generate_config, kwargs

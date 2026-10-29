@@ -1,0 +1,116 @@
+from typing import Any, Dict, List, Optional, Union
+
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from rtp_llm.config.generate_config import RoleType
+
+_ROLE_TYPE_NAMES = ("PDFUSION", "PREFILL", "DECODE", "VIT", "FRONTEND")
+_ROLE_TYPES_BY_NAME = {name: getattr(RoleType, name) for name in _ROLE_TYPE_NAMES}
+_ROLE_TYPES_BY_VALUE = {int(role): role for role in _ROLE_TYPES_BY_NAME.values()}
+
+
+def _coerce_role_type(value: Union[int, str, RoleType]) -> RoleType:
+    if isinstance(value, RoleType):
+        role = _ROLE_TYPES_BY_VALUE.get(int(value))
+        if role is not None:
+            return role
+    elif isinstance(value, str):
+        role_name = value.strip().rsplit(".", 1)[-1].upper()
+        if role_name.startswith("ROLE_TYPE_"):
+            role_name = role_name[len("ROLE_TYPE_") :]
+        role = _ROLE_TYPES_BY_NAME.get(role_name)
+        if role is not None:
+            return role
+    elif isinstance(value, int) and not isinstance(value, bool):
+        role = _ROLE_TYPES_BY_VALUE.get(value)
+        if role is not None:
+            return role
+    raise ValueError(f"Invalid role: {value!r}, expected int, str, or RoleType")
+
+
+class WorkerStatusRequest(BaseModel):
+    latest_cache_version: Optional[int] = -1
+    latest_finished_version: Optional[int] = -1
+
+
+class TaskInfo(BaseModel):
+    request_id: int
+    prefix_length: int  # cache hit len
+    input_length: int
+    waiting_time_ms: int  # for master check server is hang or not
+    iterate_count: int
+    end_time_ms: int = -1
+    dp_rank: int
+
+
+class CacheStatus(BaseModel):
+    available_kv_cache: int = -1
+    total_kv_cache: int = -1
+    block_size: int = -1
+    version: int = -1
+    cached_keys: Optional[List[int]] = None
+
+
+class ProfileMeta(BaseModel):
+    profile_time: Dict[int, int]  # {token_size, time}
+
+
+class WorkStatus(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    role: RoleType  # prefill, decode, vit
+    server_port: Optional[int] = None
+    http_port: Optional[int] = None
+    grpc_port: Optional[int] = None
+
+    running_task_info: List[TaskInfo]  # 当前running 的task信息
+    finished_task_list: List[TaskInfo]  # 窗口内已经完成的任务状态
+
+    dp_size: int
+    tp_size: int
+    alive: bool
+    precision: str = "fp16"
+    status_version: Optional[int] = -1  # 时间戳
+    latest_finished_version: Optional[int] = -1  # 最新完成任务的版本
+
+    profile_meta: Optional[ProfileMeta] = None  # 统计的处理数据
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def validate_role(cls, v):
+        return _coerce_role_type(v)
+
+
+class DebugInfo(BaseModel):
+    running_batch_size: int
+    queue_size: int
+    waiting_time_ms: int
+    available_kv_cache_len: int
+    estimate_ttft_ms: int
+    estimate_tpot_ms: int
+    hit_cache_len: int
+
+
+class ServerStatus(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    role: RoleType
+    server_ip: str
+    http_port: int
+    grpc_port: int
+    debug_info: Optional[DebugInfo] = None
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def validate_role(cls, v):
+        return _coerce_role_type(v)
+
+
+class ScheduleMeta(BaseModel):
+    server_status: List[ServerStatus]
+    cache_local: int = 0  # 0: LOCAL, 1: REMOTE
+    code: int = 200  # 200: OK
+    error_message: Optional[str] = None
+    success: Optional[bool] = True
+    real_master_host: Optional[str] = None
+    enqueued_by_master: bool = False

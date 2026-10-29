@@ -1,0 +1,927 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2025, RTP-LLM
+# This file is distributed under the same license as the RTP-LLM package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2025.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: RTP-LLM 0.2.0\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-11-03 16:43+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: zh_CN\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.17.0\n"
+
+#: ../../backend/server_arguments.md:1
+msgid "ServerArgs"
+msgstr ""
+
+#: ../../backend/server_arguments.md:3
+msgid ""
+"This page lists server arguments used to configure the behavior and "
+"performance of the language model server via command line. These "
+"parameters allow users to customize key server functionalities, including"
+" model selection, parallel strategies, memory management, and "
+"optimization techniques."
+msgstr ""
+
+#: ../../backend/server_arguments.md:5
+msgid "Parallelism and Distributed Setup Configuration"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Arguments"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Description"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Defaults"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--tp-size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Specifies the tensor parallelism degree."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "None"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--ep-size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Defines the number of model instances for expert parallelism."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--dp-size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Sets the number of replicas or group size for data parallelism."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--world-size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid ""
+"Total number of GPUs used in distributed setup (WORLD_SIZE = TP_SIZE * "
+"DP_SIZE)."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--world-rank`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Global unique ID of the current process/GPU in the distributed system."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--local-world-size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Number of GPU devices used on the current node."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable_ffn_disaggregate`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid ""
+"Enables FFN disaggregation feature to separate attention and feed-forward"
+" network computations for performance optimization."
+msgstr ""
+
+#: ../../backend/server_arguments.md:17
+msgid "Concurrency Control"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--concurrency-with-block`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Controls blocking behavior for concurrent requests."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "False"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--concurrency-limit`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Maximum number of concurrent requests allowed by the system."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "32"
+msgstr ""
+
+#: ../../backend/server_arguments.md:24
+msgid "[Attention Optimization](./attention_backend.md)"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable_fmha`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables Fused Multi-Head Attention (FMHA) feature."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "True"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable_flashinfer_trtllm_gen`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables FlashInfer TRT-LLM Gen attention on SM100."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable_flashinfer_trt_fmha_v2`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables FlashInfer TRT-LLM FMHA v2 contiguous prefill."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable_paged_flashinfer_trt_fmha_v2`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables FlashInfer TRT-LLM FMHA v2 paged prefill."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable_open_source_fmha`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables open-source FMHA implementation."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable_paged_open_source_fmha`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables Paged open-source FMHA implementation."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--disable_flashinfer_native`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Disables FlashInfer native attention backends."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--disable_flashinfer_hybrid_prefill`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Disables FlashInfer native Hybrid Prefill implementation."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable_xqa`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables XQA feature (requires SM90+ GPU)."
+msgstr ""
+
+#: ../../backend/server_arguments.md:39
+msgid "KV Cache Configuration"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--reuse-cache`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Activates KV Cache reuse mechanism."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--multi-task-prompt`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Multi-task prompt file path."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--multi-task-prompt-str`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Multi-task prompt JSON string."
+msgstr ""
+
+#: ../../backend/server_arguments.md:47
+msgid "Hardware/Kernel Optimization"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--deep-gemm-num-sm`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Number of SMs used for DeepGEMM."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--arm-gemm-use-kai`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables KleidiAI support for ARM GEMM."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable-stable-scatter-add`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables stable scatter add operation."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable-multi-block-mode`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables multi-block mode for MMHA."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--rocm-hipblaslt-config`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "hipBLASLt GEMM configuration file path."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "gemm_config.csv"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--ft-disable-custom-ar`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Disables custom AllReduce implementation."
+msgstr ""
+
+#: ../../backend/server_arguments.md:58
+msgid "Device Resource Management"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--device-reserve-memory-bytes`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Amount of GPU memory to reserve (bytes)."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "0"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--host-reserve-memory-bytes`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Amount of CPU memory to reserve (bytes)."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "4GB"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--overlap-math-sm-count`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Number of SMs for compute-communication overlap optimization."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--overlap-comm-type`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Compute-communication overlap strategy type."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--m-split`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "M_SPLIT parameter for device operations."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable-comm-overlap`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables compute-communication overlapping execution."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable-layer-micro-batch`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables layer-level micro-batching."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--not-use-default-stream`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Do not use default CUDA stream."
+msgstr ""
+
+#: ../../backend/server_arguments.md:71
+msgid "DeepEP Configuration"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--use-deepep-moe`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables DeepEP for MoE processing. Single EP shoude set be false"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--use-deepep-internode`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables inter-node communication optimization."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--use-deepep-low-latency`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables DeepEP low-latency mode."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--use-deepep-p2p-low-latency`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables P2P low-latency mode."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--deep-ep-num-sm`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Number of SMs for DeepEPBuffer."
+msgstr ""
+
+#: ../../backend/server_arguments.md:81
+msgid "EPLB Configuration"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--eplb_mode`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "EPLB mode"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "\"NONE\""
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--balance_method`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "EPLB load balancing method."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "\"mix\""
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--redundant_expert`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Number of redundant experts."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--eplb_update_time`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "EPLB execution cycle."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "5000"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--eplb_balance_layer_per_step`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Number of layers updated per EPLB update."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "1"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--eplb_force_repack`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Globally repack EPLB experts."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--eplb_stats_window_size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "EPLB statistics window size."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "10"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--eplb_control_step`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "(DEBUG) EPLB synchronization control parameter cycle."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "100"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--eplb_test_mode`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "(DEBUG) Enables ExpertBalancer test mode"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--fake_balance_expert`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "(DEBUG) Enables expert pseudo-balancing mechanism."
+msgstr ""
+
+#: ../../backend/server_arguments.md:96
+msgid "Sampling Configuration"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--max-batch-size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Override system maximum batch size."
+msgstr ""
+
+#: ../../backend/server_arguments.md:103
+msgid "Logging & Profiling"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--ft-nvtx`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables NVTX performance profiling."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--py-inference-log-response`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Logs inference response content."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--trace-memory`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables memory tracing."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--trace-malloc-stack`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables malloc stack tracing."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable-device-perf`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Collects device performance metrics."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--ft-core-dump-on-exception`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Generates core dump on exception."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--ft-alog-conf-path`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Log configuration file path."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--log-level`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Log level (ERROR/WARN/INFO/DEBUG)."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "INFO"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--gen-timeline-sync`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Collects Timeline analysis data."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--torch-cuda-profiler-dir`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Torch Profiler output directory."
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "\"\""
+msgstr ""
+
+#: ../../backend/server_arguments.md:118
+msgid "Speculative Decoding"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--sp-model-type`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Specifies draft model type (e.g.  \"deepseek-v3-mtp\")"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--sp-type`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Controls speculative sampling type (\"vanilla\" disables, \"mtp\" enables)"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--sp-min-token-match`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Minimum token match length"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "2"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--sp-max-token-match`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Maximum token match length"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--tree-decode-config`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Tree decode mapping configuration file"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--gen-num-per-cycle`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Maximum number of tokens generated per cycle"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--force-stream-sample`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Forces streaming sampling"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--force-score-context-attention`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Forces context attention scoring"
+msgstr ""
+
+#: ../../backend/server_arguments.md:131
+msgid "RPC and Service Discovery"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--use-local`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Uses local service discovery"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--remote-rpc-server-ip`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Remote RPC server address"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--decode-cm2-config`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Decode service discovery configuration"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--remote-vit-server-ip`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Remote ViT server address"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--multimodal-part-cm2-config`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Multimodal service discovery configuration"
+msgstr ""
+
+#: ../../backend/server_arguments.md:141
+msgid "Cache Store"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--cache-store-rdma-mode`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables RDMA mode"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--wrr-available-ratio`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "WRR load balancing availability threshold"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "80"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--rank-factor`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "WRR ranking factor (0=KV_CACHE usage, 1=in-flight requests)"
+msgstr ""
+
+#: ../../backend/server_arguments.md:149
+msgid "Scheduler Configuration"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--use-batch-decode-scheduler`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables batch decode scheduler"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--max-context-batch-size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Maximum context batch size"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--scheduler-reserve-resource-ratio`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Reserved resource percentage"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "5"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--batch-decode-scheduler-batch-size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Decode batch size"
+msgstr ""
+
+#: ../../backend/server_arguments.md:161
+msgid "Load Balancing and Performance Optimization Configuration"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--load-balance`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables dynamic load balancing"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--step-records-time-range`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Performance record retention time window (microseconds)"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "60000000"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--step-records-max-size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Maximum performance record count"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "1000"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--disable-pdl`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Disables PDL feature"
+msgstr ""
+
+#: ../../backend/server_arguments.md:170
+msgid "3FS Configuration"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--enable-3fs`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Enables 3FS for managing KVCache"
+msgstr ""
+
+#: ../../backend/server_arguments.md:176
+msgid "Model Adaptation"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--max-lora-model-size`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Maximum size limit for LoRA models"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "-1"
+msgstr ""
+
+#: ../../backend/server_arguments.md:182
+msgid "System Debugging"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Collects Timeline analysis data"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "Torch Profiler output directory"
+msgstr ""
+
+#: ../../backend/server_arguments.md:189
+msgid "Load Config"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "`--load_method`"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid ""
+"Specify the weight loading method.<br>Options: auto, fastsafetensors, "
+"scratch"
+msgstr ""
+
+#: ../../backend/server_arguments.md
+msgid "auto"
+msgstr ""

@@ -1,0 +1,468 @@
+import itertools
+import math
+import os
+import random
+import sys
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional
+from unittest import SkipTest, TestCase, main
+from unittest.mock import Mock
+
+import torch
+import torch.nn.functional as F
+
+device = torch.device(f"cuda")
+
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.models.rotary_embedding.deepseek_rotary_embedding import (
+    DeepseekV3YarnRotaryEmbedding,
+)
+from rtp_llm.models_py.modules import MlaAttention
+from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashinfer_mla_wrapper import (
+    MlaFlashInferDecodeImpl,
+    MlaFlashInferPrefillImpl,
+)
+from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import MlaImplBase
+from rtp_llm.models_py.modules.hybrid.test.mla_attention_ref import MlaAttentionRef
+from rtp_llm.ops import ParallelismConfig
+from rtp_llm.ops.compute_ops import KVCache, LayerKVCache, PyAttentionInputs
+from rtp_llm.utils.model_weight import W
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
+    bs_page_num, page_size, ckv_dim = ckv.shape
+    page_num = bs_page_num // batch_size
+    _, _, kpe_dim = kpe.shape
+    ckv = ckv.view(batch_size, page_num * page_size, ckv_dim)
+    kpe = kpe.view(batch_size, page_num * page_size, kpe_dim)
+    ckv = ckv[:, :kv_len, :]
+    kpe = kpe[:, :kv_len, :]
+    k = (
+        torch.cat([ckv, kpe], dim=-1)
+        .view(-1, 1, ckv_dim + kpe_dim)
+        .repeat_interleave(num_heads, dim=1)
+    )
+    v = ckv.repeat_interleave(num_heads, dim=1)
+
+    return k, v
+
+
+def create_cos_sin_cache():
+    rotary_emb = DeepseekV3YarnRotaryEmbedding(
+        64,
+        163840,
+        10000,
+        scaling_factor=1.0,
+        original_max_position_embeddings=4096,
+        beta_fast=32,
+        beta_slow=1,
+        mscale=0.707,
+        mscale_all_dim=0.707,
+    )
+    half_rope_dim = 64 // 2
+    cos_cache = rotary_emb.cos_cached[:, :half_rope_dim]
+    sin_cache = rotary_emb.sin_cached[:, :half_rope_dim]
+    # cos sin cache must be float32
+    cos_sin_cache = (
+        torch.cat([cos_cache, sin_cache], dim=-1)
+        .contiguous()
+        .to(device)
+        .to(torch.float32)
+    )
+    return cos_sin_cache
+
+
+class RecordingSparseMlaImpl(MlaImplBase):
+    def __init__(self, attn_inputs, output: torch.Tensor):
+        self.attn_inputs = attn_inputs
+        self.output = output
+        self.fmha_params = object()
+        self.cp_params = object()
+        self.calls = []
+
+    @staticmethod
+    def support(attn_configs, attn_inputs) -> bool:
+        return True
+
+    @staticmethod
+    def is_sparse() -> bool:
+        return True
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: Optional[LayerKVCache],
+        layer_id: int,
+        topk_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        self.calls.append((q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices))
+        if (
+            self.attn_inputs.cache_store_inputs is not None
+            and self.attn_inputs.cache_store_writer is not None
+        ):
+            self.attn_inputs.cache_store_writer.write(
+                self.attn_inputs.cache_store_inputs, kv_cache
+            )
+        return self.output
+
+
+def make_sparse_routing_attention():
+    attention = object.__new__(MlaAttention)
+    torch.nn.Module.__init__(attention)
+    topk_indices = torch.tensor([[1]], dtype=torch.int32)
+    attention.indexer = Mock(return_value=topk_indices)
+    attention.q_lora_rank = 0
+    attention.num_heads = 1
+    attention.attn_config = SimpleNamespace(size_per_head=2)
+    attention.q_head_dim = 2
+    attention.kv_lora_rank = 1
+    attention.qk_rope_head_dim = 1
+    attention.v_head_dim = 2
+    attention.layer_idx = 0
+    attention.fused_qkv_proj = Mock(
+        return_value=torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+            dtype=torch.float32,
+        )
+    )
+    attention.kv_a_layernorm = Mock(side_effect=lambda value: value)
+    attention.o_proj = Mock(side_effect=lambda value: value)
+    attention.parallelism_config = SimpleNamespace(get_attn_tp_size=lambda: 1)
+    return attention, topk_indices
+
+
+class SparseMlaRoutingTest(TestCase):
+    def setUp(self) -> None:
+        self.default_cache = LayerKVCache(
+            torch.ones(8, dtype=torch.uint8), 64, 0, "default"
+        )
+        self.indexer_cache = LayerKVCache(
+            torch.ones(8, dtype=torch.uint8) * 2, 64, 0, "indexer_kv"
+        )
+
+    @staticmethod
+    def _attention_inputs(tag: str):
+        return SimpleNamespace(
+            is_prefill=True,
+            cache_store_inputs=SimpleNamespace(tag=tag),
+            cache_store_writer=Mock(),
+        )
+
+    def test_sparse_forward_routes_exact_caches_independent_of_order(self):
+        attention, topk_indices = make_sparse_routing_attention()
+        default_inputs = self._attention_inputs("default")
+        indexer_inputs = self._attention_inputs("indexer_kv")
+        default_impl = RecordingSparseMlaImpl(
+            default_inputs, torch.tensor([[[9.0, 10.0]], [[11.0, 12.0]]])
+        )
+        indexer_impl = RecordingSparseMlaImpl(indexer_inputs, torch.empty(0))
+        fmha_routes = {"indexer_kv": indexer_impl, "default": default_impl}
+        cache_routes = {
+            "indexer_kv": self.indexer_cache,
+            "default": self.default_cache,
+        }
+
+        output = attention(
+            torch.zeros((2, 4), dtype=torch.float32), fmha_routes, cache_routes
+        )
+
+        self.assertTrue(torch.equal(output, torch.tensor([[9.0, 10.0], [11.0, 12.0]])))
+        self.assertEqual(len(default_impl.calls), 1)
+        _, compressed_kv, k_pe, cache, layer_id, observed_topk = default_impl.calls[0]
+        self.assertEqual(tuple(compressed_kv.shape), (2, 1))
+        self.assertEqual(tuple(k_pe.shape), (2, 1))
+        self.assertIs(cache, self.default_cache)
+        self.assertEqual(layer_id, 0)
+        self.assertIs(observed_topk, topk_indices)
+        default_inputs.cache_store_writer.write.assert_called_once_with(
+            default_inputs.cache_store_inputs, self.default_cache
+        )
+
+        attention.indexer.assert_called_once()
+        indexer_args = attention.indexer.call_args.args
+        self.assertIs(indexer_args[2], self.indexer_cache)
+        self.assertIs(indexer_args[3], indexer_impl.fmha_params)
+        self.assertIs(indexer_args[4], indexer_inputs)
+        indexer_inputs.cache_store_writer.write.assert_called_once_with(
+            indexer_inputs.cache_store_inputs, self.indexer_cache
+        )
+
+    def test_sparse_forward_rejects_missing_extra_and_wrong_routes(self):
+        default_impl = RecordingSparseMlaImpl(
+            self._attention_inputs("default"), torch.zeros((2, 1, 2))
+        )
+        indexer_impl = RecordingSparseMlaImpl(
+            self._attention_inputs("indexer_kv"), torch.empty(0)
+        )
+        valid_fmha = {"default": default_impl, "indexer_kv": indexer_impl}
+        valid_cache = {
+            "default": self.default_cache,
+            "indexer_kv": self.indexer_cache,
+        }
+        invalid_routes = (
+            ({"default": default_impl}, valid_cache),
+            ({**valid_fmha, "extra": indexer_impl}, valid_cache),
+            ({"default": default_impl, "wrong": indexer_impl}, valid_cache),
+            (valid_fmha, {"default": self.default_cache}),
+            (valid_fmha, {**valid_cache, "extra": self.indexer_cache}),
+            (
+                valid_fmha,
+                {"default": self.default_cache, "wrong": self.indexer_cache},
+            ),
+        )
+
+        for fmha_routes, cache_routes in invalid_routes:
+            attention, _ = make_sparse_routing_attention()
+            with self.subTest(
+                fmha_tags=list(fmha_routes), cache_tags=list(cache_routes)
+            ):
+                with self.assertRaisesRegex(RuntimeError, "requires exactly"):
+                    attention(
+                        torch.zeros((2, 4), dtype=torch.float32),
+                        fmha_routes,
+                        cache_routes,
+                    )
+                attention.fused_qkv_proj.assert_not_called()
+
+    def test_sparse_forward_skips_indexer_for_cacheless_warmup(self):
+        attention, _ = make_sparse_routing_attention()
+        default_inputs = SimpleNamespace(
+            is_prefill=True, cache_store_inputs=None, cache_store_writer=None
+        )
+        indexer_cache_store_writer = Mock()
+        indexer_inputs = SimpleNamespace(
+            is_prefill=True,
+            cache_store_inputs=object(),
+            cache_store_writer=indexer_cache_store_writer,
+        )
+        default_impl = RecordingSparseMlaImpl(
+            default_inputs, torch.tensor([[[9.0, 10.0]], [[11.0, 12.0]]])
+        )
+        indexer_impl = RecordingSparseMlaImpl(indexer_inputs, torch.empty(0))
+
+        output = attention(
+            torch.zeros((2, 4), dtype=torch.float32),
+            {"default": default_impl, "indexer_kv": indexer_impl},
+            None,
+        )
+
+        self.assertTrue(torch.equal(output, torch.tensor([[9.0, 10.0], [11.0, 12.0]])))
+        self.assertIs(default_impl.calls[0][3], None)
+        self.assertIs(default_impl.calls[0][5], None)
+        attention.indexer.assert_not_called()
+        indexer_cache_store_writer.write.assert_not_called()
+
+
+class MLATest(TestCase):
+    NUM_TOKENS = [7]
+    HIDDEN_SIZES = [2048]
+    PAGE_SIZE = [64]
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            raise SkipTest("CUDA is not available")
+        torch.set_default_device(device)
+
+    def _run_mla_test(self, num_tokens: int, hidden_size: int, page_size: int):
+        sequence_lengths = [2]
+
+        batch_size = len(sequence_lengths)
+        num_tokens = len(sequence_lengths)
+
+        seq_page_sizes = [math.ceil(x / page_size) for x in sequence_lengths]
+        kvcache_block_id = torch.zeros(
+            [batch_size, max(seq_page_sizes)],
+            dtype=torch.int32,
+            device=torch.device("cpu"),
+        )
+        bias = 1
+        for i in range(batch_size):
+            kvcache_block_id[i, : seq_page_sizes[i]] = torch.arange(
+                bias,
+                bias + seq_page_sizes[i],
+                dtype=torch.int32,
+                device=torch.device("cpu"),
+            )
+            bias += seq_page_sizes[i]
+
+        self.config = ModelConfig()
+        self.config.attn_config.head_num = 16
+        self.config.num_layers = 27
+        self.config.max_seq_len = 1024
+        self.config.vocab_size = 102400
+        self.config.attn_config.size_per_head = 192
+        self.config.hidden_size = hidden_size
+        self.config.attn_config.nope_head_dim = 128
+        self.config.attn_config.rope_head_dim = 64
+        self.config.attn_config.kv_lora_rank = 512
+        self.config.attn_config.v_head_dim = 128
+        self.config.attn_config.q_lora_rank = 0
+        self.config.attn_config.tokens_per_block = 64
+        self.config.attn_config.kernel_tokens_per_block = 64
+        self.config.attn_config.softmax_extra_scale = 1.0
+        self.config.attn_config.use_mla = True
+        self.config.quant_config = None
+        self.parallelism_config = ParallelismConfig()
+        self.parallelism_config.tp_size = 1
+        self.parallelism_config.tp_rank = 0
+
+        torch.manual_seed(0)
+        sequence_lengths_mius_1 = [x - 1 for x in sequence_lengths]
+        sequence_lengths_t = torch.tensor(
+            sequence_lengths_mius_1, dtype=torch.int32, device=torch.device("cpu")
+        )
+        prefix_lengths_t = torch.zeros(
+            len(sequence_lengths_t) - len(sequence_lengths) + 1,
+            dtype=torch.int32,
+            device=torch.device("cpu"),
+        )
+
+        attn_inputs: PyAttentionInputs = PyAttentionInputs()
+        attn_inputs.is_prefill = True
+        attn_inputs.prefix_lengths = prefix_lengths_t
+        attn_inputs.sequence_lengths = torch.tensor(
+            [], dtype=torch.int32, device=torch.device("cpu")
+        )
+        attn_inputs.input_lengths = sequence_lengths_t
+        attn_inputs.kv_cache_block_id = kvcache_block_id
+        attn_inputs.kv_cache_block_id_device = kvcache_block_id.to(device)
+        attn_inputs.kv_cache_kernel_block_id = kvcache_block_id
+        attn_inputs.kv_cache_kernel_block_id_device = kvcache_block_id.to(device)
+
+        weights = {}
+        weights[W.mla_fusedqkrope_no_lora_w] = torch.randn(
+            [
+                self.config.hidden_size,
+                self.config.attn_config.size_per_head * self.config.attn_config.head_num
+                + self.config.attn_config.kv_lora_rank
+                + self.config.attn_config.rope_head_dim,
+            ],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        weights[W.mla_kv_a_ln_gamma] = torch.randn(
+            [self.config.attn_config.kv_lora_rank], dtype=torch.bfloat16, device=device
+        )
+
+        weights[W.mla_kc] = torch.randn(
+            [
+                self.config.attn_config.head_num,
+                self.config.attn_config.nope_head_dim,
+                self.config.attn_config.kv_lora_rank,
+            ],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        weights[W.mla_vc] = torch.randn(
+            [
+                self.config.attn_config.head_num,
+                self.config.attn_config.kv_lora_rank,
+                self.config.attn_config.v_head_dim,
+            ],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        weights[W.mla_kv_b_w] = torch.randn(
+            [
+                self.config.attn_config.kv_lora_rank,
+                self.config.attn_config.head_num
+                * (
+                    self.config.attn_config.nope_head_dim
+                    + self.config.attn_config.v_head_dim
+                ),
+            ],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        weights[W.attn_o_w] = torch.randn(
+            [
+                self.config.attn_config.head_num * self.config.attn_config.v_head_dim,
+                self.config.hidden_size,
+            ],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        layer_weights: List[Dict[str, torch.Tensor]] = []
+        layer_weights.append(weights)
+
+        attn_configs = self.config.getAttentionConfigs(
+            self.parallelism_config.get_attn_tp_size()
+        )
+        fmha_impl = MlaFlashInferPrefillImpl(
+            attn_configs,
+            attn_inputs,
+            layer_weights,
+            create_cos_sin_cache(),
+            quant_config=self.config.quant_config,
+        )
+        deepseekv2_mla = MlaAttention(
+            self.config.attn_config,
+            self.parallelism_config,
+            weights,
+            0,
+            self.config.layernorm_eps,
+            self.config.quant_config,
+        )
+        kv_cache: Optional[KVCache] = None
+        deepseekv2_mla_ref = MlaAttentionRef(
+            self.config.attn_config,
+            weights,
+            0,
+            self.config.layernorm_eps,
+            self.config.quant_config,
+        )
+
+        hidden = torch.randn(
+            [num_tokens, self.config.hidden_size],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        out = deepseekv2_mla(hidden, fmha_impl, kv_cache)
+        out_ref = deepseekv2_mla_ref(hidden)
+
+        out_norm = out / (torch.norm(out) + 1e-8)
+        out_ref_norm = out_ref / (torch.norm(out_ref) + 1e-8)
+        self.assertTrue(torch.allclose(out_norm, out_ref_norm, atol=0.01, rtol=0.01))
+
+        out_flat = out.flatten()
+        out_ref_flat = out_ref.flatten()
+        # 计算余弦相似度
+        cosine_sim = F.cosine_similarity(
+            out_flat.unsqueeze(0), out_ref_flat.unsqueeze(0), dim=1
+        )
+        self.assertTrue(
+            torch.allclose(
+                torch.tensor(1.0).to(device).to(cosine_sim.dtype),
+                cosine_sim,
+                atol=0.01,
+                rtol=0.01,
+            )
+        )
+
+    def test_mlp(self):
+        for params in itertools.product(
+            self.NUM_TOKENS, self.HIDDEN_SIZES, self.PAGE_SIZE
+        ):
+            with self.subTest(
+                num_tokens=params[0], hidden_size=params[1], page_size=params[2]
+            ):
+                self._run_mla_test(*params)
+
+
+if __name__ == "__main__":
+    main()

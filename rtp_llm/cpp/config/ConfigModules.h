@@ -1,0 +1,714 @@
+#pragma once
+#include <optional>
+#include <string>
+#include <sstream>
+#include <map>
+#include <vector>
+#include "rtp_llm/cpp/config/MMTransportMode.h"
+#include "rtp_llm/cpp/config/RoleTypes.h"
+#include "rtp_llm/cpp/config/RdmaConfig.h"
+#include "rtp_llm/models_py/bindings/core/Types.h"
+
+namespace rtp_llm {
+
+/** NCCL communication config (ip + ports). Aligns with Python NcclCommConfig. */
+struct NcclCommConfig {
+    std::string master_ip   = "";
+    int64_t     tp_port     = 0;
+    int64_t     dp_tp_port  = 0;
+    int64_t     ffn_tp_port = 0;
+    std::string to_string() const;
+};
+
+enum class CPRotateMethod {
+    DISABLED                = 0,
+    ALL_GATHER              = 1,
+    ALL_GATHER_WITH_OVERLAP = 2,
+    ALLTOALL                = 3,
+    PREFILL_CP              = 4,
+    UNKNOWN                 = 5,
+};
+struct PrefillCPConfig {
+    CPRotateMethod method           = CPRotateMethod::DISABLED;
+    size_t         comm_buffer_size = 512 * 1024 * 1024;  // 512MB
+    // When true + tp_size > 1, KV cache uses page-level round-robin sharding
+    // across the CP (== TP) group. Each rank physically holds only owned blocks
+    // (block_idx % cp_size == cp_rank); see rtp_llm/cpp/cache/CPSlotMapper.h.
+    bool kv_cache_sharded = false;
+    // Explicit prefill CP size for decode-side fixed/SWA ring sizing; 0 = unset.
+    int64_t prefill_cp_size = 0;
+    bool    is_enabled() const {
+        return method != CPRotateMethod::DISABLED && method != CPRotateMethod::UNKNOWN
+               && method != CPRotateMethod::PREFILL_CP;
+    }
+    bool is_prefill_enabled() const {
+        return method == CPRotateMethod::PREFILL_CP;
+    }
+    std::string to_string() const;
+};
+struct FfnDisAggregateConfig {
+    bool        enable_ffn_disaggregate = false;
+    int         attention_tp_size       = 1;
+    int         attention_dp_size       = 1;
+    int         ffn_tp_size             = 1;
+    int         ffn_dp_size             = 1;
+    bool        is_ffn_rank             = false;
+    std::string to_string() const;
+    bool        is_ffn_service() const {
+        return enable_ffn_disaggregate && is_ffn_rank;
+    }
+};
+
+struct ParallelismConfig {
+    int64_t tp_size          = 1;
+    int64_t ep_size          = 1;
+    int64_t dp_size          = 1;
+    int64_t pp_size          = 1;
+    int64_t world_size       = 1;
+    int64_t world_rank       = 0;
+    int64_t local_world_size = 1;
+    int64_t local_rank       = 0;
+    int64_t ffn_sp_size      = 1;
+    int64_t tp_rank          = 0;
+    int64_t ep_rank          = 0;
+    int64_t dp_rank          = 0;
+    int64_t ffn_tp_size      = 1;
+    int64_t ffn_tp_rank      = 0;
+    bool    enable_sp        = false;
+    bool    use_ub_comm      = false;
+
+    // Mirror of py_env_configs.role_config.role_type, plumbed in
+    // engine_config.setup_engine_config so model construction (e.g.
+    // DeepSeekV4Model's mega-MoE token bound cap) does not have to read
+    // os.environ["ROLE_TYPE"] anymore.
+    RoleType role_type = RoleType::PDFUSION;
+
+    FfnDisAggregateConfig ffn_disaggregate_config;  // FFN disaggregate configuration
+
+    // Context Parallel configuration
+    PrefillCPConfig prefill_cp_config;
+
+    int64_t get_attn_tp_size() const {
+        return prefill_cp_config.is_enabled() ? 1 : tp_size;
+    }
+    int64_t get_attn_tp_rank() const {
+        return prefill_cp_config.is_enabled() ? 0 : tp_rank;
+    }
+    int64_t get_ffn_tp_size() const {
+        return prefill_cp_config.is_enabled() ? 1 : ffn_tp_size;
+    }
+    int64_t get_ffn_tp_rank() const {
+        return prefill_cp_config.is_enabled() ? 0 : ffn_tp_rank;
+    }
+    std::string to_string() const;
+};
+
+struct ConcurrencyConfig {
+    bool        concurrency_with_block = false;
+    int         concurrency_limit      = 32;
+    std::string to_string() const;
+};
+
+enum class FMHAType {
+    FLASH_INFER,
+    NONE,
+    OPEN_SOURCE,
+    PAGED_OPEN_SOURCE,
+    PAGED_FLASHINFER_TRT_FMHA_V2,
+    FLASHINFER_TRT_FMHA_V2,
+    XQA,
+    AITER_PREFILL,
+    AITER_ASM_PREFILL,
+    AITER_PAGED_PREFILL,
+    AITER_DECODE,
+    AITER_ASM_DECODE,
+    AITER_TRITON_DECODE,
+    PY_FLASHINFER_PREFILL_PAGED,
+    PY_FLASHINFER_PREFILL_RAGGED,
+    PY_FLASHINFER_DECODE,
+    FLASHINFER_MLA_PREFILL,
+    FLASHINFER_MLA_DECODE,
+    SPARSE_FLASHMLA,
+    CP_FLASH_INFER,
+    CP_SPARSE_FLASHMLA,
+    HEADWISE,
+};
+
+struct FMHAConfig {
+    bool enable_fmha                         = true;
+    bool enable_flashinfer_trtllm_gen        = true;
+    bool enable_flashinfer_trt_fmha_v2       = true;
+    bool enable_paged_flashinfer_trt_fmha_v2 = true;
+    bool enable_open_source_fmha             = true;
+    bool enable_paged_open_source_fmha       = true;
+    bool disable_flashinfer_native           = false;
+    bool disable_flashinfer_hybrid_prefill   = true;
+    bool enable_xqa                          = true;
+    bool use_aiter_pa                        = true;
+    bool use_asm_pa                          = true;
+    // Default off: Triton PA on ROCm regressed vs ASM PA after the rocm_impl
+    // refactor. Set to true to select Triton for decode and no-prefix prefill;
+    // the latter is the ROCm generation-prefill graph-capable backend.
+    bool        use_triton_pa  = false;
+    int64_t     absorb_opt_len = 1024;
+    std::string to_string() const;
+};
+
+constexpr double kDefaultDeviceLowWatermarkRatio  = 0.82;
+constexpr double kDefaultDeviceHighWatermarkRatio = 0.90;
+constexpr double kDefaultMemoryLowWatermarkRatio  = 0.90;
+constexpr double kDefaultMemoryHighWatermarkRatio = 0.94;
+constexpr double kDefaultDiskLowWatermarkRatio    = 0.92;
+constexpr double kDefaultDiskHighWatermarkRatio   = 0.97;
+
+struct KVCacheConfig {
+    bool                                    reuse_cache           = false;
+    std::string                             multi_task_prompt     = "";
+    std::string                             multi_task_prompt_str = "";
+    std::map<std::string, std::vector<int>> multi_task_prompt_tokens;
+    int64_t                                 reserve_block_ratio                             = 5;
+    int                                     max_block_size_per_item                         = 16;
+    int64_t                                 memory_cache_size_mb                            = 0;
+    int64_t                                 memory_cache_sync_timeout_ms                    = 10000;
+    std::string                             disk_cache_paths                                = "";
+    int64_t                                 disk_cache_size_mb                              = 0;
+    bool                                    disk_cache_buffered_io                          = true;
+    int64_t                                 disk_cache_sync_timeout_ms                      = 30000;
+    int64_t                                 disk_cache_staging_block_count                  = 128;
+    int64_t                                 memory_cache_max_descriptors_per_transfer_batch = 8;
+    int64_t                                 block_tree_transfer_worker_count                = 4;
+    int64_t                                 block_tree_business_queue_max_size              = 10000;
+    int64_t                                 block_tree_transfer_queue_max_size              = 10000;
+    double block_tree_device_evict_low_watermark_ratio  = kDefaultDeviceLowWatermarkRatio;
+    double block_tree_device_evict_high_watermark_ratio = kDefaultDeviceHighWatermarkRatio;
+    double block_tree_memory_evict_low_watermark_ratio  = kDefaultMemoryLowWatermarkRatio;
+    double block_tree_memory_evict_high_watermark_ratio = kDefaultMemoryHighWatermarkRatio;
+    double block_tree_disk_evict_low_watermark_ratio    = kDefaultDiskLowWatermarkRatio;
+    double block_tree_disk_evict_high_watermark_ratio   = kDefaultDiskHighWatermarkRatio;
+    int    linear_step                                  = 1;  // for linear attention cache reuse
+    // Fields merged from PyKvCacheConfig
+    int fp8_kv_cache = 0;
+    // "auto" preserves a model-declared recurrent-state dtype. Models
+    // without such a declaration keep LinearAttentionConfig's BF16 default;
+    // the legacy remote connector falls back to BF16 because it requires one
+    // contiguous shared cache pool.
+    std::string ssm_state_dtype           = "auto";
+    int64_t     kv_cache_mem_mb           = -1;
+    int         seq_size_per_block        = 0;
+    int         kernel_seq_size_per_block = 0;
+    int         test_block_num            = 0;
+    int         use_block_cache           = -1;  // -1 means not set, use Optional<int> equivalent
+    bool        enable_device_cache       = true;
+    bool        enable_memory_cache       = false;
+    bool        enable_disk_cache         = false;
+    bool        enable_remote_cache       = false;
+    std::string device_eviction_policy    = "lru";
+    std::string memory_eviction_policy    = "lru";
+    std::string disk_eviction_policy      = "fifo";
+
+    // DSV4 fixed-allocation pool block count. 0 means the fixed regions
+    // (INDEXER_STATE / CSA_STATE / HCA_STATE / SWA_KV) use the normal
+    // linear-step-derived block count.
+    uint32_t dsv4_fixed_pool_blocks = 0;
+
+    // Optional DSV4 HCA_STATE pool block count override. 0 means HCA_STATE
+    // follows dsv4_fixed_pool_blocks or the normal linear-step-derived count.
+    uint32_t dsv4_hca_state_pool_blocks = 0;
+
+    // DSV4 fixed-pool residency switch. false = GPU BlockPool; true = pinned
+    // CPU BlockPool for INDEXER_STATE / CSA_STATE / HCA_STATE / SWA_KV.
+    bool dsv4_fixed_pool_use_memory = false;
+
+    // HBM cache event publishing. Only tp_rank=0 with pp_size=1 creates an active publisher for each DP replica.
+    std::string kv_cache_event_publisher_type   = "none";  // none | kvcm
+    std::string kv_cache_event_manager_endpoint = "";      // KVCM Meta HTTP endpoint
+    std::string kv_cache_event_instance_group   = "";
+    std::string kv_cache_event_instance_id      = "";
+    std::string kv_cache_event_host_ip_port     = "";
+    // BlockTreeCache FULL prefix invariant scanner; interval 0 disables the scanner thread.
+    // Batch size and detail cap are scanner-internal constants, not user-tunable.
+    int64_t block_tree_full_prefix_scan_interval_ms = 0;
+
+    // KVCM storage backend configuration fields
+    bool        kvcm_enable_vipserver                = false;
+    std::string kvcm_vipserver_domain                = "";
+    std::string kvcm_server_address                  = "";
+    std::string kvcm_instance_group                  = "default";
+    uint32_t    kvcm_meta_channel_retry_time         = 3;
+    uint32_t    kvcm_meta_channel_connection_timeout = 6000;
+    uint32_t    kvcm_meta_channel_call_timeout       = 1500;
+    uint32_t    kvcm_storage_thread_num              = 4;
+    uint32_t    kvcm_storage_queue_size              = 2000;
+    int         kvcm_put_timeout_ms                  = 12000;
+    int         kvcm_get_timeout_ms                  = 12000;
+    std::string kvcm_model_sdk_config                = R"([{"type":"local","sdk_log_level":"DEBUG"}])";
+    std::string kvcm_model_user_data                 = "";
+    std::string kvcm_model_extra_info                = "";
+    std::string kvcm_instance_id_salt                = "";
+    size_t      kvcm_asyncwrapper_thread_num         = 16;
+    size_t      kvcm_asyncwrapper_queue_size         = 1000;
+    int         kvcm_get_broadcast_timeout           = 15000;
+    int         kvcm_put_broadcast_timeout           = 15000;
+    std::string kvcm_client_config                   = "";
+    void        insertMultiTaskPromptTokens(std::string task_id, std::vector<int64_t> tokens_id);
+    std::string to_string() const;
+};
+
+struct ProfilingDebugLoggingConfig {
+    bool        trace_memory              = false;
+    bool        enable_device_perf        = false;
+    bool        ft_core_dump_on_exception = false;
+    std::string ft_alog_conf_path         = "";
+    bool        gen_timeline_sync         = false;
+    int         timeline_start_step       = 0;
+    int         timeline_num_steps        = 3;
+    std::string timeline_trace_name       = "profiler";
+    std::string torch_cuda_profiler_dir   = "";
+    int         log_file_backup_count     = 16;
+    bool        debug_load_server         = false;
+    int         hack_layer_num            = 0;
+    bool        debug_start_fake_process  = false;
+    bool        enable_detail_log         = false;
+    bool        check_nan                 = false;
+    bool        enable_model_inputs_log   = false;
+
+    std::string to_string() const;
+};
+
+struct HWKernelConfig {
+    static constexpr int kGenerationPrefillCudaGraphMaxCaptureTokens = 1 << 20;
+    // Every bucket retains a whole-model device graph and its graph-owned
+    // allocations. Keep malformed list/range/file input from turning startup
+    // into an unbounded capture loop; production presets use only seven.
+    static constexpr int kGenerationPrefillCudaGraphMaxCaptureBuckets = 64;
+    // The generation-prefill attention backend receives one additional
+    // positive-length padding-sentinel row. CUDA's graph-safe paged-attention
+    // plan is a single-CTA kernel with at most 1024 rows, so real requests must
+    // stay at or below 1023.
+    static constexpr int kGenerationPrefillCudaGraphMaxRequests = 1023;
+
+    int         deep_gemm_num_sm             = -1;
+    bool        arm_gemm_use_kai             = false;
+    bool        enable_multi_block_mode      = true;
+    bool        ft_disable_custom_ar         = true;
+    std::string rocm_hipblaslt_config        = "gemm_config.csv";
+    bool        use_swizzleA                 = false;
+    bool        enable_cuda_graph            = false;
+    bool        enable_cuda_graph_debug_mode = false;
+    // Generation-prefill graph is enabled only when the CUDA graph master
+    // switch is on and this capture bucket list is explicitly configured.
+    int              generation_prefill_cuda_graph_max_requests = 1;
+    std::vector<int> generation_prefill_capture_token_buckets;
+    bool             enable_native_cuda_graph = false;
+    int              num_native_cuda_graph    = 200;
+    // Prefill CUDA Graph capture configuration
+    // Can be set via: prefill_capture_file_path, prefill_capture_seq_lens, or prefill_capture_max_seq_len + step
+    std::vector<int> prefill_capture_seq_lens;
+    // Decode CUDA Graph capture configuration
+    // Comma-separated list of batch sizes, e.g., "1,2,4,8,16,32"
+    std::vector<int> decode_capture_batch_sizes;
+    bool             disable_dpc_random     = false;
+    bool             rocm_disable_custom_ag = true;
+    std::string      to_string() const;
+};
+
+struct DeviceResourceConfig {
+    int         overlap_math_sm_count    = 0;
+    int         overlap_comm_type        = 0;
+    int         m_split                  = 0;
+    bool        enable_comm_overlap      = true;
+    int         enable_layer_micro_batch = 0;
+    std::string to_string() const;
+};
+
+struct MoeConfig {
+    bool        use_deepep_moe             = false;
+    bool        use_deepep_internode       = false;
+    bool        use_deepep_low_latency     = true;
+    bool        use_deepep_p2p_low_latency = false;
+    bool        use_mori_ep                = false;
+    bool        fake_balance_expert        = false;
+    bool        hack_moe_expert            = false;
+    int         deep_ep_num_sm             = 0;
+    int         masked_max_token_num       = 256;
+    bool        use_all_gather             = false;
+    int         ll_num_max_token           = 0;
+    std::string moe_strategy               = "auto";
+    std::string fp4_moe_op                 = "auto";
+    std::string to_string() const;
+};
+
+struct ModelSpecificConfig {
+    std::string to_string() const;
+};
+
+enum SpeculativeType {
+    SP_TYPE_NONE          = 0,  // Not enabled (empty string or "none")
+    SP_TYPE_VANILLA       = 1,  // Classic speculative sampling
+    SP_TYPE_MTP           = 2,  // Multi-token prediction (DeepSeek-V3)
+    SP_TYPE_EAGLE3        = 3,  // EAGLE-3
+    SP_TYPE_EAGLE         = 4,  // EAGLE
+    SP_TYPE_DETERMINISTIC = 5,  // Deterministic (Prompt-Lookup)
+    SP_TYPE_DSPARK        = 6   // DSpARK block-diffusion draft
+};
+
+struct SpeculativeExecutionConfig {
+    std::string     model_type                    = "";
+    SpeculativeType type                          = SP_TYPE_NONE;
+    int64_t         sp_min_token_match            = 2;
+    int64_t         sp_max_token_match            = 2;
+    std::string     tree_decode_config            = "";
+    int64_t         gen_num_per_cycle             = 1;
+    bool            force_stream_sample           = false;
+    bool            force_score_context_attention = true;
+    std::string     quantization                  = "";
+    std::string     checkpoint_path               = "";
+    // DSpARK noise/mask token used to build each fixed-width draft block.
+    // Filled from the draft checkpoint by ModelFactory.
+    int64_t sp_dspark_mask_token_id = -1;
+    // True: gamma query rows, including the anchor prediction. False:
+    // one conditioning anchor followed by gamma prediction rows.
+    bool        sp_dspark_sample_from_anchor = true;
+    std::string to_string() const;
+    size_t      speculativeReserveStep() const;
+
+    // Helper functions for enum conversion
+    static SpeculativeType from_string(const std::string& str);
+    static std::string     to_string(SpeculativeType type);
+};
+
+struct MMControlConfig {
+    // Best-effort release RPC deadline.
+    int64_t release_timeout_ms = 1000;
+};
+
+struct MMTransportConfig {
+    std::string     mode = kMMTransportModeGrpc;
+    MMControlConfig control;
+    RdmaConfig      rdma;
+    // LLM-to-ViT RPC budget when no request input sets mm_timeout_ms.
+    int64_t default_rpc_timeout_ms = 125 * 1000;
+    // Let the ViT worker return its structured timeout before the client deadline.
+    int64_t rpc_timeout_margin_ms = 5 * 1000;
+};
+
+struct VitConfig {
+    VitSeparation     vit_separation = VitSeparation::VIT_SEPARATION_LOCAL;
+    MMTransportConfig output_transport;
+
+    std::string to_string() const;
+};
+
+struct CacheStoreConfig {
+    bool    cache_store_rdma_mode         = false;
+    int     wrr_available_ratio           = 80;
+    int     rank_factor                   = 0;
+    int     thread_count                  = 32;
+    int     rdma_connect_timeout_ms       = 250;
+    int     rdma_qp_count_per_connection  = 2;
+    int     rdma_io_thread_count          = 4;
+    int     rdma_worker_thread_count      = 2;
+    int     messager_io_thread_count      = 2;
+    int     messager_worker_thread_count  = 32;
+    int64_t rdma_transfer_wait_timeout_ms = 180 * 1000;  // RDMA 传输完成最大等待超时时间，默认 180 秒
+    int rdma_max_block_pairs_per_connection = 0;  // 每条 RDMA 连接可处理的最大 block_pair 数量，0 表示不限制
+    int64_t p2p_read_steal_before_deadline_ms =
+        250;  // Decode read：在此距 deadline 时从 recv store steal，阻止新 transfer 匹配
+    int64_t p2p_read_return_before_deadline_ms = 100;  // Decode read 与 Prefill send：transfer 层 deadline / worker
+                                                       // 须在 D 前该毫秒数完成（与对端 recv/send 对齐）
+    int64_t p2p_transfer_not_done_resource_hold_ms =
+        10 * 1000;  // Scheduler：TRANSFER_NOT_DONE 后延迟 done 以保留显存安全窗口
+
+    int     p2p_resource_store_timeout_check_interval_ms = 100;
+    int64_t p2p_layer_cache_buffer_store_timeout_ms      = 100 * 1000;
+    int64_t p2p_cancel_broadcast_timeout_ms              = 1000;
+    int     cache_store_tcp_anet_rpc_thread_num          = 3;
+    int     cache_store_tcp_anet_rpc_queue_num           = 100;
+
+    std::string to_string() const;
+};
+
+struct BatchDecodeSchedulerConfig {
+    int64_t batch_decode_scheduler_batch_size = 1;
+    // 0: use decode warmup, others: use prefill warmup
+    int64_t     batch_decode_scheduler_warmup_type = 0;
+    std::string to_string() const;
+};
+
+enum class PDFusionSchedulerMode {
+    DEFAULT = 0,
+    RATIO   = 1,
+    UNKNOWN = 2,
+};
+
+PDFusionSchedulerMode parsePDFusionSchedulerMode(const std::string& mode);
+
+struct FIFOSchedulerConfig {
+    int64_t max_context_batch_size = 1;
+    int64_t max_batch_tokens_size  = 0;
+    // PDFUSION scheduler mode. Supported values:
+    //   ""      -> default FIFO/decode-first scheduler
+    //   "ratio" -> PDFusionRatioScheduler with decode_prefill_ratio
+    std::string pdfusion_scheduler_mode = "";
+    // PDFusionRatioScheduler cadence knob, as a decode:prefill round ratio string.
+    //   "0"   -> always try PREFILL first when a waiting stream exists.
+    //   "N"   -> 1 prefill : N decode (decode-heavy); "1" = strict alternation.
+    //   "1/X" -> X prefill : 1 decode (prefill-heavy).
+    //   invalid input falls back to "1".
+    std::string decode_prefill_ratio           = "1";
+    bool        cp_force_single_prefill        = true;
+    int64_t     max_inited_kv_cache_streams    = 0;
+    int64_t     max_batch_tokens_without_cache = 0;
+    std::string to_string() const;
+};
+
+struct GrammarConfig {
+    bool constrained_json_disable_any_whitespace = false;
+    // Service-level xgrammar matcher policy. Requests cannot override it.
+    bool terminate_without_stop_token = false;
+    // Threads used by one grammar compile. <=0 is resolved by Python from this rank's CPU share.
+    int num_workers = 0;
+    // Positive wall-clock budget a caller waits for a compile. Non-positive values are rejected.
+    int compile_timeout_ms = 2000;
+    // Positive number of grammar compiles that may run concurrently in this engine process.
+    int compile_concurrency = 1;
+    // Positive number of distinct compiles that may wait behind running work.
+    int         compile_queue_size = 2;
+    std::string tokenizer_info_json;
+    // Total byte cap split between xgrammar's cache and the engine verdict LRU; <=0 = unlimited.
+    int64_t     compiler_cache_bytes = 2L * 1024L * 1024L * 1024L;
+    std::string to_string() const;
+};
+
+struct RuntimeConfig {
+    int64_t max_generate_batch_size = 1;
+
+    int64_t max_block_size_per_item = 16;
+
+    int64_t reserve_runtime_mem_mb = 0;
+    bool    warm_up                = false;
+    bool    warm_up_with_loss      = false;
+    bool    model_warm_up          = true;
+
+    int output_dispatcher_worker_count = 0;
+
+    // Scheduler configuration
+    bool                       use_batch_decode_scheduler = false;
+    BatchDecodeSchedulerConfig batch_decode_scheduler_config;
+    FIFOSchedulerConfig        fifo_scheduler_config;
+
+    std::string              model_name = "";
+    std::vector<std::string> worker_grpc_addrs;
+    std::vector<std::string> worker_addrs;
+
+    // Fields merged from PyDeviceResourceConfig
+    std::string specify_gpu_arch = "";
+
+    std::string to_string() const;
+};
+
+struct PDSepConfig {
+    RoleType role_type                       = RoleType::PDFUSION;
+    bool     cache_store_rdma_mode           = true;
+    int64_t  cache_store_listen_port         = 0;
+    int64_t  cache_store_connect_port        = 0;
+    int64_t  cache_store_rdma_listen_port    = 0;
+    int64_t  cache_store_rdma_connect_port   = 0;
+    int64_t  remote_rpc_server_port          = 0;
+    int64_t  prefill_retry_times             = 0;
+    int64_t  prefill_retry_timeout_ms        = 20;
+    int64_t  prefill_max_wait_timeout_ms     = 600 * 1000;
+    int64_t  decode_retry_times              = 100;
+    int64_t  decode_retry_timeout_ms         = 100;
+    int64_t  decode_retry_interval_ms        = 1;
+    int64_t  decode_polling_kv_cache_step_ms = 30;
+    int64_t  decode_polling_call_prefill_ms  = 30;
+    int64_t  rdma_connect_retry_times        = 0;
+    int64_t  load_cache_timeout_ms           = 5000;
+    int64_t  max_rpc_timeout_ms              = 2 * 3600 * 1000;  // 2h default
+    int64_t  worker_port_offset              = 0;
+    bool     decode_entrance                 = false;
+    // ========== Prefill Thread Pool Configuration ==========
+    // prepare-resource pool size. 0 = concurrency_limit * 2; effective minimum is 128.
+    int64_t prefill_prepare_resource_pool_size = 0;
+    // Max wait time in stopStream() for Engine Loop to call finish_internal().
+    // When GenerateDone is set and stream has no error, stopStream() waits up to
+    // this many ms for Engine Loop's advance() to detect GenerateDone and set FINISHED.
+    int64_t prefill_stop_stream_wait_timeout_ms = 2000;
+
+    std::string to_string() const;
+};
+
+struct MiscellaneousConfig {
+    bool        disable_pdl = true;
+    std::string aux_string  = "";
+    std::string to_string() const;
+};
+
+class ParallelInfo final {
+public:
+    ParallelInfo(int tp_size          = 1,
+                 int pp_size          = 1,
+                 int ep_size          = 1,
+                 int dp_size          = 1,
+                 int world_size       = 1,
+                 int world_rank       = 0,
+                 int local_world_size = 1):
+        tp_size_(tp_size),
+        pp_size_(pp_size),
+        ep_size_(ep_size),
+        dp_size_(dp_size),
+        world_size_(world_size),
+        world_rank_(world_rank),
+        local_world_size_(local_world_size) {}
+
+public:
+    static ParallelInfo& globalParallelInfo() {
+        static ParallelInfo parallel_info;
+        return parallel_info;
+    }
+    void setTpSize(int tp_size) {
+        tp_size_ = tp_size;
+    }
+    int getTpSize() const {
+        return tp_size_;
+    }
+    void setPpSize(int pp_size) {
+        pp_size_ = pp_size;
+    }
+    int getPpSize() const {
+        return pp_size_;
+    }
+    void setDpSize(int dp_size) {
+        dp_size_ = dp_size;
+    }
+    int getDpSize() const {
+        return dp_size_;
+    }
+    void setEpSize(int ep_size) {
+        ep_size_ = ep_size;
+    }
+    int getEpSize() const {
+        return ep_size_;
+    }
+    int getTpRank() const {
+        return world_rank_ % tp_size_;
+    }
+    void setWorldRank(int world_rank) {
+        world_rank_ = world_rank;
+    }
+    int getWorldRank() const {
+        return world_rank_;
+    }
+    int getLocalRank() const {
+        return world_rank_ % local_world_size_;
+    }
+    void setWorldSize(int world_size) {
+        world_size_ = world_size;
+    }
+    int getWorldSize() const {
+        return world_size_;
+    }
+    void setLocalWorldSize(int local_world_size) {
+        local_world_size_ = local_world_size;
+    }
+    int getLocalWorldSize() const {
+        return local_world_size_;
+    }
+    bool isMaster() const {
+        return world_rank_ == 0;
+    }
+    bool isWorker() const {
+        return !isMaster();
+    }
+    std::string toString() const {
+        std::ostringstream oss;
+        oss << "ParallelInfo:[ "
+            << "tp_size=" << tp_size_ << " pp_size=" << pp_size_ << " world_size=" << world_size_
+            << " world_rank=" << world_rank_ << " local_world_size=" << local_world_size_ << " ]";
+        return oss.str();
+    }
+    // only for test
+    void reload() {
+        ParallelismConfig parallelism_config;
+        tp_size_ = parallelism_config.tp_size;
+        // in fact pipeline parallelism is not supported yet
+        pp_size_          = parallelism_config.pp_size;
+        ep_size_          = parallelism_config.ep_size;
+        dp_size_          = parallelism_config.dp_size;
+        world_size_       = parallelism_config.world_size;
+        world_rank_       = parallelism_config.world_rank;
+        local_world_size_ = parallelism_config.local_world_size;
+    }
+
+private:
+    int tp_size_;
+    int pp_size_;
+    int ep_size_;
+    int dp_size_;
+    int world_size_;
+    int world_rank_;
+    int local_world_size_;
+};
+
+struct ArpcConfig {
+    int         threadNum   = 10;
+    int         queueNum    = 50;
+    int         ioThreadNum = 2;
+    std::string to_string() const;
+};
+
+/// Shared ``client_config`` / ``server_config`` maps for gRPC channel options (JSON root keys).
+struct GrpcMapsConfig {
+    std::map<std::string, int> client_config;
+    std::map<std::string, int> server_config;
+    std::map<std::string, int> get_client_config() const {
+        return client_config;
+    }
+    std::map<std::string, int> get_server_config() const {
+        return server_config;
+    }
+};
+
+struct GrpcConfig: GrpcMapsConfig {
+    /// If > 0, passed to gRPC sync server as ``MAX_POLLERS`` (per completion queue).
+    int max_server_pollers = 0;
+    GrpcConfig(){};
+    GrpcConfig(const std::string& json_str);
+    std::string to_string() const;
+    void        from_json(const std::string& json_str);
+};
+
+/// DashSc gRPC (predict_v2.proto) Python client/server channel options.
+struct DashScGrpcConfig: GrpcMapsConfig {
+    int max_server_workers = 4;
+    DashScGrpcConfig(){};
+    DashScGrpcConfig(const std::string& json_str);
+    std::string to_string() const;
+    void        from_json(const std::string& json_str);
+};
+
+struct LinearAttentionConfig {
+    int         linear_conv_kernel_dim = 0;
+    int         linear_key_head_dim    = 0;
+    int         linear_num_key_heads   = 0;
+    int         linear_num_value_heads = 0;
+    int         linear_value_head_dim  = 0;
+    DataType    ssm_state_dtype        = DataType::TYPE_BF16;
+    DataType    conv_state_dtype       = DataType::TYPE_BF16;
+    std::string to_string() const;
+};
+
+enum class HybridAttentionType {
+    NONE,
+    LINEAR,
+    SLIDING_WINDOW,
+};
+
+struct HybridAttentionConfig {
+    bool                             enable_hybrid_attention = false;
+    std::vector<HybridAttentionType> hybrid_attention_types;
+    std::string                      to_string() const;
+};
+
+}  // namespace rtp_llm

@@ -1,0 +1,948 @@
+// message.proto
+syntax = "proto3";
+import "google/protobuf/wrappers.proto";
+
+message TensorPB {
+    enum DataType {
+        FP32 = 0;
+        INT32 = 1;
+        FP16 = 2;
+        BF16 = 3;
+    }
+    DataType data_type = 1;
+    repeated int64 shape = 2;
+    bytes fp32_data = 3;
+    bytes int32_data = 4;
+    bytes fp16_data = 5;
+    bytes bf16_data = 6;
+}
+
+message IntVector {
+    repeated int32 values = 1;
+}
+
+message IntMatrix {
+    repeated IntVector rows = 1;
+}
+
+// KV-cache protocol compatibility contract:
+// Grouped topology and independent block pools change block addressing and
+// payload structures. Prefill, decode, P2P, remote-cache, and host-cache
+// peers that exchange KV-cache RPCs must run the same build. Mixed-version
+// rollout across this protocol change is intentionally unsupported; no legacy
+// dual-read/write fallback is provided.
+message GroupBlockPB {
+    // Legacy numeric identity. T8 decoders intentionally reject numeric-only payloads.
+    int32 deprecated_group_id = 1;
+    int32 block_id = 2;
+    string tag = 3;
+}
+
+message TaggedBlockIdsPB {
+    string tag = 1;
+    repeated int32 block_ids = 2;
+}
+
+enum RoleTypePB {
+    ROLE_TYPE_PDFUSION = 0;
+    ROLE_TYPE_PREFILL = 1;
+    ROLE_TYPE_DECODE = 2;
+    ROLE_TYPE_VIT = 3;
+    ROLE_TYPE_FRONTEND = 4;
+}
+
+message RoleAddrPB {
+    enum RoleType {
+        PDFUSION = 0;
+        PREFILL = 1;
+        DECODE = 2;
+        VIT = 3;
+        FRONTEND = 4;
+    }
+    RoleType role = 1;
+    string ip = 2;
+    int32 http_port = 3;
+    int32 grpc_port = 4;
+    string role_str = 5;
+}
+
+message GenerateConfigPB {
+    enum ThinkingModePB {
+        THINKING_MODE_UNSPECIFIED = 0;
+        THINKING_MODE_DISABLED = 1;
+        THINKING_MODE_ADAPTIVE = 2;
+        THINKING_MODE_ENABLED = 3;
+    }
+    int32 max_new_tokens = 1;
+    int32 num_beams = 2;
+    int32 num_return_sequences = 3;
+    int32 min_new_tokens = 4;
+
+    int32 top_k = 5;
+    float top_p = 6;
+    float temperature = 7;
+    float repetition_penalty = 8;
+    google.protobuf.Int32Value no_repeat_ngram_size = 9;
+    google.protobuf.Int64Value random_seed = 10;
+    google.protobuf.FloatValue top_p_decay = 11;
+    google.protobuf.FloatValue top_p_min = 12;
+    google.protobuf.Int32Value top_p_reset_ids = 13;
+    google.protobuf.StringValue task_id = 14;
+    int32 calculate_loss = 15;
+    bool return_incremental = 16;
+    bool return_hidden_states = 17;
+    bool return_logits = 18;
+    bool is_streaming = 19;
+    int32 timeout_ms = 20;
+    IntMatrix stop_words_list = 21;
+    repeated int32 select_tokens_id = 22;
+    google.protobuf.StringValue adapter_name = 23;
+    bool sp_edit = 24;
+    repeated int32 sp_advice_prompt_token_ids = 25;
+    bool force_disable_sp_run = 26;
+    // legacy compat: false=NONE, true=DEFAULT/ORIGINAL (cannot distinguish across versions)
+    bool return_all_probs = 27;
+    bool sp_input_lookup = 28;
+    bool can_use_pd_separation = 29;
+    bool return_softmax_probs = 30;
+    bool return_cum_log_probs = 31;
+    bool in_think_mode = 32;
+    int32 max_thinking_tokens = 33;
+    repeated int32 end_think_token_ids = 34;
+    bool gen_timeline = 35;
+    int32 global_request_id = 36;
+    bool force_sp_accept = 37;
+    int32 hidden_states_cut_dim = 38;
+    bool normalized_hidden_states = 39;
+    int32 profile_step = 40;
+    repeated RoleAddrPB role_addrs = 41;
+    reserved 42;
+    reserved "inter_request_id";
+    bool ignore_eos = 43;
+    float presence_penalty = 44;
+    float frequency_penalty = 45;
+    bool do_sample = 46;
+    bool reuse_cache = 47;
+    repeated int32 variable_num_beams = 48;
+    google.protobuf.StringValue trace_id = 49;
+    bool return_all_hidden_states = 50;
+    bool enable_memory_cache = 51;
+    bool enable_device_cache = 52;
+    bool enable_remote_cache = 53;
+    string unique_key = 54;
+    reserved 55;
+    google.protobuf.Int32Value group_timeout = 56;
+    string profile_trace_name = 57;
+    // 生成式推荐：组合 token 粒度去重与曝光过滤
+    int32 combo_token_size = 58;
+    IntMatrix banned_combo_token_ids = 59;
+    // 0=unset(fallback to bool return_all_probs), 1=NONE, 2=DEFAULT, 3=ORIGINAL
+    int32 return_all_probs_mode = 60;
+    // 跨序列 combo 去重开关
+    bool enable_cross_sequence_ban = 61;
+    // 跨序列分叉起始商品位置
+    int32 cross_seq_diverge_start_combo = 62;
+    bool return_prompt_logits = 63;
+    int32 prompt_logits_top_k = 64;
+    int32 prompt_logits_start = 65;
+    int32 prompt_logits_end = 66;
+    bool return_target_logprob = 67;
+    repeated int32 begin_think_token_ids = 68;
+    google.protobuf.StringValue json_schema = 69;
+    google.protobuf.StringValue regex = 70;
+    google.protobuf.StringValue ebnf = 71;
+    google.protobuf.StringValue structural_tag = 72;
+    ThinkingModePB thinking_mode = 73;
+    // 请求级 L3 写入开关；RPC 缺失时为 false。
+    bool enable_disk_cache = 74;
+}
+
+message MMPreprocessConfigPB {
+    int32 width = 1;
+    int32 height = 2;
+    int32 min_pixels = 3;
+    int32 max_pixels = 4;
+    int32 fps = 5;
+    int32 min_frames = 6;
+    int32 max_frames = 7;
+    repeated float crop_positions = 8;
+    int32 mm_timeout_ms = 9;
+}
+
+message MultimodalInputPB {
+    string multimodal_url = 1;
+    int32 multimodal_type = 2;
+    TensorPB multimodal_tensor = 3;
+    MMPreprocessConfigPB mm_preprocess_config = 4;
+}
+
+message MultimodalInputsPB {
+    repeated MultimodalInputPB multimodal_inputs = 1;
+    // LLM can receive the output through GPUDirect RDMA.
+    bool support_rdma = 2;
+}
+
+enum TensorDataTypePB {
+    RDMA_TENSOR_FLOAT32 = 0;
+    RDMA_TENSOR_INT32 = 1;
+    RDMA_TENSOR_FLOAT16 = 2;
+    RDMA_TENSOR_BFLOAT16 = 3;
+}
+
+message RdmaNicKeyPB {
+    uint32 nic_id = 1;
+    uint32 rkey = 2;
+}
+
+message TensorMetaPB {
+    repeated int64 shape = 1;
+    TensorDataTypePB data_type = 2;
+    uint64 offset = 3;
+    uint64 nbytes = 4;
+}
+
+message RdmaDescriptorPB {
+    uint64 remote_addr = 1;
+    repeated RdmaNicKeyPB nic_keys = 2;
+    string lease_id = 3;
+    string host = 4;
+    uint32 port = 5;
+    uint64 payload_bytes = 6;
+    repeated TensorMetaPB tensors = 7;
+}
+
+message MMRdmaSlotPB {
+    enum Role {
+        ROLE_UNSPECIFIED = 0;
+        EMBEDDING = 1;
+        POS_ID = 2;
+        EXTRA_INPUT = 3;
+    }
+    RdmaDescriptorPB rdma_descriptor = 1;
+    // Must have the same length as rdma_descriptor.tensors and match it by index.
+    // EXTRA_INPUT entries preserve their original order across all slots.
+    repeated Role roles = 2;
+}
+
+message MultimodalOutputPB {
+    TensorPB multimodal_embedding = 1;
+    TensorPB multimodal_pos_id = 2;
+    repeated TensorPB multimodal_extra_input = 3;
+    repeated int32 split_size = 4;
+    // Non-empty means fields 1/2/3 are stored in these slots; split_size remains inline.
+    repeated MMRdmaSlotPB output_rdma_slots = 5;
+}
+
+message ReleaseLeasePB {
+    repeated string lease_id = 1;
+}
+
+message TraceContextPB {
+    string traceparent = 1;
+    string tracestate = 2;
+}
+
+message RequestInfoPB {
+    string frontend_ip = 1;
+    string dash_ip = 2;
+    string trace_id = 3;
+    string request_id = 4;
+    string source_role = 5;
+    TraceContextPB trace_context = 6;
+}
+
+message GenerateInputPB {
+    int64 request_id = 1;
+    repeated int32 token_ids = 2;
+    repeated MultimodalInputPB multimodal_inputs = 3;
+    GenerateConfigPB generate_config = 4;
+    string client_id = 5;
+    int64 start_time = 6;
+    int32 group_size = 7;
+    google.protobuf.Int64Value group_id = 8;
+    RequestInfoPB request_info = 9;
+    // Auto-TPM QoS priority (task40): 1-100; 0 = not set (request carries no
+    // priority). Used as a metrics tag on engine-side TPS
+    // reporting; never affects engine scheduling.
+    int32 priority = 10;
+}
+
+message AuxInfoPB {
+    int32 cost_time_us = 1;
+    int32 iter_count = 2;
+    int32 input_len = 3;
+    int32 total_reuse_len = 4;
+    int32 prefix_len = 5;
+    int32 output_len = 6;
+    TensorPB cum_log_probs = 9;
+    int32 step_output_len = 10;
+    bool pd_sep = 11;
+    int32 first_token_cost_time_us = 12;
+    TensorPB softmax_probs = 13;
+    int32 wait_time_us = 14;
+
+    int32 local_reuse_len = 15;
+    int32 remote_reuse_len = 16;
+    int32 prefill_total_reuse_len = 17;
+    int32 prefill_local_reuse_len = 18;
+    int32 prefill_remote_reuse_len = 19;
+    int32 decode_total_reuse_len = 20;
+    int32 decode_local_reuse_len = 21;
+    int32 decode_remote_reuse_len = 22;
+    string aux_string = 23;
+    int32 memory_reuse_len = 24;
+    int32 prefill_memory_reuse_len = 25;
+    int32 decode_memory_reuse_len = 26;
+    map<int32, int32> multimodal_lengths = 27;
+    int32 speculative_draft_rounds = 28;
+    repeated int32 speculative_accepted_tokens_per_pos = 29;
+    string generation_prefill_cuda_graph_status = 30;
+    int32 disk_reuse_len = 31;
+    int32 prefill_disk_reuse_len = 32;
+    int32 decode_disk_reuse_len = 33;
+}
+
+message PromptLogitsOutputPB {
+    TensorPB topk_logprobs = 1;
+    TensorPB topk_token_ids = 2;
+    TensorPB target_logprobs = 3;
+    int32 start_pos = 4;
+    int32 end_pos = 5;
+}
+
+message FlattenOutputPB {
+    repeated bool finished = 1;
+    repeated AuxInfoPB aux_info = 2;
+    TensorPB output_ids = 3;
+    TensorPB hidden_states = 4;
+    TensorPB loss = 5;
+    TensorPB logits = 6;
+    TensorPB all_probs = 7;
+    TensorPB all_hidden_states = 8;
+    PromptLogitsOutputPB prompt_logits = 9;
+    // Output of the deployment-registered post-layers CustomHandler.
+    TensorPB custom_output = 10;
+}
+
+message GenerateOutputsPB {
+    int64 request_id = 1;
+    FlattenOutputPB flatten_output = 2;
+    int64 receive_load_time = 3;
+    int64 start_load_time = 4;
+    int64 receive_generate_time = 5;
+    int64 load_done_time = 6;
+    int64 begin_compute_time = 7;
+    int64 compute_done_time = 8;
+    RpcErrorPB error_info = 9;
+    // Advertised only by the Decode ALLOCATE response.
+    bool supports_prefill_completion = 10;
+}
+
+// return to python client
+message ErrorDetailsPB {
+    int64 error_code = 1;
+    string error_message = 2;
+}
+
+enum ErrorCodePB {
+    NONE_ERROR = 0;
+    UNKNOWN_ERROR = 1;
+    CANCELLED = 2;
+    LOAD_CACHE_TIMEOUT = 3;
+    CACHE_STORE_LOAD_CONNECT_FAILED = 4;
+    CACHE_STORE_LOAD_SEND_REQUEST_FAILED = 5;
+    CACHE_STORE_CALL_PREFILL_TIMEOUT = 6;
+    CACHE_STORE_LOAD_RDMA_CONNECT_FAILED = 7;
+    CACHE_STORE_LOAD_RDMA_WRITE_FAILED = 8;
+    CACHE_STORE_LOAD_BUFFER_TIMEOUT = 9;
+    P2P_CONNECTOR_CALL_PREFILL_FAILED = 10;
+    P2P_CONNECTOR_LOAD_FROM_PREFILL_FAILED = 11;
+    P2P_CONNECTOR_SCHEDULER_CALL_WORKER_FAILED = 12;
+    P2P_CONNECTOR_SCHEDULER_STREAM_RESOURCE_FAILED = 13;
+    P2P_CONNECTOR_SCHEDULER_FILL_RESPONSE_FAILED = 14;
+    P2P_CONNECTOR_WORKER_ASYMMETRIC_TP_FAILED = 15;
+    P2P_CONNECTOR_WORKER_HANDLE_READ_TIMEOUT = 16;
+    P2P_CONNECTOR_WORKER_HANDLE_READ_CANCELLED = 17;
+    P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_FAILED = 18;
+    P2P_CONNECTOR_WORKER_READ_TRANSFER_RDMA_FAILED = 19;
+    P2P_CONNECTOR_WORKER_READ_BUFFER_MISMATCH = 20;
+    P2P_CONNECTOR_WORKER_HANDLE_READ_TRANSFER_TIMEOUT = 21;
+    P2P_CONNECTOR_WORKER_READ_FAILED = 22;
+    P2P_CONNECTOR_WORKER_READ_CANCELED = 23;
+    P2P_CONNECTOR_WORKER_READ_TIMEOUT = 24;
+    P2P_CONNECTOR_WORKER_READ_TRANSFER_NOT_DONE = 25;
+}
+
+// transfer between prefill and decode
+message RpcErrorPB {
+    ErrorCodePB error_code = 1;
+    string error_message = 2;
+}
+
+message EmptyPB {}
+
+enum RemoteStage {
+    ALLOCATE = 0;
+    LOAD = 1;
+    GENERATE = 2;
+    // Prefill completed locally after LOAD; no Decode execution is required.
+    PREFILL_COMPLETE = 3;
+}
+
+message GenerateRequestPB {
+    RemoteStage stage = 1;
+    int64 request_id = 2;
+    string client_id = 3;
+    int64 start_time = 4;
+    int32 first_generate_token_id = 5;
+    GenerateInputPB input = 6;
+    repeated string peer_addrs = 7;
+    repeated int32 propose_token_ids = 8;
+    repeated int32 position_ids = 9;
+    TensorPB propose_probs = 10;
+    TensorPB propose_hidden = 11;
+}
+
+// In the TP case, the decode master broadcasts to decode workers.
+// This request uses the tagged grouped-cache layout. Legacy group-addressing
+// field numbers stay reserved even though mixed-version KV-cache deployment is
+// outside the supported protocol contract documented above.
+message BroadcastLoadRequestPB {
+    int64 request_id = 1;
+    string request_key = 2;
+    repeated string peer_addrs = 3;
+    repeated int64 cache_keys = 4;
+    reserved 5;
+    reserved "block_ids";
+    int64 block_num = 6;
+    int64 reuse_block_size = 7;
+    int64 timeout_ms = 8;
+    int64 dp_rank = 9;
+    int32 partition_count = 10;
+    int32 partition_id = 11;
+    reserved 12;
+    reserved "group_block_ids";
+    int32 prefill_cp_size = 13;
+    repeated TaggedBlockIdsPB tagged_group_block_ids = 14;
+
+}
+
+message BroadcastLoadResponsePB {
+    RpcErrorPB error_info = 1;
+    int64 done_time_us = 2;
+    int64 loaded_cache_block_count = 3;
+}
+
+message RemoteFinishRequestPB {
+    int64 request_id = 1;
+}
+
+message RemoteGenerateRequestPBNew {
+    GenerateInputPB input = 1;
+    string client_id = 2;
+    int64 start_time_us = 3;
+    repeated string addrs = 4;
+    repeated int32 block_ids = 5;
+    int64 reuse_block_size = 6;
+    string mtp_hidden_states_key = 7;
+    bool use_mla = 8;
+    int32 layer_num = 9;
+    int64 deadline_us = 10;
+}
+
+message RemoteGenerateResponsePBNew {
+    ErrorDetailsPB error_info = 1;
+    GenerateOutputsPB output = 2;
+    int32 first_generate_token_id = 3;
+    int64 first_token_rt_us = 4;
+    bool finished = 5;
+}
+
+message RemoteStorePartition {
+    string remote_addr = 1;
+    int32 remote_partition_id = 2;
+    int32 remote_partition_count = 3;
+    int32 local_partition_id = 4;
+    int32 local_partition_count = 5;
+}
+
+message RemoteStoreRequestPB {
+    int64 dp_rank = 1;
+    int64 request_id = 2;
+    string request_key = 3;
+    repeated int32 decode_block_ids = 4;
+    repeated int32 prefill_block_ids = 5;
+    int64 reuse_block_size = 6;
+    repeated RemoteStorePartition partition_infos = 7;
+    int64 deadline_us = 8;
+    string client_id = 9;
+}
+
+message RemoteStoreResponsePB {
+    RpcErrorPB error_info = 1;
+    int64 done_time_us = 2;
+}
+
+message StatusVersionPB {
+    int64 latest_cache_version = 1;
+    int64 latest_finished_version = 2;
+}
+
+message CacheVersionPB {
+    int64 latest_cache_version = 1;
+    bool need_cache_keys = 2;
+}
+
+message CacheStatusPB {
+    int64 available_kv_cache = 1;
+    int64 total_kv_cache = 2;
+    int64 block_size = 3;
+    int64 version = 4;
+    map<int64, bool> cache_keys = 5;
+}
+
+message UpdateSchedulerInfoRequestPB {
+    string scheduler_info = 1;
+}
+
+message SetLogLevelRequestPB {
+    string log_level = 1;
+}
+
+message StartProfileRequestPB {
+    string trace_name = 1;
+    int32 start_step = 2;
+    int32 num_steps = 3;
+    bool enable_all_rank = 4;
+}
+
+message StartProfileInternalRequestPB {
+    string trace_name = 1;
+    int32 start_step = 2;
+    int32 num_steps = 3;
+}
+
+message TorchAllocatorDumpRequestPB {
+    string auth_token = 1;
+    string dump_id = 2;
+}
+
+message TorchAllocatorDumpResultPB {
+    int64 world_rank = 1;
+    int64 dp_rank = 2;
+    int64 tp_rank = 3;
+    int64 local_rank = 4;
+    int64 pid = 5;
+    bool success = 6;
+    string file_path = 7;
+    string error = 8;
+    string dump_id = 9;
+}
+
+message TorchAllocatorDumpResponsePB {
+    repeated TorchAllocatorDumpResultPB results = 1;
+}
+
+message CheckHealthResponsePB {
+    string health = 1;
+}
+
+message UpdateEplbConfigRequestPB {
+    string mode = 1;
+    int32 update_time = 2;
+}
+
+enum TaskPhase {
+    TASK_PHASE_PENDING = 0;
+    TASK_PHASE_RECEIVED = 1;
+    TASK_PHASE_KV_ALLOCATED = 2;
+    TASK_PHASE_RUNNING = 3;
+}
+
+enum PriorityPreemptionProgressPB {
+    PRIORITY_PREEMPTION_NONE = 0;
+    PRIORITY_PREEMPTION_CANCELING = 1;
+    PRIORITY_PREEMPTION_CANCELED = 2;
+}
+
+message TaskInfoPB {
+    int64 request_id = 1;
+    reserved 2;
+    reserved "inter_request_id";
+    int64 prefix_length = 3;
+    int64 input_length = 4;
+    int64 waiting_time_ms = 5;
+    int64 iterate_count = 6;
+    int64 end_time_ms = 7;
+    int64 dp_rank = 8;
+    bool is_waiting = 9;
+    ErrorDetailsPB error_info = 10;
+    int64 batch_id = 11;
+    TaskPhase phase = 12;
+    int64 execution_time_ms = 13;
+    PriorityPreemptionProgressPB priority_preemption_progress = 14;
+    int32 priority = 15;
+}
+
+message UpdateWeightsRequestPB {
+    string name = 1;
+    string desc = 2;
+    string method = 3;
+}
+
+message WorkerStatusPB {
+    string role = 1;              // 字符串角色名，如 "PREFILL"，向后兼容
+    // LocalRpcServer::GetWorkerStatus currently does not populate this field, so
+    // protobuf returns the default value 0. Keep it for wire compatibility, but
+    // do not use it for routing, admission control, or batch-size decisions.
+    int32 available_concurrency = 2;
+    repeated TaskInfoPB running_task_info = 3;
+    repeated TaskInfoPB finished_task_list = 4;
+    int32 waiting_query_len = 5;
+    int32 running_query_len = 6;
+    double step_latency_ms = 7;
+    int32 iterate_count = 8;
+    int32 dp_size = 9;
+    int32 tp_size = 10;
+    int64 status_version = 12;
+    bool alive = 13;
+    string precision = 14;
+    int64 latest_finished_version = 15;
+    int64 dp_rank = 16;
+    int64 available_kv_cache = 17;
+    int64 total_kv_cache = 18;
+    reserved 19;
+    reserved "role_str";
+    RoleTypePB role_type = 20;
+    // Static limits used by the running Engine. FlexLB uses these values to
+    // avoid constructing a group that the Engine can never admit.
+    int64 max_seq_len = 21;
+    int64 max_batch_tokens_size = 22;
+}
+
+message EmbeddingInputPB {
+    repeated int32 token_ids = 1;
+    repeated int32 token_type_ids = 2;
+    repeated int32 input_lengths = 3;
+    int64 request_id = 4;
+    repeated MultimodalInputPB multimodal_features = 5;
+    string vit_role_addr = 6;
+    bool gen_timeline = 7;
+    int32 profile_step = 8;
+    string profile_trace_name = 9;
+}
+
+message EmbeddingHealthRequestPB {
+    int64 request_id = 1;
+}
+
+message EmbeddingTensorMapPB {
+    map<string, TensorPB> tensor_map = 1;
+}
+
+message EmbeddingOutputPB {
+    bool output_is_tensor = 1;
+    TensorPB output_t = 2;
+    repeated EmbeddingTensorMapPB output_map = 3;
+}
+
+service EmbeddingRpcService {
+    rpc StartProfile(StartProfileRequestPB) returns (EmptyPB);
+    rpc embedding(EmbeddingInputPB) returns (EmbeddingOutputPB);
+    rpc health(EmbeddingHealthRequestPB) returns (EmptyPB);
+}
+
+message MemoryOperationRequestPB {
+    message CopyItem {
+        int32 mem_block = 1;
+        int32 disk_block = 2;
+        repeated GroupBlockPB group_blocks = 3;
+        // Legacy numeric identity. T8 decoders intentionally reject numeric-only payloads.
+        uint64 deprecated_group_set_id = 4;
+        repeated string group_tags = 5;
+    }
+    enum CopyDirection {
+        H2D = 0;
+        D2H = 1;
+        H2DISK = 2;
+        DISK2H = 3;
+        D2DISK = 4;
+        DISK2D = 5;
+    }
+    repeated CopyItem copy_items = 1;
+    CopyDirection copy_direction = 2;
+    int64 timeout_ms = 3;
+}
+
+message MemoryOperationResponsePB {
+    // gRPC status reports the RPC/transport outcome; this code reports the transfer
+    // business outcome of a handler that ran to completion. CODE_UNSPECIFIED is the
+    // protobuf default and means the handler never filled in a result.
+    enum Code {
+        CODE_UNSPECIFIED = 0;
+        OK = 1;
+        FAILED = 2;
+    }
+    Code code = 1;
+}
+
+message TPWorkerInfoPB {
+    string ip = 1;
+    int32 cache_store_port = 2;
+}
+
+message LayerCacheBlockPB {
+    uint32 layer_id = 1;
+    repeated int64 cache_keys = 2;
+    repeated uint32 block_ids = 3;
+    string cache_tag = 4;
+}
+
+enum P2PConnectorBroadcastType {
+    READ = 0;
+    HANDLE_READ = 1;
+    CANCEL_READ = 2;
+    CANCEL_HANDLE_READ = 3;
+}
+
+message P2PConnectorBroadcastTpRequestPB {
+    repeated LayerCacheBlockPB layer_blocks = 1;
+    repeated TPWorkerInfoPB peer_workers = 2;
+    string unique_key = 3;
+    int64 request_id = 4;
+    int64 deadline_ms = 5;
+    P2PConnectorBroadcastType type = 6;
+    // TP size of the remote side (prefill_tp_size for decode, decode_tp_size for prefill)
+    int32 remote_tp_size = 8;
+}
+
+// GetPeerInfo: Decode calls this on Prefill to exchange TP size before recv registration
+message GetPeerInfoRequestPB {
+    string requester_ip = 1;
+    int32  requester_tp_size = 2;
+}
+
+message GetPeerInfoResponsePB {
+    int32  tp_size = 1;
+}
+
+message P2PConnectorBroadcastTpResponsePB {
+    ErrorCodePB error_code = 1;
+    string error_message = 2;
+}
+
+message P2PConnectorStartLoadRequestPB {
+    string unique_key = 1;
+    repeated TPWorkerInfoPB workers = 2;
+    int64 deadline_ms = 3;
+}
+
+// Side-channel tensor blob: carries named tensor data between prefill and decode
+message SideChannelTensorPB {
+    TensorPB tensor = 1;
+}
+
+// Side-channel payload: replaces fixed first_token/reuse/SP/position_ids fields
+// Keys: "propose_tokens", "propose_probs", "propose_hidden", "position_ids"
+message SideChannelPayloadPB {
+    map<string, SideChannelTensorPB> tensors = 1;
+    // Scalar fields that don't fit tensor format
+    int64  first_generate_token_id = 2;
+    int32  total_reuse_len         = 3;
+    int32  local_reuse_len         = 4;
+    int32  remote_reuse_len        = 5;
+    int32  memory_reuse_len        = 6;
+}
+
+message P2PConnectorStartLoadResponsePB {
+    // Legacy fixed fields reserved (replaced by SideChannelPayloadPB)
+    reserved 1 to 8;
+    reserved "first_generate_token_id", "total_reuse_len", "local_reuse_len", "remote_reuse_len", "propose_token_ids", "propose_probs", "propose_hidden", "position_ids";
+
+    // Keep error field numbers stable within this schema. This does not imply
+    // mixed-version support for grouped/independent-pool KV-cache deployments.
+    ErrorCodePB error_code = 9;
+    string error_message = 10;
+
+    // New side-channel payload: all data carried as structured map + scalars
+    // Field 12 avoids conflict with the error fields in the current schema.
+    SideChannelPayloadPB payload = 12;
+}
+
+enum RemoteOpType {
+    REMOTE_OPERATION_UNSPECIFIED = 0;
+    REMOTE_OPERATION_READ = 1;
+    REMOTE_OPERATION_WRITE = 2;
+}
+
+message RemoteBoolMasksTypePB { repeated bool values = 1; }
+message RemoteBlockMaskPB {
+    oneof info {
+        int32 offset = 1;
+        RemoteBoolMasksTypePB bool_masks = 2;
+    }
+}
+
+message FunctionRequestPB {
+    oneof request {
+        MemoryOperationRequestPB mem_request = 1;
+        RemoteOperationRequestPB remote_request = 2;
+        P2PConnectorBroadcastTpRequestPB p2p_request = 3;
+    }
+}
+
+message RemoteOperationRequestPB {
+    // group_tags is the only valid group identity. Remote/memory connector
+    // peers must follow the same-build KV-cache protocol contract documented
+    // above; the legacy numeric identity remains reserved without a fallback.
+    RemoteOpType op = 1;
+    string trace_id = 2;
+    reserved 3;
+    reserved "group_ids";
+    repeated int32 block_ids = 4;
+    repeated string uris = 5;
+    repeated string group_tags = 6;
+}
+
+message RemoteOperationResponsePB {
+    RemoteBlockMaskPB succeed_block = 1;  // for read/write, TODO
+    repeated string actual_uris = 2; // only for write
+}
+
+message FunctionResponsePB {
+    oneof response {
+        MemoryOperationResponsePB mem_response = 1;
+        RemoteOperationResponsePB remote_response = 2;
+        P2PConnectorBroadcastTpResponsePB p2p_response = 3;
+    }
+}
+
+message BatchGenerateInputPB {
+    repeated GenerateInputPB inputs = 1;
+}
+
+message BatchGenerateResultPB {
+    GenerateOutputsPB final_output = 1;
+    RpcErrorPB error_info = 2;
+}
+
+message BatchGenerateOutputsPB {
+    repeated BatchGenerateResultPB results = 1;
+}
+
+message EnqueueBatchExternalInputPB {
+    GenerateInputPB input = 1;
+}
+
+message EnqueueBatchDpSlotPB {
+    int32 dp_rank = 1;
+    repeated EnqueueBatchExternalInputPB requests = 2;
+}
+
+message EnqueueBatchRequestPB {
+    int64 batch_id = 1;
+    repeated EnqueueBatchDpSlotPB dp_slots = 2;
+    // Lease between successful enqueue and FetchResponse attachment. Zero uses
+    // the Prefill server default.
+    int64 fetch_attach_timeout_ms = 3;
+}
+
+message EnqueueGroupInputPB {
+    GenerateInputPB input = 1;
+}
+
+message EnqueueGroupRequestPB {
+    int64 batch_id = 1;
+    int32 dp_rank = 2;
+    repeated EnqueueGroupInputPB requests = 3;
+    int64 fetch_attach_timeout_ms = 4;
+}
+
+message EnqueueBatchSuccessPB {
+    int64 request_id = 1;
+}
+
+message EnqueueBatchErrorPB {
+    int64 request_id = 1;
+    ErrorDetailsPB error_info = 2;
+}
+
+message EnqueueBatchResponsePB {
+    int64 batch_id = 1;
+    repeated EnqueueBatchSuccessPB successes = 2;
+    repeated EnqueueBatchErrorPB errors = 3;
+}
+
+message FetchRequestPB {
+    int64 request_id = 1;
+}
+
+message CancelRequestPB {
+    int64 request_id = 1;
+}
+
+enum CancelStatusPB {
+    CANCEL_STATUS_UNSPECIFIED = 0;
+    // The original Prefill atomically installed the priority-preemption
+    // latch/intent and triggered current-or-future P-to-D cancellation. This
+    // is not a resource-release acknowledgement.
+    CANCEL_STATUS_ACCEPTED = 1;
+    CANCEL_STATUS_NOT_FOUND = 2;
+    // No active request was visible, so Prefill installed (or found) a
+    // short-lived request-id tombstone. A later Enqueue for the same id is
+    // rejected with 8429 before it can reach the Engine scheduler.
+    CANCEL_STATUS_TOMBSTONED = 3;
+}
+
+message CancelResponsePB {
+    CancelStatusPB status = 1;
+}
+
+service RpcService {
+    rpc GetWorkerStatus(StatusVersionPB) returns (WorkerStatusPB);
+    rpc GetCacheStatus(CacheVersionPB) returns (CacheStatusPB);
+    rpc GenerateStreamCall(GenerateInputPB) returns (stream GenerateOutputsPB);
+    rpc BatchGenerateCall(BatchGenerateInputPB) returns (BatchGenerateOutputsPB);
+    rpc RemoteLoad(BroadcastLoadRequestPB) returns (BroadcastLoadResponsePB);
+    rpc RemoteGenerate(stream GenerateRequestPB) returns (stream GenerateOutputsPB);
+    rpc RemoteFinish(RemoteFinishRequestPB) returns (EmptyPB);
+    rpc RemoteFinishNew(RemoteFinishRequestPB) returns (EmptyPB);
+
+    rpc CheckHealth(EmptyPB) returns (CheckHealthResponsePB);
+    rpc UpdateEplbConfig(UpdateEplbConfigRequestPB) returns (EmptyPB);
+    rpc SetPause(EmptyPB) returns (EmptyPB);
+    rpc SetRestart(EmptyPB) returns (EmptyPB);
+    rpc SetLogLevel(SetLogLevelRequestPB) returns (EmptyPB);
+    rpc StartProfile(StartProfileRequestPB) returns (EmptyPB);
+    rpc StartProfileInternal(StartProfileInternalRequestPB) returns (EmptyPB);
+    rpc DumpTorchAllocator(TorchAllocatorDumpRequestPB) returns (TorchAllocatorDumpResponsePB);
+    rpc DumpTorchAllocatorInternal(TorchAllocatorDumpRequestPB) returns (TorchAllocatorDumpResultPB);
+    rpc UpdateSchedulerInfo(UpdateSchedulerInfoRequestPB) returns (EmptyPB);
+
+    rpc UpdateWeights(UpdateWeightsRequestPB) returns (EmptyPB);
+    rpc RemoteGenerateNew(RemoteGenerateRequestPBNew) returns (RemoteGenerateResponsePBNew);
+    rpc RemoteStore(RemoteStoreRequestPB) returns (RemoteStoreResponsePB);
+
+    rpc ExecuteFunction(FunctionRequestPB) returns (FunctionResponsePB);
+    rpc StartLoad(P2PConnectorStartLoadRequestPB) returns (P2PConnectorStartLoadResponsePB);
+    rpc GetPeerInfo(GetPeerInfoRequestPB) returns (GetPeerInfoResponsePB);
+    rpc EnqueueBatch(EnqueueBatchRequestPB) returns (EnqueueBatchResponsePB);
+    rpc EnqueueGroup(EnqueueGroupRequestPB) returns (EnqueueBatchResponsePB);
+    rpc FetchResponse(FetchRequestPB) returns (stream GenerateOutputsPB);
+    // AutoTPM priority-preemption Cancel targets the original Prefill role.
+    // Prefill triggers the existing Prefill->Decode stream cancellation;
+    // Decode does not implement this RPC. Completion is reported separately
+    // by Prefill WorkerStatus as priority_preemption_progress=CANCELED with
+    // error code 8429. The original Enqueue/Fetch path also returns 8429.
+    rpc Cancel(CancelRequestPB) returns (CancelResponsePB);
+}
+
+// Response type intentionally changed as part of multimodal refactoring — not a rolling-upgrade concern
+// because VIT proxy and LLM backend are always deployed together in this service.
+service MultimodalRpcService {
+    rpc GetWorkerStatus(StatusVersionPB) returns (WorkerStatusPB);
+    rpc GetCacheStatus(CacheVersionPB) returns (CacheStatusPB);
+    rpc RemoteMultimodalEmbedding(MultimodalInputsPB) returns (MultimodalOutputPB);
+    // Best-effort release after the LLM finishes reading remote slots.
+    rpc ReleaseRdmaLease(ReleaseLeasePB) returns (EmptyPB);
+}

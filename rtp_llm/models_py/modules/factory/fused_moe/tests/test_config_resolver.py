@@ -1,0 +1,187 @@
+"""Configuration resolver tests"""
+
+import unittest
+from unittest.mock import patch
+
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
+from rtp_llm.device.device_type import DeviceType
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
+    MoEConfigAdapter,
+)
+from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
+    MoeConfigResolver,
+)
+from rtp_llm.ops import CPRotateMethod, MoeConfig, ParallelismConfig
+
+
+def create_config_adapter(
+    ep_size: int = 1,
+    tp_size: int = 1,
+    dp_size: int = 1,
+    quant_config=None,
+    use_deepep_low_latency: bool = False,
+    data_type: str = "fp16",
+    cp_enabled: bool = False,
+) -> MoEConfigAdapter:
+    """Helper function to create MoEConfigAdapter for testing"""
+    model_config = ModelConfig()
+    model_config.hidden_size = 1024
+    model_config.expert_num = 8
+    model_config.moe_k = 2
+    model_config.data_type = data_type
+    model_config.quant_config = quant_config
+
+    parallelism_config = ParallelismConfig()
+    parallelism_config.ep_size = ep_size
+    parallelism_config.tp_size = tp_size
+    parallelism_config.dp_size = dp_size
+    parallelism_config.ep_rank = 0
+    parallelism_config.tp_rank = 0
+    parallelism_config.dp_rank = 0
+    parallelism_config.world_size = ep_size * tp_size
+    parallelism_config.world_rank = 0
+    parallelism_config.local_rank = 0
+    parallelism_config.local_world_size = 1
+    if cp_enabled:
+        parallelism_config.prefill_cp_config.method = CPRotateMethod.ALL_GATHER
+
+    moe_config = MoeConfig()
+    moe_config.use_deepep_low_latency = use_deepep_low_latency
+    moe_config.ll_num_max_token = 128
+    return MoEConfigAdapter(
+        model_config=model_config,
+        parallelism_config=parallelism_config,
+        moe_config=moe_config,
+    )
+
+
+class TestMoeConfigResolver(unittest.TestCase):
+    """Test MoeConfigResolver"""
+
+    def setUp(self):
+        """Prepare for testing"""
+        self.resolver = MoeConfigResolver()
+
+    def test_get_device_type(self):
+        """Test getting device type"""
+        with patch(
+            "rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver.get_device_type"
+        ) as mock_get_device_type:
+            mock_get_device_type.return_value = DeviceType.Cuda
+            device_type = self.resolver.get_device_type()
+            self.assertEqual(device_type, DeviceType.Cuda)
+
+    def test_has_quantization_false(self):
+        """Test case without quantization"""
+        config = create_config_adapter(quant_config=None)
+        self.assertFalse(self.resolver.has_quantization(config))
+
+    def test_has_quantization_true(self):
+        """Test case with quantization"""
+        quant_config = Fp8BlockWiseQuantConfig()
+        config = create_config_adapter(quant_config=quant_config)
+        self.assertTrue(self.resolver.has_quantization(config))
+
+    def test_get_quant_method_none(self):
+        """Test getting quantization method (no quantization)"""
+        config = create_config_adapter(quant_config=None)
+        self.assertIsNone(self.resolver.get_quant_method(config))
+
+    def test_get_quant_method(self):
+        """Test getting quantization method"""
+        quant_config = Fp8BlockWiseQuantConfig()
+        config = create_config_adapter(quant_config=quant_config)
+        self.assertEqual(self.resolver.get_quant_method(config), "FP8_PER_BLOCK")
+
+    def test_is_bf16_false(self):
+        """Test is_bf16 returns False for fp16"""
+        config = create_config_adapter(data_type="fp16")
+        self.assertFalse(self.resolver.is_bf16(config))
+
+    def test_is_bf16_true(self):
+        """Test is_bf16 returns True for bf16"""
+        config = create_config_adapter(data_type="bf16")
+        self.assertTrue(self.resolver.is_bf16(config))
+
+    def test_is_ep_enabled_false(self):
+        """Test EP not enabled"""
+        config = create_config_adapter(ep_size=1)
+        self.assertFalse(self.resolver.is_ep_enabled(config))
+
+    def test_is_ep_enabled_true(self):
+        """Test EP enabled"""
+        config = create_config_adapter(ep_size=4)
+        self.assertTrue(self.resolver.is_ep_enabled(config))
+
+    def test_use_low_latency(self):
+        """Test low latency mode"""
+        config = create_config_adapter(use_deepep_low_latency=True)
+        self.assertTrue(self.resolver.use_low_latency(config))
+
+    def test_is_single_gpu(self):
+        """Test single GPU mode"""
+        config = create_config_adapter(ep_size=1)
+        self.assertTrue(self.resolver.is_single_gpu(config))
+
+    def test_is_tp_equal_ep(self):
+        """Test TP equals EP"""
+        config = create_config_adapter(ep_size=4, tp_size=4)
+        self.assertTrue(self.resolver.is_tp_equal_ep(config))
+
+    def test_is_tp_equal_ep_false_in_cp_mode(self):
+        """Adapter tp_size collapses to attn_tp (=1) when CP is enabled, so
+        is_tp_equal_ep returns False even though physical tp == ep. This is
+        the expected behavior — CP topologies should select via is_cp_equal_ep
+        and route to pure_cp_router instead of pure_tp_router."""
+        config = create_config_adapter(ep_size=2, tp_size=2, cp_enabled=True)
+        self.assertFalse(self.resolver.is_tp_equal_ep(config))
+
+    def test_is_cp_equal_ep_true_in_cp_mode(self):
+        """is_cp_equal_ep reads raw parallelism_config.tp_size, so it returns
+        True in CP+EP topologies regardless of the adapter's collapsed tp_size."""
+        config = create_config_adapter(ep_size=2, tp_size=2, cp_enabled=True)
+        self.assertTrue(self.resolver.is_cp_equal_ep(config))
+
+    def test_is_cp_equal_ep_true_without_cp(self):
+        """Without CP, is_cp_equal_ep behaves the same as is_tp_equal_ep."""
+        config = create_config_adapter(ep_size=4, tp_size=4)
+        self.assertTrue(self.resolver.is_cp_equal_ep(config))
+
+    def test_is_cp_equal_ep_false_when_mismatch(self):
+        config = create_config_adapter(ep_size=4, tp_size=2, cp_enabled=True)
+        self.assertFalse(self.resolver.is_cp_equal_ep(config))
+
+    def test_is_pure_tp_mode_single_gpu(self):
+        """Test pure TP mode with single GPU (tp=1, dp=1, ep=1)"""
+        config = create_config_adapter(tp_size=1, dp_size=1, ep_size=1)
+        self.assertTrue(self.resolver.is_pure_tp_mode(config))
+
+    def test_is_pure_tp_mode_multi_gpu_tp(self):
+        """Test pure TP mode with multi-GPU TP (tp=4, dp=1, ep=1)"""
+        config = create_config_adapter(tp_size=4, dp_size=1, ep_size=1)
+        self.assertTrue(self.resolver.is_pure_tp_mode(config))
+
+    def test_is_pure_tp_mode_rejects_ep_equals_tp(self):
+        """Test pure TP mode rejects EP=TP>1 scenario (tp=4, dp=1, ep=4).
+
+        This is the key regression test: previously is_tp_equal_ep would
+        return True here, causing pure-TP router to be selected even though
+        weights are split by EP.
+        """
+        config = create_config_adapter(tp_size=4, dp_size=1, ep_size=4)
+        self.assertFalse(self.resolver.is_pure_tp_mode(config))
+
+    def test_is_pure_tp_mode_rejects_dp_greater_than_one(self):
+        """Test pure TP mode rejects dp_size > 1"""
+        config = create_config_adapter(tp_size=4, dp_size=2, ep_size=1)
+        self.assertFalse(self.resolver.is_pure_tp_mode(config))
+
+    def test_is_pure_tp_mode_rejects_ep_greater_than_one(self):
+        """Test pure TP mode rejects ep_size > 1"""
+        config = create_config_adapter(tp_size=2, dp_size=1, ep_size=2)
+        self.assertFalse(self.resolver.is_pure_tp_mode(config))
+
+
+if __name__ == "__main__":
+    unittest.main()

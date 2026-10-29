@@ -1,0 +1,811 @@
+import itertools
+import json
+import logging
+from functools import partial
+from typing import Any, AsyncGenerator, List, Optional
+
+from fastapi import Request
+
+from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
+from rtp_llm.config.generate_config import (
+    GenerateConfig,
+    ReturnAllProbsMode,
+    ThinkingMode,
+)
+from rtp_llm.config.grammar_constraint import GrammarConstraint
+from rtp_llm.config.model_args import ModelArgs
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.config.py_config_modules import (
+    GenerateEnvConfig,
+    PyMiscellaneousConfig,
+    RenderConfig,
+    VitConfig,
+)
+from rtp_llm.config.response_format import ResponseFormat, normalize_think_tag
+from rtp_llm.config.response_format_compiler import ReasoningFormat
+from rtp_llm.frontend.recommendation_parser import parse_and_fill_banned_combo
+from rtp_llm.frontend.tokenizer_factory.tokenizers import BaseTokenizer
+from rtp_llm.openai.api_datatype import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatCompletionStreamResponse,
+    ChatMessage,
+    DebugInfo,
+    FunctionCall,
+    ModelCard,
+    ModelList,
+    RoleEnum,
+    ToolCall,
+    UsageInfo,
+)
+from rtp_llm.openai.renderer_factory import ChatRendererFactory
+from rtp_llm.openai.renderers.basic_renderer import BasicRenderer
+from rtp_llm.openai.renderers.custom_renderer import (
+    CustomChatRenderer,
+    RenderedInputs,
+    RendererParams,
+    StreamResponseObject,
+)
+from rtp_llm.ops import SpecialTokens
+from rtp_llm.server.backend_rpc_server_visitor import BackendRPCServerVisitor
+from rtp_llm.server.request_headers import extract_request_headers
+from rtp_llm.utils.complete_response_async_generator import (
+    CompleteResponseAsyncGenerator,
+)
+
+_INT32_MAX = 2_147_483_647
+
+
+def _positive_int_or_none(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    value = int(value)
+    return value if value > 0 else None
+
+
+class OpenaiEndpoint(object):
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        misc_config: PyMiscellaneousConfig,
+        vit_config: VitConfig,
+        tokenizer: BaseTokenizer,
+        backend_rpc_server_visitor: BackendRPCServerVisitor,
+    ):
+        # Get values from model_config
+        self.generate_env_config = model_config.generate_env_config
+        self.max_seq_len = model_config.max_seq_len
+        self.model_name = model_config.model_name
+        self.special_tokens = model_config.special_tokens
+        template_type = model_config.template_type
+        ckpt_path = model_config.ckpt_path
+        render_config = model_config.render_config
+
+        if tokenizer == None:
+            raise AttributeError(f"tokenizer is none!")
+        self.tokenizer: BaseTokenizer = tokenizer
+        self.backend_rpc_server_visitor = backend_rpc_server_visitor
+
+        self.eos_token_id = tokenizer.eos_token_id
+        if self.eos_token_id == None:
+            self.eos_token_id = self.special_tokens.eos_token_id
+
+        self.stop_words_id_list = self.special_tokens.stop_words_id_list
+
+        render_params = RendererParams(
+            model_type=model_config.model_type,
+            max_seq_len=self.max_seq_len,
+            eos_token_id=self.eos_token_id,
+            stop_word_ids_list=self.stop_words_id_list,
+            template_type=template_type,
+            ckpt_path=ckpt_path,
+        )
+
+        self.chat_renderer: CustomChatRenderer = ChatRendererFactory.get_renderer(
+            self.tokenizer,
+            render_params,
+            self.generate_env_config,
+            render_config,
+            ckpt_path,
+            misc_config,
+            vit_config,
+        )
+        logging.info(f"Finally openai endpoint uses renderer: {self.chat_renderer} ")
+        self.template_renderer: CustomChatRenderer = (
+            self.chat_renderer
+            if isinstance(self.chat_renderer, BasicRenderer)
+            else BasicRenderer(
+                self.tokenizer,
+                render_params,
+                self.generate_env_config,
+                render_config,
+                ckpt_path,
+                misc_config,
+                vit_config,
+            )
+        )
+        logging.info(f"chat_renderer [{self.chat_renderer}] is created.")
+        extra_stop_word_ids_list = self.chat_renderer.get_all_extra_stop_word_ids_list()
+        self.stop_words_id_list.extend(extra_stop_word_ids_list)
+        self.stop_words_str_list = self.special_tokens.stop_words_str_list
+
+        env_stop_words_str = self.generate_env_config.stop_words_str
+        env_stop_words_id = self.generate_env_config.stop_words_list
+        env_stop_words_str_list = (
+            json.loads(env_stop_words_str) if env_stop_words_str else []
+        )
+        env_stop_words_id_list = (
+            json.loads(env_stop_words_id) if env_stop_words_id else []
+        )
+        env_force_stop = self.generate_env_config.force_stop_words
+        if env_force_stop:
+            self.stop_words_str_list = env_stop_words_str_list
+            self.stop_words_id_list = env_stop_words_id_list
+        else:
+            self.stop_words_str_list = (
+                self.stop_words_str_list + env_stop_words_str_list
+            )
+            self.stop_words_id_list = self.stop_words_id_list + env_stop_words_id_list
+
+        # sync between stop word id str and stop words id list
+        stop_words_str_list_from_id = []
+        for stop_word_ids in self.stop_words_id_list:
+            word = self.tokenizer.decode(stop_word_ids)
+            if len(word):
+                stop_words_str_list_from_id.append(word)
+
+        stop_words_id_list_from_str = []
+        for stop_word_str in self.stop_words_str_list:
+            ids = self.tokenizer.encode(stop_word_str)
+            if len(ids):
+                stop_words_id_list_from_str.append(ids)
+
+        self.stop_words_str_list += stop_words_str_list_from_id
+        self.stop_words_id_list += stop_words_id_list_from_str
+
+        # dedup stop words
+        self.stop_words_str_list = list(set(self.stop_words_str_list))
+        self.stop_words_id_list = self._dedup_stop_words_list(self.stop_words_id_list)
+
+        logging.info(
+            f"use stop_words_str_list [{self.stop_words_str_list}], "
+            f"stop_words_id_list [{self.stop_words_id_list}]"
+        )
+
+    async def list_models(self):
+        model_card = ModelCard(id=self.model_name)
+        return ModelList(data=[model_card])
+
+    def _dedup_stop_words_list(
+        self, stop_words_list: List[List[int]]
+    ) -> List[List[int]]:
+        return [i for i, _ in itertools.groupby(sorted(stop_words_list))]
+
+    def _reasoning_format_for_prompt(
+        self,
+        config: GenerateConfig,
+        renderer: CustomChatRenderer,
+        input_ids: Optional[List[int]],
+    ) -> Optional[ReasoningFormat]:
+        if config.thinking_mode not in (
+            ThinkingMode.ENABLED,
+            ThinkingMode.ADAPTIVE,
+        ):
+            return None
+
+        base_format = renderer.get_reasoning_format()
+        if config.thinking_mode == ThinkingMode.ENABLED:
+            return base_format
+        think_start_tag = normalize_think_tag(self.generate_env_config.think_start_tag)
+        begin_ids = config.begin_think_token_ids or self.tokenizer.encode(
+            think_start_tag, add_special_tokens=False
+        )
+        prompt_has_begin = bool(
+            begin_ids
+            and input_ids is not None
+            and input_ids[-len(begin_ids) :] == begin_ids
+        )
+        if config.thinking_mode == ThinkingMode.ADAPTIVE and prompt_has_begin:
+            config.thinking_mode = ThinkingMode.ENABLED
+            config.in_think_mode = True
+        return ReasoningFormat(
+            tag_begin="" if prompt_has_begin else think_start_tag,
+            tag_end=base_format.tag_end,
+            suffix=base_format.suffix,
+            no_think_excludes=base_format.no_think_excludes,
+        )
+
+    def _tokenize_request_stop_words(self, stop_words: List[str]) -> List[List[int]]:
+        stop_word_ids = []
+        for stop_word in stop_words:
+            # Byte-level tokenizers encode a word differently after a space.
+            variants = [stop_word]
+            if stop_word and not stop_word[0].isspace():
+                variants.append(" " + stop_word)
+            for variant in variants:
+                try:
+                    token_ids = self.tokenizer.encode(variant, add_special_tokens=False)
+                except TypeError:
+                    if not getattr(self, "_legacy_tokenizer_warned", False):
+                        self._legacy_tokenizer_warned = True
+                        logging.warning(
+                            "tokenizer %s does not accept add_special_tokens; "
+                            "stop words may pick up special tokens and never "
+                            "match in the engine",
+                            type(self.tokenizer).__name__,
+                        )
+                    token_ids = self.tokenizer.encode(variant)
+                if token_ids:
+                    stop_word_ids.append(list(token_ids))
+        return stop_word_ids
+
+    def _extract_generation_config(
+        self,
+        request: ChatCompletionRequest,
+        input_ids: Optional[List[int]] = None,
+        renderer: Optional[CustomChatRenderer] = None,
+    ) -> GenerateConfig:
+        # TODO(wangyin): implement this
+        renderer = renderer or self.chat_renderer
+        config = request.extra_configs or GenerateConfig()
+        if request.extra_configs is not None and (
+            config.response_format is not None
+            or GrammarConstraint.collect_from_config(config)
+        ):
+            raise FtRuntimeException(
+                ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                "structured output must use top-level response_format, not extra_configs",
+            )
+        if request.response_format is not None:
+            config.response_format = request.response_format
+        elif request.json_format:
+            config.response_format = ResponseFormat(type="json_object")
+        if request.trace_id != None:
+            config.trace_id = request.trace_id
+        if request.stream == True:
+            config.is_streaming = True
+        if request.temperature != None:
+            config.temperature = request.temperature
+        if request.top_p != None:
+            config.top_p = request.top_p
+        if request.top_k != None:
+            config.top_k = request.top_k
+        if request.n != None:
+            config.num_return_sequences = request.n
+        request_stop_words_list = request.stop if request.stop != None else []
+        if isinstance(request_stop_words_list, str):
+            request_stop_words_list = [request_stop_words_list]
+        else:
+            request_stop_words_list = list(request_stop_words_list)
+        request_stop_words_list.extend(config.stop_words_str)
+        config.stop_words_str = list(
+            set(self.stop_words_str_list + request_stop_words_list)
+        )
+        config.stop_words_list = self._dedup_stop_words_list(
+            self.stop_words_id_list
+            + self.chat_renderer.tokenize_words(self.stop_words_str_list)
+            + self._tokenize_request_stop_words(request_stop_words_list)
+            + config.stop_words_list
+        )
+        if request.chat_id != None:
+            config.chat_id = request.chat_id
+        if request.seed != None:
+            config.random_seed = request.seed
+        if request.logprobs != None:
+            if not request.logprobs:
+                config.return_all_probs = ReturnAllProbsMode.NONE
+            # Priority: if extra_configs.return_all_probs is already set to
+            # something non-NONE (typically ORIGINAL), honor that — caller has
+            # explicitly opted into a specific mode. Only fall through to
+            # logprobs_mode when no extra_configs override is present.
+            elif config.return_all_probs == ReturnAllProbsMode.NONE:
+                if request.logprobs_mode == "original":
+                    config.return_all_probs = ReturnAllProbsMode.ORIGINAL
+                else:
+                    config.return_all_probs = ReturnAllProbsMode.DEFAULT
+        if request.logprobs or request.functions:
+            config.is_streaming = True
+        if request.prompt_logprobs is not None:
+            if request.prompt_logprobs <= 0 or request.prompt_logprobs > 1024:
+                raise FtRuntimeException(
+                    ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                    f"prompt_logprobs must be in [1, 1024], got {request.prompt_logprobs}",
+                )
+            config.return_prompt_logits = True
+            config.prompt_logits_top_k = request.prompt_logprobs
+            config.enforce_prompt_scoring_constraints()
+            request.stream = False
+        if config.return_prompt_logits and request.prompt_logprobs is None:
+            config.validate()
+            request.stream = False
+        config.convert_select_tokens(len(self.tokenizer), self.tokenizer)
+
+        if (
+            request.extra_configs
+            and request.extra_configs.max_thinking_tokens is not None
+            and isinstance(request.extra_configs.max_thinking_tokens, int)
+        ):
+            config.max_thinking_tokens = request.extra_configs.max_thinking_tokens
+        if request.thinking_budget is not None:
+            budget = int(request.thinking_budget)
+            config.max_thinking_tokens = _INT32_MAX if budget < 0 else budget
+        config.thinking_mode = renderer.resolve_thinking_mode(request)
+        config.in_think_mode = config.thinking_mode == ThinkingMode.ENABLED
+        if config.thinking_mode == ThinkingMode.DISABLED:
+            config.max_thinking_tokens = 0
+        max_completion_tokens = _positive_int_or_none(request.max_completion_tokens)
+        max_tokens_cap = _positive_int_or_none(request.max_tokens)
+        if max_completion_tokens is not None:
+            backend_max_new_tokens = max_completion_tokens
+            if max_tokens_cap is not None:
+                backend_max_new_tokens = min(backend_max_new_tokens, max_tokens_cap)
+            config.max_new_tokens = backend_max_new_tokens
+        elif request.max_tokens != None:
+            config.max_new_tokens = request.max_tokens
+        config.add_thinking_params(
+            self.tokenizer,
+            self.generate_env_config,
+            enable_thinking=(
+                None
+                if config.thinking_mode == ThinkingMode.ADAPTIVE
+                else config.thinking_mode == ThinkingMode.ENABLED
+            ),
+            reasoning_format=self._reasoning_format_for_prompt(
+                config, renderer, input_ids
+            ),
+        )
+        if request.debug_info:
+            config.return_output_ids = True
+        return config
+
+    @staticmethod
+    def _apply_renderer_chat_constraints(
+        renderer,
+        request: ChatCompletionRequest,
+        config: GenerateConfig,
+    ) -> None:
+        apply_constraints = getattr(renderer, "apply_chat_completion_constraints", None)
+        if apply_constraints is not None:
+            apply_constraints(request, config)
+
+    @staticmethod
+    def _merge_tool_calls(
+        existing_tool_calls: Optional[List[ToolCall]],
+        delta_tool_calls: Optional[List[ToolCall]],
+    ) -> Optional[List[ToolCall]]:
+        """
+        合并增量的 tool_calls 到现有的 tool_calls 中
+        Args:
+            existing_tool_calls: 现有的 tool_calls 列表
+            delta_tool_calls: 增量的 tool_calls 列表
+        Returns:
+            合并后的 tool_calls 列表
+        """
+        if delta_tool_calls is None:
+            return existing_tool_calls
+        if existing_tool_calls is None:
+            existing_tool_calls = []
+        for delta_tool_call in delta_tool_calls:
+            # 查找是否已存在相同 index 的 tool_call
+            existing_tool_call = None
+            if delta_tool_call.index is not None:
+                for existing in existing_tool_calls:
+                    if existing.index == delta_tool_call.index:
+                        existing_tool_call = existing
+                        break
+            if existing_tool_call is None:
+                # 创建新的 tool_call
+                new_tool_call = ToolCall(
+                    index=delta_tool_call.index,
+                    id=delta_tool_call.id,
+                    type=delta_tool_call.type,
+                    function=FunctionCall(
+                        name=(
+                            delta_tool_call.function.name
+                            if delta_tool_call.function
+                            else None
+                        ),
+                        arguments=(
+                            delta_tool_call.function.arguments
+                            if delta_tool_call.function
+                            else None
+                        ),
+                    ),
+                )
+                existing_tool_calls.append(new_tool_call)
+            else:
+                # 增量更新现有的 tool_call
+                if delta_tool_call.id:
+                    existing_tool_call.id = delta_tool_call.id
+                if delta_tool_call.type:
+                    existing_tool_call.type = delta_tool_call.type
+                if delta_tool_call.function:
+                    if existing_tool_call.function is None:
+                        existing_tool_call.function = FunctionCall(
+                            name=delta_tool_call.function.name,
+                            arguments=delta_tool_call.function.arguments,
+                        )
+                    else:
+                        if delta_tool_call.function.name:
+                            existing_tool_call.function.name = (
+                                delta_tool_call.function.name
+                            )
+                        if delta_tool_call.function.arguments:
+                            if existing_tool_call.function.arguments is None:
+                                existing_tool_call.function.arguments = (
+                                    delta_tool_call.function.arguments
+                                )
+                            else:
+                                existing_tool_call.function.arguments += (
+                                    delta_tool_call.function.arguments
+                                )
+        return existing_tool_calls
+
+    @staticmethod
+    async def _collect_complete_response(
+        choice_generator: Optional[AsyncGenerator[StreamResponseObject, None]],
+        debug_info: Optional[DebugInfo],
+        tokenizer: Optional[Any] = None,
+    ) -> ChatCompletionResponse:
+        all_choices = []
+        usage = None
+        aux_info = None
+        extra_outputs = None
+        async for response in choice_generator:
+            if len(response.choices) != len(all_choices):
+                if all_choices == []:
+                    all_choices = [
+                        ChatCompletionResponseChoice(
+                            index=i,
+                            message=ChatMessage(
+                                role=choice.delta.role or RoleEnum.assistant,
+                                content=choice.delta.content or None,
+                                function_call=choice.delta.function_call or None,
+                                tool_calls=choice.delta.tool_calls or None,
+                            ),
+                            finish_reason=choice.finish_reason,
+                            logprobs=choice.logprobs,
+                        )
+                        for i, choice in enumerate(response.choices)
+                    ]
+                else:
+                    raise ValueError(
+                        f"response.choices has different length! "
+                        f"[{response.choices}] vs [{all_choices}]."
+                    )
+            else:
+                for i in range(len(all_choices)):
+                    if all_choices[i].message.content == None:
+                        all_choices[i].message.content = (
+                            response.choices[i].delta.content or None
+                        )
+                    else:
+                        all_choices[i].message.content += (
+                            response.choices[i].delta.content or ""
+                        )
+                    if all_choices[i].message.reasoning_content == None:
+                        all_choices[i].message.reasoning_content = (
+                            response.choices[i].delta.reasoning_content or None
+                        )
+                    else:
+                        all_choices[i].message.reasoning_content += (
+                            response.choices[i].delta.reasoning_content or ""
+                        )
+                    all_choices[i].message.role = (
+                        response.choices[i].delta.role or all_choices[i].message.role
+                    )
+                    all_choices[i].message.function_call = (
+                        response.choices[i].delta.function_call
+                        or all_choices[i].message.function_call
+                    )
+                    all_choices[i].message.tool_calls = (
+                        OpenaiEndpoint._merge_tool_calls(
+                            all_choices[i].message.tool_calls,
+                            response.choices[i].delta.tool_calls,
+                        )
+                    )
+                    all_choices[i].finish_reason = (
+                        response.choices[i].finish_reason
+                        or all_choices[i].finish_reason
+                    )
+                    if all_choices[i].logprobs != None:
+                        if response.choices[i].logprobs != None:
+                            all_choices[i].logprobs.content += response.choices[
+                                i
+                            ].logprobs.content
+                    else:
+                        all_choices[i].logprobs = response.choices[i].logprobs
+            usage = response.usage or usage
+            aux_info = response.aux_info or aux_info
+            if (
+                extra_outputs is not None
+                and response.extra_outputs is not None
+                and response.extra_outputs.custom_output is not None
+            ):
+                # Persistent scores must not erase prefill-only outputs.
+                extra_outputs = extra_outputs.model_copy(
+                    update=response.extra_outputs.model_dump(exclude_none=True)
+                )
+            else:
+                extra_outputs = response.extra_outputs or extra_outputs
+
+        if usage == None:
+            logging.warning(f"No usage returned from stream response. use empty value.")
+            usage = UsageInfo(prompt_tokens=0, total_tokens=0, completion_tokens=0)
+
+        if (
+            debug_info is not None
+            and extra_outputs is not None
+            and extra_outputs.output_ids is not None
+        ):
+            debug_info.output_ids = extra_outputs.output_ids
+            if tokenizer:
+                debug_info.raw_output = [
+                    tokenizer.decode(output_ids)
+                    for output_ids in extra_outputs.output_ids
+                ]
+
+        return ChatCompletionResponse(
+            choices=all_choices,
+            usage=usage,
+            aux_info=aux_info,
+            model="",
+            debug_info=debug_info,
+            extra_outputs=extra_outputs,
+        )
+
+    @staticmethod
+    def _complete_stream_response(
+        choice_generator: AsyncGenerator[StreamResponseObject, None],
+        debug_info: Optional[DebugInfo],
+        tokenizer: Optional[Any] = None,
+    ) -> CompleteResponseAsyncGenerator:
+        # prompt_logits is attached by renderer.generate_choice on the last StreamResponseObject;
+        # capture it here so collect_with_prompt_logits can attach it to the final ChatCompletionResponse.
+        captured_prompt_logits = {}
+
+        async def response_generator():
+            debug_info_responded = False
+
+            async for response in choice_generator:
+                output = None
+                if (
+                    debug_info is not None
+                    and response.extra_outputs is not None
+                    and response.extra_outputs.output_ids is not None
+                ):
+                    output = DebugInfo()
+                    output.output_ids = response.extra_outputs.output_ids
+                    output.raw_output = [
+                        tokenizer.decode(output_ids)
+                        for output_ids in response.extra_outputs.output_ids
+                    ]
+
+                if response.prompt_logits is not None:
+                    captured_prompt_logits["data"] = response.prompt_logits
+
+                yield ChatCompletionStreamResponse(
+                    choices=response.choices,
+                    usage=response.usage,
+                    aux_info=response.aux_info,
+                    debug_info=debug_info if not debug_info_responded else output,
+                    extra_outputs=response.extra_outputs,
+                )
+                debug_info_responded = True
+
+        async def collect_with_prompt_logits(generator):
+            resp = await OpenaiEndpoint._collect_complete_response(
+                generator, debug_info=debug_info, tokenizer=tokenizer
+            )
+            if "data" in captured_prompt_logits:
+                resp.prompt_logprobs = captured_prompt_logits["data"]
+            return resp
+
+        return CompleteResponseAsyncGenerator(
+            response_generator(), collect_with_prompt_logits
+        )
+
+    def _get_debug_info(
+        self,
+        renderer: CustomChatRenderer,
+        renderered_input: RenderedInputs,
+        gen_config: GenerateConfig,
+    ) -> DebugInfo:
+        if renderered_input.rendered_prompt != "":
+            prompt = renderered_input.rendered_prompt
+        else:
+            prompt = self.tokenizer.decode(renderered_input.input_ids)
+        return DebugInfo(
+            input_prompt=prompt,
+            input_ids=renderered_input.input_ids,
+            input_urls=[
+                mm_input.url for mm_input in renderered_input.multimodal_inputs
+            ],
+            tokenizer_info=str(self.tokenizer),
+            max_seq_len=self.max_seq_len,
+            eos_token_id=self.eos_token_id,
+            stop_word_ids_list=self.stop_words_id_list,
+            stop_words_list=self.stop_words_str_list,
+            renderer_info=renderer.get_renderer_info(),
+            generate_config=gen_config,
+        )
+
+    def render_chat(self, chat_request: ChatCompletionRequest):
+        renderer = (
+            self.template_renderer if chat_request.user_template else self.chat_renderer
+        )
+        prepopulate_str = ""
+        if len(chat_request.messages) > 0 and chat_request.messages[-1].partial:
+            prepopulate_str = str(chat_request.messages[-1].content)
+            chat_request.messages.pop()
+        rendered_input = renderer.render_chat(chat_request)
+        if prepopulate_str != "":
+            rendered_input.rendered_prompt += prepopulate_str
+            rendered_input.input_ids += self.tokenizer.encode(prepopulate_str)
+        return rendered_input
+
+    def chat_completion(
+        self, request_id: int, chat_request: ChatCompletionRequest, raw_request: Request
+    ) -> CompleteResponseAsyncGenerator:
+        renderer = (
+            self.template_renderer if chat_request.user_template else self.chat_renderer
+        )
+        rendered_input = self.render_chat(chat_request)
+        generate_config = self._extract_generation_config(
+            chat_request, rendered_input.input_ids, renderer
+        )
+
+        # 生成式推荐：chat 链路同样需要从 rendered_prompt 解析已曝光商品并填充
+        # banned_combo_token_ids。函数内部做了开关与空值短路，对非推荐场景零侵入。
+        parse_and_fill_banned_combo(
+            rendered_input.rendered_prompt, generate_config, self.tokenizer
+        )
+        self._apply_renderer_chat_constraints(renderer, chat_request, generate_config)
+
+        mm_inputs = rendered_input.multimodal_inputs
+
+        if generate_config.return_prompt_logits and mm_inputs:
+            raise FtRuntimeException(
+                ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                "prompt scoring does not support multimodal inputs",
+            )
+
+        if generate_config.sp_advice_prompt != "":
+            generate_config.sp_advice_prompt_token_ids = self.tokenizer.encode(
+                generate_config.sp_advice_prompt
+            )
+
+        debug_info = (
+            self._get_debug_info(renderer, rendered_input, generate_config)
+            if chat_request.debug_info
+            else None
+        )
+
+        # Extract QoS priority from HTTP headers and store on generate_config
+        # so it survives IPC to the dash_sc enqueue loop, where
+        # GenerateInput.headers may be absent.
+        request_headers = extract_request_headers(raw_request.headers)
+        qos_level = request_headers.get("x-dashscope-inner-qos-level")
+        if qos_level is not None:
+            try:
+                generate_config.qos_priority = int(str(qos_level).strip())
+            except (TypeError, ValueError):
+                pass
+
+        choice_generator = renderer.generate_choice(
+            request_id,
+            rendered_input.input_ids,
+            mm_inputs,
+            generate_config,
+            self.backend_rpc_server_visitor,
+            chat_request,
+            headers=request_headers,
+        )
+
+        return self._complete_stream_response(
+            choice_generator, debug_info, self.tokenizer
+        )
+
+    def _prepare_chat_input(self, request_id: int, chat_request):
+        import torch
+
+        from rtp_llm.utils.base_model_datatypes import GenerateInput
+
+        renderer = (
+            self.template_renderer if chat_request.user_template else self.chat_renderer
+        )
+        rendered_input = self.render_chat(chat_request)
+        generate_config = self._extract_generation_config(
+            chat_request, rendered_input.input_ids, renderer
+        )
+
+        if generate_config.return_prompt_logits and rendered_input.multimodal_inputs:
+            raise FtRuntimeException(
+                ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                "prompt scoring does not support multimodal inputs",
+            )
+
+        if generate_config.sp_advice_prompt != "":
+            generate_config.sp_advice_prompt_token_ids = self.tokenizer.encode(
+                generate_config.sp_advice_prompt
+            )
+
+        input_id_tensor = torch.Tensor(rendered_input.input_ids).int().unsqueeze(0)
+        gen_input = GenerateInput(
+            request_id=request_id,
+            token_ids=input_id_tensor,
+            mm_inputs=rendered_input.multimodal_inputs,
+            generate_config=generate_config,
+            tokenizer=self.tokenizer,
+        )
+        return gen_input, generate_config
+
+    async def _render_single_output(self, outputs, chat_request, generate_config):
+        """Render a single GenerateOutputs into a ChatCompletionResponse.
+        Only non-streaming mode is supported for batch inference."""
+        renderer = (
+            self.template_renderer if chat_request.user_template else self.chat_renderer
+        )
+
+        async def _single_output_gen(out):
+            yield out
+
+        output_generator = _single_output_gen(outputs)
+
+        prompt_logits_data = None
+        if generate_config.return_prompt_logits:
+            (
+                output_generator,
+                prompt_logits_data,
+            ) = await renderer._extract_prompt_logits(output_generator)
+
+        merged_gen = await renderer._merge_non_streaming_outputs(output_generator)
+        choice_generator = renderer.render_response_stream(
+            merged_gen, chat_request, generate_config
+        )
+        resp = await self._collect_complete_response(
+            choice_generator, None, self.tokenizer
+        )
+        if prompt_logits_data is not None:
+            resp.prompt_logprobs = prompt_logits_data
+        return resp
+
+    async def batch_chat_completion(self, base_request_id: int, batch_request) -> list:
+        inputs = []
+        all_configs = []
+        for i, chat_request in enumerate(batch_request.requests):
+            if chat_request.stream:
+                raise ValueError(
+                    f"batch chat completion does not support streaming (request index {i})"
+                )
+            chat_request.stream = False
+            gen_input, generate_config = self._prepare_chat_input(
+                base_request_id + i, chat_request
+            )
+            generate_config.is_streaming = False
+            inputs.append(gen_input)
+            all_configs.append(generate_config)
+
+        batch_outputs = await self.backend_rpc_server_visitor.batch_enqueue(inputs)
+
+        responses = []
+        for i, outputs in enumerate(batch_outputs):
+            complete_response = await self._render_single_output(
+                outputs, batch_request.requests[i], all_configs[i]
+            )
+            responses.append(complete_response)
+
+        return responses
+
+    def chat_render(self, chat_request: ChatCompletionRequest) -> DebugInfo:
+        renderer = (
+            self.template_renderer if chat_request.user_template else self.chat_renderer
+        )
+        rendered_input = self.render_chat(chat_request)
+        generate_config = self._extract_generation_config(
+            chat_request, rendered_input.input_ids, renderer
+        )
+        self._apply_renderer_chat_constraints(renderer, chat_request, generate_config)
+        debug_info = self._get_debug_info(renderer, rendered_input, generate_config)
+        return debug_info

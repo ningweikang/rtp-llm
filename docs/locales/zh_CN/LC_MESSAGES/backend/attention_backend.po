@@ -1,0 +1,180 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2025, RTP-LLM
+# This file is distributed under the same license as the RTP-LLM package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2025.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: RTP-LLM 0.2.0\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-10-20 10:08+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: zh_CN\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.17.0\n"
+
+#: ../../backend/attention_backend.md:1
+msgid "Attention Backend"
+msgstr ""
+
+#: ../../backend/attention_backend.md:3
+msgid "Supporting matrix for different attention backends"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**Backend**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**Page Size > 1**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**Spec Decoding**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**MLA**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**Sliding Window**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**Device Support**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**Server Args**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**Stage**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "❌"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "NV ✅<br> AMD ❌"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**FLASHINFER_TRTLLM_GEN**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "NV SM100 ✅<br> AMD ❌"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "--enable_flashinfer_trtllm_gen"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "NV SM90/SM12x ✅<br> AMD ❌"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "PREFILL ✅ <br>  DECODE❌"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**FLASHINFER_TRT_FMHA_V2**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "--enable_flashinfer_trt_fmha_v2"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**PAGED_FLASHINFER_TRT_FMHA_V2**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "✅"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "--enable_paged_flashinfer_trt_fmha_v2"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**OPEN_SOURCE**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "--enable_open_source_fmha"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**PAGED_OPEN_SOURCE**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "--enable_paged_open_source_fmha"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**CKFMHA**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "NV ❌<br> AMD ✅"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "None"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**FLASHINFER_NATIVE**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "NV ✅<br> AMD ✅"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "--disable_flashinfer_native<br>--disable_flashinfer_hybrid_prefill"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "PREFILL ✅ <br>  DECODE✅"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**XQA**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "NV Hopper ✅<br> AMD ❌"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "--enable_xqa"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "PREFILL ❌ <br>  DECODE✅"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**FlashMLA**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**MMHA**"
+msgstr ""
+
+#: ../../backend/attention_backend.md
+msgid "**AiterPA**"
+msgstr ""

@@ -1,0 +1,256 @@
+load("@hedron_compile_commands//:refresh_compile_commands.bzl", "refresh_compile_commands")
+load("//:def.bzl", "copts", "cuda_copts", "if_ascend")
+load("@arch_config//:arch_select.bzl", "select_py_bindings", "torch_deps")
+load("@bazel_skylib//lib:selects.bzl", "selects")
+
+config_setting(
+    name = "enable_triton",
+    values = {"define": "enable_triton=true"},
+)
+
+config_setting(
+    name = "using_cuda",
+    define_values = {"using_cuda": "true"},
+)
+
+config_setting(
+    name = "using_cuda12",
+    values = {"define": "using_cuda12=true"},
+)
+
+config_setting(
+    name = "using_cuda12_9_x86",
+    define_values = {
+        "using_cuda12": "true",
+        "using_cuda12_9_x86": "true",
+    },
+)
+
+config_setting(
+    name = "cuda_pre_12_9",
+    define_values = {
+        "using_cuda12_9_x86": "false",
+        "using_cuda12_arm": "false",
+        "using_cuda13_x86": "false",
+    },
+)
+
+config_setting(
+    name = "using_cuda12_arm",
+    values = {"define": "using_cuda12_arm=true"},
+)
+
+# using_cuda13_arm is a stricter subset of using_cuda12_arm (the config_setting
+# above still matches so existing selects that route ARM → pip_cuda12_arm_torch
+# keep working); additionally enables code paths that need to differentiate
+# CUDA 13 from CUDA 12.
+config_setting(
+    name = "using_cuda13_arm",
+    # Lists every define the cuda13_arm config sets so this setting is a strict
+    # specialization of using_cuda / using_cuda12 / using_cuda12_arm: selects
+    # that carry those branches alongside this one stay unambiguous (Bazel
+    # picks the stricter match).
+    define_values = {
+        "using_cuda": "true",
+        "using_cuda12": "true",
+        "using_cuda12_arm": "true",
+        "using_cuda13_arm": "true",
+    },
+)
+
+# x86_64 counterpart of using_cuda13_arm — same CUDA-13-vs-12 differentiation,
+# applied on x86 builds. Enables CUDA-13-specific dependency selection on the
+# x86 toolchain.
+#
+# define_values lists ALL flags this config requires, so Bazel can detect
+# specialization: a select() with both `using_cuda` and `using_cuda13_x86`
+# keys picks `using_cuda13_x86` for cuda13 builds (it's the strict superset).
+# Without listing using_cuda + using_cuda12 here, Bazel would report
+# "multiple matching configs" for those selects.
+config_setting(
+    name = "using_cuda13_x86",
+    define_values = {
+        "using_cuda": "true",
+        "using_cuda12": "true",
+        "using_cuda13_x86": "true",
+    },
+)
+
+config_setting(
+    name = "using_cuda12_x86",
+    values = {"define": "using_cuda12_x86=true"},
+)
+
+config_setting(
+    name = "using_rocm",
+    values = {"define": "using_rocm=true"},
+)
+
+config_setting(
+    name = "using_ascend",
+    values = {"define": "using_ascend=true"},
+)
+
+
+config_setting(
+    name = "rocm_gfx950",
+    define_values = {
+        "using_rocm": "true",
+        "gfx950": "true",
+    },
+)
+
+config_setting(
+    name = "using_arm",
+    values = {"define": "using_arm=true"},
+)
+
+config_setting(
+    name = "using_cpu",
+    values = {"define": "using_cpu=true"},
+)
+
+selects.config_setting_group(
+    name = "using_cuda12_9",
+    match_any = [
+        ":using_cuda12_9_x86",
+        ":using_cuda12_arm",
+    ],
+)
+
+# Selects whose cuda13_x86 behavior is identical to cuda12_9_x86 use this
+# group so we don't have to add a parallel branch to every select().
+selects.config_setting_group(
+    name = "using_cu12_9_or_13_x86",
+    match_any = [
+        ":using_cuda12_9_x86",
+        ":using_cuda13_x86",
+    ],
+)
+
+config_setting(
+    name = "xft_use_icx",
+    values = {"define": "xft_use_icx=true"},
+)
+
+config_setting(
+    name = "using_ppu",
+    define_values = {"use_ppu": "true"},
+)
+
+config_setting(
+    name = "using_remote_kv_cache",
+    define_values = {"use_remote_kv_cache": "true"},
+)
+
+cc_binary(
+    name = "th_transformer_config",
+    copts = copts(),
+    linkopts = ["-Wl,-rpath='$$ORIGIN'"] + if_ascend([
+        # For the CXX-ABI mismatch across CANN libraries that import torch_npu
+        # pulls in (mixed ABI=1/0 cause a std::regex runtime memory error): bind
+        # symbol references internally so this .so does not accidentally become
+        # the interposer for other modules' symbols. Ascend-only concern; other
+        # platforms keep default link semantics.
+        "-Wl,-Bsymbolic-functions",
+    ]),
+    linkshared = 1,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//rtp_llm/cpp/pybind:th_transformer_config_lib",
+    ],
+)
+
+cc_binary(
+    name = "th_grammar_tokenizer_info",
+    copts = copts(),
+    linkopts = [
+        "-Wl,-rpath='$$ORIGIN'",
+    ],
+    linkshared = 1,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//rtp_llm/cpp/engine_base/grammar:grammar_tokenizer_info_python",
+    ],
+)
+
+cc_binary(
+    name = "rtp_compute_ops",
+    copts = copts(),
+    linkopts = [
+        "-Wl,-rpath='$$ORIGIN'",
+        "-Wl,-rpath=$(NVSHMEM_DIR)/lib",
+        "-L$(NVSHMEM_DIR)/lib",
+    ],
+    linkshared = 1,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//rtp_llm/cpp/pybind:th_compute_lib",
+    ] + select({
+        "@//:using_cuda12": [
+            "//rtp_llm/cpp/pybind:th_transformer_gpu",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+cc_binary(
+    name = "mm_rdma_exporter",
+    copts = copts(),
+    linkopts = [
+        "-Wl,-rpath='$$ORIGIN'",
+    ],
+    linkshared = 1,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//rtp_llm/cpp/pybind:mm_rdma_exporter_pybind",
+    ],
+)
+
+cc_binary(
+    name = "th_transformer",
+    srcs = [
+        ":rtp_compute_ops",
+    ],
+    additional_linker_inputs = [
+        ":rtp_compute_ops",
+    ],
+    copts = copts(),
+    linkopts = [
+        "-Wl,-rpath='$$ORIGIN'",
+        # "-Wl,--exclude-libs,ALL",  # 添加这行，隐藏静态库符号
+    ] + select({
+        # ROCm keeps process-wide execution state in librtp_compute_ops.so.
+        # The generated link line lists the srcs entry before the engine objects
+        # that reference it, so the default --as-needed drops its DT_NEEDED.
+        # Repeat the library after the objects as an additional linker input.
+        ":using_rocm": [
+            "-Wl,--no-as-needed",
+            "-lrtp_compute_ops",
+            "-Wl,--as-needed",
+        ],
+        "//conditions:default": [],
+    }),
+    linkshared = 1,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//rtp_llm/cpp/pybind:th_transformer_lib",
+    ],
+)
+
+exports_files(["cc_test_wrapper.sh"])
+
+py_runtime(
+    name = "python310",
+    interpreter_path = "/opt/conda310/bin/python",
+    python_version = "PY3",
+    stub_shebang = "#!/opt/conda310/bin/python",
+    visibility = ["//visibility:public"],
+)
+
+refresh_compile_commands(
+    name = "refresh_compdb",
+    targets = {
+        "//rtp_llm/cpp/model_rpc:model_rpc_server": "--config=cuda12_6 --config=debug --sandbox_base=/mnt/ram/",
+    },
+)

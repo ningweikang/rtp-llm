@@ -1,0 +1,366 @@
+{
+    "_comment": "End-to-end tool-calling smoke for Kimi-Linear. Q0 (non-stream) and Q1 (stream) verify the KimiK2 detector + renderer; Q2 verifies multi-turn (tool result -> assistant text). Regenerate goldens via SAVE_RESPONSE=True if prompt/tool/model is changed.",
+    "model_type": "kimi_linear",
+    "model_path": "/mnt/nas1/hf/Kimi-Linear-48B-A3B-Instruct",
+    "query_result": [
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant. You have access to the provided tools. When the user asks a question that requires real-time, location-specific, or external information that you cannot answer from your own knowledge (for example current weather), you MUST call the appropriate tool with concrete arguments instead of guessing or asking the user. Do not output any explanation before the tool call.",
+                        "partial": false
+                    },
+                    {
+                        "role": "user",
+                        "content": "What's the current weather in San Francisco right now? Use celsius.",
+                        "partial": false
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_current_weather",
+                            "description": "Get the current weather conditions for a given city. Returns temperature, humidity and a short text description.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "location": {
+                                        "type": "string",
+                                        "description": "The city name, e.g. 'San Francisco' or 'Beijing'."
+                                    },
+                                    "unit": {
+                                        "type": "string",
+                                        "enum": [
+                                            "celsius",
+                                            "fahrenheit"
+                                        ],
+                                        "description": "Temperature unit to return."
+                                    }
+                                },
+                                "required": [
+                                    "location"
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "stream": false,
+                "max_tokens": 128,
+                "extra_configs": {
+                    "top_k": 1,
+                    "temperature": 0.0
+                }
+            },
+            "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 1790741145,
+                "model": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "name": null,
+                            "reasoning_content": null,
+                            "function_call": null,
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_aaaaaaaaaaaaaaaaaaaaaaaa",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_current_weather",
+                                        "arguments": "{\"location\": \"San Francisco\", \"unit\": \"celsius\"}"
+                                    }
+                                }
+                            ],
+                            "partial": false,
+                            "tool_call_id": null
+                        },
+                        "finish_reason": "tool_calls",
+                        "logprobs": null
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 203,
+                    "total_tokens": 230,
+                    "completion_tokens": 27,
+                    "completion_tokens_details": null,
+                    "prompt_tokens_details": null
+                },
+                "debug_info": null,
+                "aux_info": {
+                    "cost_time": 1462.324,
+                    "iter_count": 27,
+                    "prefix_len": 0,
+                    "input_len": 203,
+                    "output_len": 27,
+                    "step_output_len": 27,
+                    "first_token_cost_time": 210.533,
+                    "wait_time": 0.469,
+                    "pd_sep": false,
+                    "cum_log_probs": [],
+                    "beam_responses": [],
+                    "softmax_probs": [],
+                    "reuse_len": 0,
+                    "local_reuse_len": 0,
+                    "remote_reuse_len": 0,
+                    "memory_reuse_len": 0,
+                    "disk_reuse_len": 0,
+                    "prefill_total_reuse_len": 0,
+                    "prefill_local_reuse_len": 0,
+                    "prefill_remote_reuse_len": 0,
+                    "prefill_memory_reuse_len": 0,
+                    "prefill_disk_reuse_len": 0,
+                    "decode_total_reuse_len": 0,
+                    "decode_local_reuse_len": 0,
+                    "decode_remote_reuse_len": 0,
+                    "decode_memory_reuse_len": 0,
+                    "decode_disk_reuse_len": 0,
+                    "multimodal_lengths": {},
+                    "speculative_draft_rounds": 0,
+                    "speculative_accepted_tokens_per_pos": [],
+                    "generation_prefill_cuda_graph_status": "not_requested",
+                    "role_addrs": [],
+                    "aux_string": ""
+                },
+                "extra_outputs": null,
+                "prompt_logprobs": null
+            }
+        },
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant. You have access to the provided tools. When the user asks a question that requires real-time, location-specific, or external information that you cannot answer from your own knowledge (for example current weather), you MUST call the appropriate tool with concrete arguments instead of guessing or asking the user. Do not output any explanation before the tool call.",
+                        "partial": false
+                    },
+                    {
+                        "role": "user",
+                        "content": "What's the current weather in San Francisco right now? Use celsius.",
+                        "partial": false
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_current_weather",
+                            "description": "Get the current weather conditions for a given city. Returns temperature, humidity and a short text description.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "location": {
+                                        "type": "string",
+                                        "description": "The city name, e.g. 'San Francisco' or 'Beijing'."
+                                    },
+                                    "unit": {
+                                        "type": "string",
+                                        "enum": [
+                                            "celsius",
+                                            "fahrenheit"
+                                        ],
+                                        "description": "Temperature unit to return."
+                                    }
+                                },
+                                "required": [
+                                    "location"
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "stream": true,
+                "max_tokens": 128,
+                "extra_configs": {
+                    "top_k": 1,
+                    "temperature": 0.0
+                }
+            },
+            "result": {
+                "id": "chat",
+                "object": "chat.completion.chunk",
+                "created": 1777441830,
+                "model": null,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_aaaaaaaaaaaaaaaaaaaaaaaa",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_current_weather",
+                                        "arguments": "{\"location\": \"San Francisco\", \"unit\": \"celsius\"}"
+                                    }
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 203,
+                    "total_tokens": 230,
+                    "completion_tokens": 27,
+                    "completion_tokens_details": null,
+                    "prompt_tokens_details": null
+                },
+                "debug_info": null,
+                "aux_info": null,
+                "extra_outputs": null
+            }
+        },
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant. You have access to the provided tools. Always call a tool when one is appropriate, otherwise reply normally.",
+                        "partial": false
+                    },
+                    {
+                        "role": "user",
+                        "content": "What's the current weather in San Francisco right now? Use celsius.",
+                        "partial": false
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "get_current_weather:0",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_current_weather",
+                                    "arguments": "{\"location\": \"San Francisco\", \"unit\": \"celsius\"}"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "get_current_weather:0",
+                        "content": "{\"location\": \"San Francisco\", \"unit\": \"celsius\", \"temperature\": 17, \"humidity\": 72, \"description\": \"partly cloudy\"}"
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_current_weather",
+                            "description": "Get the current weather conditions for a given city. Returns temperature, humidity and a short text description.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "location": {
+                                        "type": "string",
+                                        "description": "The city name."
+                                    },
+                                    "unit": {
+                                        "type": "string",
+                                        "enum": [
+                                            "celsius",
+                                            "fahrenheit"
+                                        ],
+                                        "description": "Temperature unit to return."
+                                    }
+                                },
+                                "required": [
+                                    "location"
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "stream": false,
+                "max_tokens": 128,
+                "extra_configs": {
+                    "top_k": 1,
+                    "temperature": 0.0
+                }
+            },
+            "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 1790741147,
+                "model": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "The current weather in San Francisco is 17°C (62.6°F) with 72% humidity and partly cloudy skies.",
+                            "name": null,
+                            "reasoning_content": null,
+                            "function_call": null,
+                            "tool_calls": null,
+                            "partial": false,
+                            "tool_call_id": null
+                        },
+                        "finish_reason": "stop",
+                        "logprobs": null
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 225,
+                    "total_tokens": 252,
+                    "completion_tokens": 27,
+                    "completion_tokens_details": null,
+                    "prompt_tokens_details": null
+                },
+                "debug_info": null,
+                "aux_info": {
+                    "cost_time": 1282.071,
+                    "iter_count": 27,
+                    "prefix_len": 0,
+                    "input_len": 225,
+                    "output_len": 27,
+                    "step_output_len": 27,
+                    "first_token_cost_time": 92.846,
+                    "wait_time": 0.135,
+                    "pd_sep": false,
+                    "cum_log_probs": [],
+                    "beam_responses": [],
+                    "softmax_probs": [],
+                    "reuse_len": 0,
+                    "local_reuse_len": 0,
+                    "remote_reuse_len": 0,
+                    "memory_reuse_len": 0,
+                    "disk_reuse_len": 0,
+                    "prefill_total_reuse_len": 0,
+                    "prefill_local_reuse_len": 0,
+                    "prefill_remote_reuse_len": 0,
+                    "prefill_memory_reuse_len": 0,
+                    "prefill_disk_reuse_len": 0,
+                    "decode_total_reuse_len": 0,
+                    "decode_local_reuse_len": 0,
+                    "decode_remote_reuse_len": 0,
+                    "decode_memory_reuse_len": 0,
+                    "decode_disk_reuse_len": 0,
+                    "multimodal_lengths": {},
+                    "speculative_draft_rounds": 0,
+                    "speculative_accepted_tokens_per_pos": [],
+                    "generation_prefill_cuda_graph_status": "not_requested",
+                    "role_addrs": [],
+                    "aux_string": ""
+                },
+                "extra_outputs": null,
+                "prompt_logprobs": null
+            }
+        }
+    ]
+}

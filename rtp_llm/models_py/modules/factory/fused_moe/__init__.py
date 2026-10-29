@@ -1,0 +1,151 @@
+"""FusedMoe factory module
+
+Uses strategy pattern and builder pattern for refactored MOE factory.
+
+Main components:
+- FusedMoeFactory: Main factory class
+- MoeStrategy: Strategy base class
+- RouterBuilder/ExecutorBuilder: Builder classes
+- StrategyRegistry: Strategy registry
+
+Note: DeepEpInitializer is located in rtp_llm.models_py.distributed.deepep_initializer
+
+Usage example:
+    from rtp_llm.models_py.modules.factory import FusedMoeFactory
+
+    moe = FusedMoeFactory.create_fused_moe(config, weights)
+
+CUDA FP8/FP4 selection:
+    ``auto`` prefers ``mega_moe_se`` for EP models with shared experts. Set
+    ``MOE_STRATEGY=mega_moe`` to keep shared-expert computation independent.
+"""
+
+import torch
+
+from rtp_llm.device.device_type import DeviceType, get_device_type
+from rtp_llm.models_py.utils.arch import get_sm, is_cuda
+from rtp_llm.utils.backend_registry import run_backend_registrations
+
+from .defs.fused_moe import FusedMoe
+from .factory import FusedMoeFactory
+from .strategy_registry import StrategyRegistry
+
+__all__ = ["FusedMoeFactory", "StrategyRegistry", "FusedMoe"]
+
+
+# ============================================================================
+# Device-specific MoE strategy registration
+# ============================================================================
+
+device_type = get_device_type()
+
+# Import common strategies
+from rtp_llm.models_py.modules.factory.fused_moe.impl.common.strategy.batched_triton_strategy import (
+    BatchedTritonStrategy,
+)
+
+if device_type == DeviceType.ROCm:
+    # ========== ROCm Registry ==========
+
+    from rtp_llm.device.device_impl import is_gfx950
+
+    # MoE strategies
+    from rtp_llm.models_py.modules.factory.fused_moe.impl.rocm.strategy import (
+        RocmBf16PureTPStrategy,
+        RocmEpLowLatencyStrategy,
+        RocmEpNormalStrategy,
+        RocmFp8PerBlockPureTPStrategy,
+        RocmFp8PerChannelPureTPStrategy,
+        RocmMXFp4PureTPStrategy,
+    )
+
+    registry = StrategyRegistry()
+    registry.register(RocmEpLowLatencyStrategy())
+    registry.register(RocmEpNormalStrategy())
+    registry.register(RocmFp8PerChannelPureTPStrategy())
+    registry.register(RocmFp8PerBlockPureTPStrategy())
+    registry.register(RocmBf16PureTPStrategy())
+    registry.register(BatchedTritonStrategy())
+    FusedMoeFactory.set_registry(registry)
+    if is_gfx950():
+        registry.register(RocmMXFp4PureTPStrategy())
+
+elif device_type == DeviceType.Ascend:
+    # ========== Ascend Registry ==========
+
+    from rtp_llm.models_py.modules.factory.fused_moe.impl.ascend.strategy import (
+        AscendBf16FallbackStrategy,
+        AscendCannStrategy,
+    )
+
+    registry = StrategyRegistry()
+    # CANN first; the PyTorch fallback covers CANN opt-out configs.
+    registry.register(AscendCannStrategy())
+    registry.register(AscendBf16FallbackStrategy())
+    FusedMoeFactory.set_registry(registry)
+
+else:
+    # ========== CUDA Registry ==========
+
+    # MoE strategies
+    from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
+        CudaFp8PerBlockEpLowLatencyStrategy,
+        CudaFp8PerBlockEpNormalStrategy,
+        CudaFp8PerBlockNoDPMaskedStrategy,
+        CudaFp8PerBlockNoDPStrategy,
+        CudaFp8PerBlockPureCPStrategy,
+        CudaFp8PerBlockPureDPStrategy,
+        CudaFp8PerTensorEpLowLatencyStrategy,
+        CudaFp8PerTensorEpNormalStrategy,
+        CudaFp8PerTensorNoDPStrategy,
+        CudaGroupedFp4Strategy,
+        CudaLocalLoopStrategy,
+        CudaMegaMoeSEStrategy,
+        CudaMegaMoeStrategy,
+        CudaNoQuantCppStrategy,
+        CudaNoQuantDpNormalStrategy,
+        CudaNoQuantEpLowLatencyStrategy,
+        CudaW4a8Int4PerChannelEpLowLatencyStrategy,
+        CudaW4a8Int4PerChannelEpNormalStrategy,
+        CudaW4a8Int4PerChannelNoDPStrategy,
+    )
+
+    registry = StrategyRegistry()
+    # Registration order is the public ``auto`` preference for eligible
+    # FP8/FP4 EP models. ``mega_moe`` remains an explicit rollback path.
+    registry.register(CudaMegaMoeSEStrategy())
+    registry.register(CudaMegaMoeStrategy())
+    registry.register(CudaGroupedFp4Strategy())
+    registry.register(CudaLocalLoopStrategy())
+    registry.register(CudaFp8PerTensorEpLowLatencyStrategy())
+    registry.register(CudaFp8PerTensorEpNormalStrategy())
+    registry.register(CudaFp8PerBlockEpLowLatencyStrategy())
+    registry.register(CudaFp8PerBlockEpNormalStrategy())
+    registry.register(CudaFp8PerBlockPureCPStrategy())
+    registry.register(CudaFp8PerBlockPureDPStrategy())
+    registry.register(CudaFp8PerBlockNoDPMaskedStrategy())
+    registry.register(CudaFp8PerBlockNoDPStrategy())
+    registry.register(CudaFp8PerTensorNoDPStrategy())
+    registry.register(CudaNoQuantEpLowLatencyStrategy())
+    registry.register(CudaNoQuantDpNormalStrategy())
+    registry.register(CudaNoQuantCppStrategy())
+    registry.register(BatchedTritonStrategy())
+    registry.register(CudaW4a8Int4PerChannelEpLowLatencyStrategy())
+    registry.register(CudaW4a8Int4PerChannelEpNormalStrategy())
+    registry.register(CudaW4a8Int4PerChannelNoDPStrategy())
+    # Only register FP4 strategies on SM_100+ (and only if CUDA GPU is available)
+    if torch.cuda.is_available() and is_cuda() and get_sm()[0] >= 10:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
+            CudaFp4EpLowLatencyStrategy,
+            CudaFp4EpNormalStrategy,
+            CudaFp4NoDPStrategy,
+        )
+
+        registry.register(CudaFp4EpLowLatencyStrategy())
+        registry.register(CudaFp4EpNormalStrategy())
+        registry.register(CudaFp4NoDPStrategy())
+    FusedMoeFactory.set_registry(registry)
+
+# Out-of-tree backends registered a hook before this module existed. Runs for
+# every device branch, after the registry is populated and installed.
+run_backend_registrations("fused_moe", registry=registry)

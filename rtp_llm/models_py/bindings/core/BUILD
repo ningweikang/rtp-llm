@@ -1,0 +1,399 @@
+load("//:def.bzl", "rpm_library", "copts")
+load("@arch_config//:arch_select.bzl", "torch_deps")
+
+cc_library(
+    name = "types_hdr",
+    hdrs = [
+        "Types.h",
+        "Dispatch.h",
+    ],
+    deps = [
+        "//rtp_llm/cpp/utils:core_utils",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "types",
+    srcs = [
+        "Types.cc",
+    ],
+    deps = [
+        ":types_hdr",
+    ] + select({
+        "@//:using_cuda": ["@local_config_cuda//cuda:cuda_headers",
+                           "@local_config_cuda//cuda:cudart"],
+        "@//:using_rocm": ["@local_config_rocm//rocm:rocm_headers",
+                           "@local_config_rocm//rocm:rocm",
+                           "//rtp_llm/models_py/bindings/rocm:rocm_types_hdr"],
+        "@//:using_ascend": ["@local_config_ascend//ascend:ascend_headers"],
+        "//conditions:default": [],
+    }),
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "type_convert",
+    hdrs = [
+        "torch_utils/TypeConvert.h",
+    ],
+    deps = [
+        ":types",
+    ] + torch_deps(),
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "common_defines",
+    hdrs = [
+        "CommonDefines.h",
+    ],
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "tensor_holder",
+    hdrs = [
+        "TensorHolder.h",
+    ],
+    deps = torch_deps(),
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "op_data",
+    hdrs = [
+        "OpData.h",
+    ],
+    srcs = [
+        "OpData.cc",
+    ],
+    deps = [
+        ":type_convert",
+        ":common_defines",
+        ":tensor_holder",
+        "//rtp_llm/cpp/models/models_weight:weights_define",
+        "//rtp_llm/cpp/model_utils:model_utils",
+        "//rtp_llm/cpp/models:stats",
+        "//rtp_llm/models_py/bindings:op_defs",
+        "//rtp_llm/cpp/utils:stack_trace",
+        "//rtp_llm/cpp/utils:tensor_debug_utils",
+        "//rtp_llm/cpp/config:static_config",
+    ],
+    copts = copts(),
+    alwayslink = True,
+    visibility = ["//visibility:public"],
+)
+
+# ExecOps — unified public header for runtime operations.
+# Replaces the former ExecutionContext.h (now deleted).
+cc_library(
+    name = "exec_ops_hdr",
+    hdrs = [
+        "ExecOps.h",
+    ],
+    deps = [
+        ":op_data",
+        ":device_data",
+        "//rtp_llm/cpp/config:config_modules",
+        "//rtp_llm/cpp/models:stats",
+        "//rtp_llm/models_py/bindings/common/kernels:fuse_copy_util",
+    ] + torch_deps() + select({
+        "@//:using_rocm": ["@local_config_rocm//rocm:rocm_headers"],
+        "@//:using_ascend": ["@local_config_ascend//ascend:ascend_headers"],
+        "//conditions:default": [],
+    }),
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+# Test-only library for ExecOps.cc.
+# Use this for tests that already link cuda_impl.
+cc_library(
+    name = "exec_ops_test_lib",
+    hdrs = [
+        "ExecOps.h",
+    ],
+    srcs = [
+        "ExecOps.cc",
+    ],
+    deps = [
+        ":device_data",
+        ":op_data",
+        ":type_convert",
+        ":types_hdr",
+        ":common_defines",
+        "//rtp_llm/cpp/cache:cache_config",
+        "//rtp_llm/cpp/distribute:cpu_tp_broadcaster",
+        "//rtp_llm/cpp/utils:signal_utils",
+        "//rtp_llm/cpp/utils:kv_cache_utils",
+        "//rtp_llm/cpp/utils:debug_utils",
+        "//rtp_llm/cpp/config:static_config",
+        "//rtp_llm/cpp/model_utils:model_utils",
+        "//rtp_llm/cpp/config:config_modules",
+        "//rtp_llm/models_py/bindings:op_defs",
+        "//rtp_llm/cpp/models:stats",
+        "//rtp_llm/cpp/models/models_weight:weights_define",
+        "//rtp_llm/cpp/cache:cache_group_type",
+        "//rtp_llm/cpp/utils:core_utils",
+        "//rtp_llm/cpp/utils:error_code",
+        "//rtp_llm/cpp/pybind:th_utils",
+        "//rtp_llm/cpp/disaggregate/cache_store:cache_store_interface",
+        "//rtp_llm/models_py/bindings/common/kernels:kernels_sampling",
+        "@havenask//aios/autil:stack_tracer",
+        "@havenask//aios/autil:string_helper",
+        "@havenask//aios/autil:scope",
+    ] + torch_deps() + select({
+        "@//:using_cuda": [
+            "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
+        ],
+        "//conditions:default": [],
+    }),
+    copts = copts(),
+    visibility = ["//visibility:public"],
+    alwayslink = 1,
+)
+
+# DeviceData.h - standalone header for DeviceInitParams, DeviceType, etc.
+cc_library(
+    name = "device_data",
+    hdrs = [
+        "DeviceData.h",
+    ],
+    deps = [
+        ":common_defines",
+        "//rtp_llm/models_py/bindings/core:types_hdr",
+        "//rtp_llm/cpp/config:model_config",
+        "//rtp_llm/cpp/config:config_modules",
+    ],
+    visibility = ["//visibility:public"],
+    copts = copts(),
+)
+
+
+filegroup(
+    name = "exec_ctx_impl_srcs",
+    srcs = [
+        "CudaOps.cc",
+        "CudaSampleOp.cc",
+        "CudaBeamSearchOp.cc",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Split into two targets so that the process-wide global state
+# lives in exactly ONE .so.
+#
+# exec_ctx_state: ExecOps.cc
+#   Defines process-global runtime and Python callback state.
+#   Linked ONLY into librtp_compute_ops.so (via th_compute_lib).
+#
+# exec_ctx_ops: CudaOps.cc + sample ops
+#   Platform op implementations that do NOT directly touch global state.
+#   Linked into both .so files; calls to state accessors are resolved
+#   at load-time from librtp_compute_ops.so.
+
+cc_library(
+    name = "exec_ctx_state",
+    hdrs = [
+        "ExecOps.h",
+    ],
+    srcs = [
+        "ExecOps.cc",
+    ],
+    deps = [
+        ":device_data",
+        ":op_data",
+        ":type_convert",
+        ":types_hdr",
+        ":common_defines",
+        "//rtp_llm/cpp/cache:cache_config",
+        "//rtp_llm/cpp/distribute:cpu_tp_broadcaster",
+        "//rtp_llm/cpp/utils:signal_utils",
+        "//rtp_llm/cpp/utils:kv_cache_utils",
+        "//rtp_llm/cpp/utils:debug_utils",
+        "//rtp_llm/cpp/config:static_config",
+        "//rtp_llm/cpp/model_utils:model_utils",
+        "//rtp_llm/cpp/config:config_modules",
+        "//rtp_llm/models_py/bindings:op_defs",
+        "//rtp_llm/cpp/models:stats",
+        "//rtp_llm/cpp/models/models_weight:weights_define",
+        "//rtp_llm/cpp/cache:cache_group_type",
+        "//rtp_llm/cpp/utils:core_utils",
+        "//rtp_llm/cpp/utils:error_code",
+        "//rtp_llm/cpp/pybind:th_utils",
+        "//rtp_llm/cpp/disaggregate/cache_store:cache_store_interface",
+        "//rtp_llm/models_py/bindings/common/kernels:kernels_sampling",
+        "@havenask//aios/autil:stack_tracer",
+        "@havenask//aios/autil:string_helper",
+        "@havenask//aios/autil:scope",
+    ] + torch_deps() + select({
+        "@//:using_rocm": [
+            "//rtp_llm/models_py/bindings/rocm/kernels/sampling:sampling",
+            "//rtp_llm/models_py/bindings/rocm:rocm_host_utils",
+            "@local_config_rocm//rocm:rocm_headers",
+            "@local_config_rocm//rocm:rocm",
+        ],
+        "@//:using_cuda": [
+            "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
+            "//rtp_llm/models_py/bindings/cuda/kernels/sampling:sampling",
+        ],
+        "@//:using_ascend": [
+            "//rtp_llm/models_py/bindings/ascend:ascend_host_utils",
+            "@local_config_ascend//ascend:ascend_headers",
+            "@local_config_ascend//ascend:ascend",
+        ],
+        "//conditions:default": [],
+    }),
+    copts = copts(),
+    visibility = ["//visibility:public"],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "exec_ctx_ops",
+    srcs = [
+        "CudaOps.cc",
+        "CudaSampleOp.cc",
+        "CudaBeamSearchOp.cc",
+    ],
+    deps = [
+        ":exec_ops_hdr",
+        ":device_data",
+        ":op_data",
+        ":type_convert",
+        ":types_hdr",
+        ":common_defines",
+        "//rtp_llm/cpp/utils:signal_utils",
+        "//rtp_llm/cpp/utils:kv_cache_utils",
+        "//rtp_llm/cpp/utils:debug_utils",
+        "//rtp_llm/cpp/config:static_config",
+        "//rtp_llm/cpp/model_utils:model_utils",
+        "//rtp_llm/cpp/config:config_modules",
+        "//rtp_llm/models_py/bindings:op_defs",
+        "//rtp_llm/cpp/models:stats",
+        "//rtp_llm/cpp/models/models_weight:weights_define",
+        "//rtp_llm/cpp/cache:cache_group_type",
+        "//rtp_llm/cpp/utils:core_utils",
+        "//rtp_llm/cpp/pybind:th_utils",
+        "//rtp_llm/cpp/disaggregate/cache_store:cache_store_interface",
+        "//rtp_llm/models_py/bindings/common/kernels:kernels_sampling",
+        "//rtp_llm/models_py/bindings/common/kernels:vocab_prune_kernels",
+        "@havenask//aios/autil:stack_tracer",
+        "@havenask//aios/autil:string_helper",
+        "@havenask//aios/autil:scope",
+    ] + torch_deps() + select({
+        "@//:using_rocm": [
+            "//rtp_llm/models_py/bindings/rocm/kernels/sampling:sampling",
+            "//rtp_llm/models_py/bindings/rocm:speculative_sampling",
+            "//rtp_llm/models_py/bindings/rocm:rocm_host_utils",
+            "//rtp_llm/models_py/bindings/common/kernels:kernels_copy",
+            "//3rdparty/trt_beam_search:trt_beam_search_impl",
+            "@local_config_rocm//rocm:rocm_headers",
+            "@local_config_rocm//rocm:rocm",
+        ],
+        "@//:using_cuda": [
+            "//rtp_llm/models_py/bindings/cuda/kernels/sampling:sampling",
+            "//rtp_llm/models_py/bindings/cuda/kernels:kernels_speculative_sampling",
+        ],
+        "@//:using_ascend": [
+            "//rtp_llm/models_py/bindings/ascend:ascend_host_utils",
+            "//rtp_llm/models_py/bindings/ascend/ops:npu_bridge",
+            "@local_config_ascend//ascend:ascend_headers",
+            "@local_config_ascend//ascend:ascend",
+        ],
+        "//conditions:default": [],
+    }),
+    copts = copts(),
+    visibility = ["//visibility:public"],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "rejection_sampling_ops_test_lib",
+    srcs = [
+        "CudaSampleOp.cc",
+    ],
+    deps = [
+        ":common_defines",
+        ":op_data",
+        "//rtp_llm/cpp/utils:debug_utils",
+        "//rtp_llm/models_py/bindings/common/kernels:kernels_sampling",
+        "//rtp_llm/models_py/bindings/common/kernels:vocab_prune_kernels",
+    ] + torch_deps() + select({
+        "@//:using_rocm": [
+            "//rtp_llm/models_py/bindings/rocm/kernels/sampling:sampling",
+            "//rtp_llm/models_py/bindings/rocm:speculative_sampling",
+            "//rtp_llm/models_py/bindings/rocm:rocm_host_utils",
+            "@local_config_rocm//rocm:rocm_headers",
+            "@local_config_rocm//rocm:rocm",
+        ],
+        "@//:using_cuda": [
+            "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
+            "//rtp_llm/models_py/bindings/cuda/kernels/sampling:sampling",
+            "//rtp_llm/models_py/bindings/cuda/kernels:kernels_speculative_sampling",
+        ],
+        "@//:using_ascend": [
+            "//rtp_llm/models_py/bindings/ascend:ascend_host_utils",
+            "//rtp_llm/models_py/bindings/ascend/ops:npu_bridge",
+            "@local_config_ascend//ascend:ascend_headers",
+            "@local_config_ascend//ascend:ascend",
+        ],
+        "//conditions:default": [],
+    }),
+    copts = copts(),
+    visibility = ["//visibility:public"],
+    alwayslink = 1,
+)
+
+# Isolate CudaSampleOp.cc from GPU-only dependencies so the generic PyTorch
+# fallback remains compile- and testable under --config=cpu.
+cc_library(
+    name = "generic_sampler_fallback_test_lib",
+    srcs = ["CudaSampleOp.cc"],
+    deps = [
+        ":common_defines",
+        ":op_data",
+    ] + torch_deps(),
+    copts = copts(),
+    target_compatible_with = select({
+        "@//:using_cpu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//rtp_llm/models_py/bindings/core/test:__pkg__"],
+)
+
+# Combined target for backward compatibility — pulls in both state + ops.
+cc_library(
+    name = "exec_ctx_rocm",
+    hdrs = [
+        "ExecOps.h",
+    ],
+    deps = [
+        ":exec_ctx_state",
+        ":exec_ctx_ops",
+    ],
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "cache_store_async_writer",
+    hdrs = ["CacheStoreAsyncWriter.h"],
+    srcs = ["CacheStoreAsyncWriter.cc"],
+    deps = [
+        ":exec_ops_hdr",
+        "//rtp_llm/cpp/cache:cache",
+        "//rtp_llm/cpp/utils:core_utils",
+        "//rtp_llm/cpp/utils:device_pin",
+        "//rtp_llm/models_py/bindings:op_defs",
+        "@havenask//aios/autil:env_util",
+        "@havenask//aios/autil:lock_free",
+    ] + torch_deps(),
+    visibility = ["//visibility:public"],
+    copts = copts(),
+)

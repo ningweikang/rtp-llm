@@ -1,0 +1,272 @@
+/*
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#pragma once
+
+#if USING_ROCM
+#include <hiprand/hiprand_kernel_rocm.h>
+#else
+#include <curand_kernel.h>
+#endif
+#include "rtp_llm/cpp/utils/StringUtil.h"
+#include "rtp_llm/cpp/utils/Logger.h"
+#include "common.h"
+#include "decodingCommon.h"
+#include "topkLastDim.h" // Air TopK
+
+#include <cstdlib>
+
+#define BEAM_SEARCH_DEBUG 0
+
+namespace tensorrt_llm
+{
+namespace kernels
+{
+// Runtime rollback switch for the V2 top-k radix routing (see topkLastDim.h for the
+// path legend): 0/unset = auto route, 1 = force multi-block, 2 = force one-block.
+// Anything else is rejected with a warning and falls back to 0, since a stray value
+// would silently select the multi-block route. Cached so the workspace-size query
+// and the run always agree on the path.
+inline int beamTopkForcePath()
+{
+    static int const force_path = [] {
+        char const* env = std::getenv("RTP_LLM_BEAM_TOPK_FORCE_PATH");
+        if (env == nullptr)
+        {
+            return 0;
+        }
+        char* end = nullptr;
+        long const v = std::strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v >= 0 && v <= 2)
+        {
+            return static_cast<int>(v);
+        }
+        RTP_LLM_LOG_WARNING("invalid RTP_LLM_BEAM_TOPK_FORCE_PATH='%s' (want 0/1/2), falling back to 0", env);
+        return 0;
+    }();
+    return force_path;
+}
+static size_t constexpr kMaxBeamWidth = 1024;           // Max beam width supported in TRT-LLM now
+static size_t constexpr kMaxBeamWidthForV1 = 8;         // Max beam width for V1 workflow (V2 for larger)
+static size_t constexpr kMaxBeamWidthArrayLength = 8;   // Max length of beam width array of a request
+static size_t constexpr kThreadForSmallBeamWidth = 256; // Max count of thread for stage 1 in V1 workflow
+static size_t constexpr kMaxVPartStage1 = 128;          // Max vocab part count for stage 1 in V1 workflow
+
+static float constexpr kBeamSearchDiversity = 0.f;
+static float constexpr kLengthPenalty = 0.f;
+static runtime::SizeType32 constexpr kEarlyStopping = 1;
+
+struct BeamHypotheses
+{
+    // clang-format off
+    // MBS: max_batch_size, BS: batch_size, MSL: max_seq_length
+    // BMI: beam_width_out, BMO: beam_width_out, MBM: max_beam_width
+    // %%: parameter name in file generation.py (python workflow)
+    // Candidate beams: a beam which generates end_id or its sequence length reaches MSL
+    // Candidate-Beam-Array (CBA): The arrays to place the candidate beams and related information
+    // Variable-Beam-Width-Search (VBWS): A search mode that allows using different beam width for each step
+
+    // Scalar values
+    bool bReturnNormedScore{false};         // Return `normedScore` or `cumLogProbs`, always be `false` now
+    bool bVBWS{false};                      // whether to use VBWS for Beam-Search
+    size_t nMaxBatchSize{0};                // Buildtime max batch size
+    size_t nBatchSize{0};                   // Runtime batch size
+    // size_t nMaxBeamWidth{0};                // Scalar value of max beam width, no less than nBeamWidthIn and nBeamWidthOut
+    size_t nBeamWidthIn{0};                 // Scalar value of current input beam width
+    size_t nBeamWidthOut{0};                // Scalar value of current output beam width
+    size_t nMaxSeqLen{0};                   //
+    size_t nVocabSize{0};                   // Vocab Size Padded
+    size_t nVPart{0};                       // Count of vocab_size_padded divided
+    size_t nByteMaxSharedMemoryPerBlock{0}; // Device information
+    size_t nByteSharedMemoryStage1{0};      // Dynamic shared memory size of stage 1
+    size_t nByteSharedMemoryStage3{0};      // Static shared memory size of stage 3
+
+    // Pointers from SamplingConfig
+    float const* diversityRates{nullptr};           // [BS]
+    float const* lengthPenalties{nullptr};          // [BS]
+    int const* earlyStoppings{nullptr};             // [BS]
+    int const* beamWidthArraysHost{nullptr};        // [BS, kMaxBeamWidthArrayLength]                           for VBWS
+    int* nBeamWidthInHost{nullptr};                 // [BS], cpu                                                for VBWS, beam width of last forward computation
+    int* nBeamWidthOutHost{nullptr};                // [BS], cpu                                                for VBWS, beam width of next forward computation
+
+    // Pointers for input
+    int* tokenIdsIn{nullptr};                       // [BS, BMI, MSL]    %%
+    int const* inputLengthsIn{nullptr};             // [BS, BMI]         %% context_length
+    int const* sequenceLengthsIn{nullptr};          // [BS, BMI]         %% context_length
+    int const* endIds{nullptr};                     // [BS, BMI]         %% self.end_ids
+    float const* cumLogProbsIn{nullptr};            // [BS, BMI]         %% self.cum_log_probs
+    runtime::SizeType32 const* batchSlots{nullptr}; // [BS]
+
+    // Pointers for output
+    int* tokenIdsOut{nullptr};                      // [BS, BMO, MSL]    %%
+    float* logProbs{nullptr};                       // [BS, BMO, MSL]    %% self.log_probs                       only used in gather_tree
+    float* logProbsTiled{nullptr};                  // [MSL, MBS, BMO]   %% self.log_probs_tiled
+    int* inputLengthsOut{nullptr};                  // [BS, BMI]         %% context_length
+    int* sequenceLengthsOut{nullptr};               // [BS, BMO]         %% self.sequence_length_buffer
+    float* cumLogProbsOut{nullptr};                 // [BS, BMO]         %% self.cum_log_probs
+
+    // Pointers of CBA
+    int* outputIdsCBA{nullptr};                     // [BS, BMO*2, MSL]  %% self.beam_hyps_output_ids_cba
+    float* logProbsCBA{nullptr};                    // [BS, BMO*2, MSL]  %% self.beam_hyps_log_probs_cba
+    int* sequenceLengthsCBA{nullptr};               // [BS, BMO*2]       %% self.beam_hyps_seq_len_cba
+    float* cumLogProbsCBA{nullptr};                 // [BS, BMO*2]       %% self.beam_hyps_cum_log_probs_cba
+    float* normedScoresCBA{nullptr};                // [BS, BMO*2]       %% self.beam_hyps_normed_scores_cba
+    int* numBeamsCBA{nullptr};                      // [BS]                %% self.beam_hyps_num_beams             number of beams in CBA
+    float* minNormedScoresCBA{nullptr};             // [BS]                %% self.beam_hyps_min_normed_scores     worst score in CBA
+
+    // Pointers related to beam search process, they are initialized in those two functions:
+    // [gptDecoder.cpp] GptDecoder<T>::forward or [dynamicDecodeOp.cpp] FtDynamicDecode<T>::forward
+    bool* batchDones{nullptr};                      // [BS]                %% self.beam_hyps_is_done               whether a whole batch is finished
+    FinishedState* finished{nullptr};               // [BS*BMO], uint8   %% self.finished                        whether and how a beam is finished
+
+    // Pointers for backtrack of the beams, they are relocated in [dynamicDecodeLayer.cpp] DynamicDecodeLayer<T>::prepareIdsPtrs
+    int* outputIdsPtr{nullptr};                     // [BS, BMO]    %% self.output_ids
+    int* parentIdsPtr{nullptr};                     // [BS, BMO]    %% self.parent_ids
+
+    // Pointers for gather_tree(), read the unfinished beams from them and write to CBA for the final selection
+    int const* outputIdsUnfinish{nullptr};          // [BS, BMO, MSL]   %% self.output_ids
+    int const* parentIdsUnfinish{nullptr};          // [BS, BMO, MSL]   %% self.parent_ids
+
+    // clang-format on
+
+    void print();
+};
+
+__inline__ int padToNextPowerOfTwo(int const n)
+{
+    // Pad n up to the nearest power of 2
+    int recursor = n - 1;
+    int res = 2;
+    while (recursor >>= 1)
+        res <<= 1;
+    return res;
+}
+
+template <typename T>
+__device__ __forceinline__ T applyLengthPenalty(T const log_prob, int const length, float const length_penalty)
+{
+    // score = log(prob) / (length ^ length_penalty)
+    if (length_penalty == 0.0f || length == 1)
+    {
+        return log_prob;
+    }
+    return log_prob / static_cast<T>(powf(static_cast<float>(length), length_penalty));
+}
+
+template <typename T, bool IS_V2>
+void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
+
+void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& bh,
+    runtime::SizeType32 const maxAttentionWindow, runtime::SizeType32 sinkTokenLength, cudaStream_t stream);
+
+// nvcc 13 emits explicit template instantiations of __global__ kernels with
+// internal linkage (Itanium-ABI L-prefix in the mangled name), so launching
+// addCumLogProbs<<<>>> from beamSearchKernels{4,8,...}.cu — which include the
+// template header — cannot resolve against the instantiation in
+// beamSearchKernels.cu.  Instead, expose a host wrapper that lives in the
+// same TU as the kernel definition, and have the template code call that.
+template <typename T>
+void launchAddCumLogProbs(
+    T* pStage1LogProbs, float const* cumLogProbs, FinishedState const* finished,
+    int const* endIds, float const* diversityRates,
+    runtime::SizeType32 const* batchSlots, size_t nBS, size_t nBMIn, size_t nBMOut,
+    int nThread, cudaStream_t stream);
+
+__global__ void gatherId(int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS,
+    size_t const nBMIn, size_t const nBMOut, size_t const nV);
+
+void invokePopulateTokenIds(int* tokenIdsOut, int const* tokenIdsIn, int const* sequenceLengthsOut, int const* parentIdsPtr, int const* outputIdsPtr, 
+    size_t const batchSize, size_t const maxSeqLen, size_t const beamWidthOut, size_t const beamWidthIn, 
+    cudaStream_t stream);
+
+// void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM, int const nV);
+
+// for Beam Search debug
+#if BEAM_SEARCH_DEBUG
+#define BID 0
+
+#define LINE(x) printf(x "@L%d\n", __LINE__);
+
+#define PRINT(x)                                                                                                       \
+    {                                                                                                                  \
+        printf(#x "=");                                                                                                \
+        print_element_(x);                                                                                             \
+        printf("\n");                                                                                                  \
+    }
+
+// Host function
+#define PRINT_HOST(x, nRow, nCol, nColPadded)                                                                          \
+    {                                                                                                                  \
+        if (x == nullptr)                                                                                              \
+        {                                                                                                              \
+            printf(#x "=nullptr\n");                                                                                   \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            printf(#x "=\n");                                                                                          \
+            printMatrix(x, nRow, nCol, nColPadded);                                                                    \
+        }                                                                                                              \
+    }
+#define PH2(x, nCol) PRINT_HOST(x, 1, nCol, nCol)
+#define PH3(x, nElement, nCol) PRINT_HOST(x, ((nElement) / (nCol)), nCol, nCol)
+
+// Device function
+#define PRINT_DEVICE(x, nRow, nCol, nColPadded)                                                                        \
+    {                                                                                                                  \
+        if (x == nullptr)                                                                                              \
+        {                                                                                                              \
+            printf(#x "=nullptr\n");                                                                                   \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            printf(#x "=\n");                                                                                          \
+            printMatrixDevice(x, nRow, nCol, nColPadded);                                                              \
+        }                                                                                                              \
+    }
+#define PD2(x, nCol) PRINT_DEVICE(x, 1, nCol, nCol)
+#define PD3(x, nElement, nCol) PRINT_DEVICE(x, ((nElement) / (nCol)), nCol, nCol)
+
+// Device function
+#define WITH(blockIdxx, bSync, code)                                                                                   \
+    {                                                                                                                  \
+        if (bSync)                                                                                                     \
+        {                                                                                                              \
+            __syncthreads();                                                                                           \
+        }                                                                                                              \
+        if (blockIdx.x == (blockIdxx) && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0    \
+            && threadIdx.z == 0)                                                                                       \
+        {                                                                                                              \
+            code                                                                                                       \
+        }                                                                                                              \
+        if (bSync)                                                                                                     \
+        {                                                                                                              \
+            __syncthreads();                                                                                           \
+        }                                                                                                              \
+    }
+
+#else
+#define LINE(x)
+#define PRINT(x)
+#define QH(x, y, z, w)
+#define PH2(x, nCol)
+#define PH3(x, nElement, nCol)
+#define PRINT_DEVICE(x, y, z, w)
+#define PD2(x, nCol)
+#define PD3(x, nElement, nCol)
+#define WITH(x, y, z)
+#endif
+
+} // namespace kernels
+} // namespace tensorrt_llm

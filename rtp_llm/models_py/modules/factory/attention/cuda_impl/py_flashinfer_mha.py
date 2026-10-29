@@ -1,0 +1,1539 @@
+from typing import Any, Optional
+
+import torch
+from flashinfer.cascade import merge_state_in_place
+from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
+from flashinfer.prefill import (
+    BatchPrefillWithPagedKVCacheWrapper,
+    BatchPrefillWithRaggedKVCacheWrapper,
+)
+
+from rtp_llm.models_py.modules.factory.attention import common
+from rtp_llm.models_py.modules.factory.attention.cuda_impl.flashinfer_rotary_emb import (
+    MhaRotaryEmbeddingOp,
+)
+from rtp_llm.models_py.modules.factory.attention.cuda_impl.kv_cache_write_op import (
+    KVCacheWriteOp,
+)
+from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashinfer_mla import (
+    check_attention_inputs,
+)
+from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHAImplBase
+from rtp_llm.models_py.utils.arch import is_sm10x, is_sm90
+from rtp_llm.ops import AttentionConfigs, KvCacheDataType, ParallelismConfig, RopeStyle
+from rtp_llm.ops.compute_ops import (
+    FusedRopeKVCacheDecodeOp,
+    LayerKVCache,
+    ParamsBase,
+    PyAttentionInputs,
+    fill_mla_params,
+    rtp_llm_ops,
+)
+
+# Constants
+DEFAULT_PY_FLASHINFER_WORKSPACE_SIZE_MB = 128
+_FLASHINFER_WORKSPACE_ALIGNMENT = 256
+_FLASHINFER_ACCUMULATOR_BYTES = 4
+
+# FP8 KV cache uses a unit quantization scale: K/V are cast
+# directly to float8_e4m3fn and FA3 FP8 kernels run with scale_q/k/v = 1.0.
+FP8_UNIT_SCALE = 1.0
+_g_fp8_unit_scale_tensors: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_fp8_unit_scale_tensor(device: torch.device) -> torch.Tensor:
+    scale = _g_fp8_unit_scale_tensors.get(device)
+    if scale is None:
+        scale = torch.tensor([FP8_UNIT_SCALE], dtype=torch.float32, device=device)
+        _g_fp8_unit_scale_tensors[device] = scale
+    return scale
+
+
+def quantize_to_fp8_if_needed(
+    tensor: torch.Tensor, target_dtype: torch.dtype
+) -> torch.Tensor:
+    """Return a matching tensor or quantize it to the supported FP8 dtype."""
+    if tensor.dtype == target_dtype:
+        return tensor
+    if target_dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"unsupported dtype conversion from {tensor.dtype} to {target_dtype}; "
+            "only quantization to torch.float8_e4m3fn is supported"
+        )
+
+    # per_tensor_quant_fp8 requires contiguous input; packed-QKV split
+    # views are strided, so materialize them first.
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    output = torch.empty_like(tensor, dtype=target_dtype)
+    rtp_llm_ops.per_tensor_quant_fp8(
+        tensor, output, _get_fp8_unit_scale_tensor(tensor.device), True
+    )
+    return output
+
+
+# Global workspace buffer pool. CUDA graph instances keep their compact buffers
+# alive; the default 128 MiB buffer is reused as staging while each instance is
+# planned and right-sized.
+_g_py_flashinfer_workspace_pool: dict[tuple[torch.device, int], list[torch.Tensor]] = {}
+_g_py_flashinfer_pool_lock = __import__("threading").Lock()
+
+
+def _round_workspace_size(size_bytes: int) -> int:
+    if size_bytes <= 0:
+        raise ValueError(f"workspace size must be positive, got {size_bytes}")
+    return (
+        (size_bytes + _FLASHINFER_WORKSPACE_ALIGNMENT - 1)
+        // _FLASHINFER_WORKSPACE_ALIGNMENT
+        * _FLASHINFER_WORKSPACE_ALIGNMENT
+    )
+
+
+def _workspace_device(device: str | torch.device) -> torch.device:
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
+def get_py_flashinfer_workspace_buffer(
+    device: str | torch.device = "cuda",
+    size_bytes: int = DEFAULT_PY_FLASHINFER_WORKSPACE_SIZE_MB * 1024 * 1024,
+) -> torch.Tensor:
+    """Get a PyFlashInfer workspace buffer from the pool.
+
+    This function manages workspace buffers to support multiple concurrent instances.
+    """
+    resolved_device = _workspace_device(device)
+    rounded_size = _round_workspace_size(size_bytes)
+    key = (resolved_device, rounded_size)
+    with _g_py_flashinfer_pool_lock:
+        buffers = _g_py_flashinfer_workspace_pool.get(key)
+        if buffers:
+            return buffers.pop()
+    return torch.zeros(
+        rounded_size,
+        dtype=torch.uint8,
+        device=resolved_device,
+    )
+
+
+def release_py_flashinfer_workspace_buffer(buffer: torch.Tensor) -> None:
+    """Release a PyFlashInfer workspace buffer back to the pool."""
+    key = (buffer.device, buffer.numel() * buffer.element_size())
+    with _g_py_flashinfer_pool_lock:
+        _g_py_flashinfer_workspace_pool.setdefault(key, []).append(buffer)
+
+
+def _planned_flashinfer_workspace_size(
+    wrapper: Any, num_qo_heads: int, head_dim_vo: int
+) -> Optional[int]:
+    """Return the float-workspace bytes required by a completed graph plan.
+
+    FlashInfer FA2 exposes its split-K allocation through ``PrefillPlanInfo``.
+    FA3 stores scheduling metadata in the integer workspace and does not consume
+    the float workspace. Unknown backends retain FlashInfer's recommended size.
+    """
+    backend = getattr(wrapper, "_backend", None)
+    plan_info = getattr(wrapper, "_plan_info", None)
+    # FA3 tensor-core decode is implemented through the SM90 batch-prefill
+    # planner as well, whose eight-field plan contains only integer-workspace
+    # offsets.  Do not generalize this to future/other FA3 wrappers: their
+    # workspace contract may differ.
+    if backend == "fa3" and plan_info is not None and len(plan_info) == 8:
+        return _FLASHINFER_WORKSPACE_ALIGNMENT
+    if backend != "fa2" or plan_info is None or len(plan_info) != 15:
+        return None
+
+    split_kv = bool(plan_info[14])
+    if not split_kv:
+        return _FLASHINFER_WORKSPACE_ALIGNMENT
+
+    padded_batch_size = int(plan_info[0])
+    cta_tile_q = int(plan_info[3])
+    value_offset = int(plan_info[10])
+    lse_offset = int(plan_info[11])
+    partial_rows = num_qo_heads * padded_batch_size * cta_tile_q
+    required_bytes = max(
+        value_offset + partial_rows * head_dim_vo * _FLASHINFER_ACCUMULATOR_BYTES,
+        lse_offset + partial_rows * _FLASHINFER_ACCUMULATOR_BYTES,
+    )
+    return _round_workspace_size(required_bytes)
+
+
+def _compact_graph_workspace(
+    wrapper: Any,
+    workspace: torch.Tensor,
+    num_qo_heads: int,
+    head_dim_vo: int,
+) -> torch.Tensor:
+    """Replace a graph wrapper's staging workspace with its stable exact size."""
+    required_bytes = _planned_flashinfer_workspace_size(
+        wrapper, num_qo_heads, head_dim_vo
+    )
+    current_bytes = workspace.numel() * workspace.element_size()
+    if required_bytes is None or required_bytes >= current_bytes:
+        return workspace
+
+    # FlashInfer's plan() stages scheduler metadata with raw cudaMemcpyAsync
+    # from its pinned host workspace. reset_workspace_buffer() replaces that
+    # pinned tensor, so its stream work must finish before the old allocation
+    # can be released/reused. This runs once while constructing each graph and
+    # has no steady-state cost.
+    if workspace.is_cuda:
+        torch.cuda.current_stream(workspace.device).synchronize()
+
+    compact = get_py_flashinfer_workspace_buffer(workspace.device, required_bytes)
+    wrapper.reset_workspace_buffer(compact, wrapper._int_workspace_buffer)
+    release_py_flashinfer_workspace_buffer(workspace)
+    return compact
+
+
+def _host_i32(t):
+    """Lift a possibly CUDA-resident tensor to host for the host fill path.
+
+    The C++ fillParams reads raw host pointers; hybrid-attention models
+    (qwen3-next) and the MTP device-state fast path can hand in CUDA-resident
+    lengths/block tables even when input_lengths stays on the host.
+    """
+    return t.cpu() if t is not None and t.numel() > 0 and t.is_cuda else t
+
+
+def _device_or(device_tensor, host_tensor):
+    """Prefer the *_device mirror; fall back to the base field.
+
+    Unit tests (and some callers) construct PyAttentionInputs with only the
+    base fields populated (possibly already CUDA-resident), so the device
+    mirror may be missing.
+    """
+    if device_tensor is not None and device_tensor.numel() > 0:
+        return device_tensor
+    return host_tensor
+
+
+def attn_kv_dtype(attn_configs: AttentionConfigs) -> torch.dtype:
+    # Use one dtype source for both plan() and forward().
+    if attn_configs.kv_cache_dtype == KvCacheDataType.FP8:
+        return torch.float8_e4m3fn
+    return attn_configs.dtype
+
+
+def attn_q_dtype(attn_configs: AttentionConfigs) -> torch.dtype:
+    # FA3 FP8 (Hopper wgmma) requires Q/KV in the same FP8 dtype and is
+    # SM90-only with head_dim 64/128/256;
+    # Otherwise keep Q in fp16/bf16 (FA2 KV-dequant path)
+    # Q uses the same unit-scale FP8 contract as the KV cache on this path.
+    if (
+        attn_configs.kv_cache_dtype == KvCacheDataType.FP8
+        and is_sm90()
+        and attn_configs.size_per_head in (64, 128, 256)
+    ):
+        return torch.float8_e4m3fn
+    return attn_configs.dtype
+
+
+class PyFlashinferPrefillPagedAttnOp(object):
+    """FlashInfer Prefill Attention Op with Paged KV Cache support"""
+
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        attn_inputs: PyAttentionInputs,
+        backend: str = "auto",
+    ) -> None:
+        self.g_workspace_buffer = get_py_flashinfer_workspace_buffer()
+        self.local_head_num = attn_configs.head_num
+        self.local_kv_head_num = attn_configs.kv_head_num
+        self.head_dim_qk = attn_configs.size_per_head
+        self.head_dim_vo = attn_configs.size_per_head
+        self.page_size = attn_configs.kernel_tokens_per_block
+        self.dtype = attn_configs.dtype
+        self.kv_dtype = attn_kv_dtype(attn_configs)
+        self.q_dtype = attn_q_dtype(attn_configs)
+        self.max_seq_len = attn_configs.max_seq_len
+        self.is_causal = attn_configs.is_causal
+        self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
+        self.enable_cuda_graph = attn_inputs.is_cuda_graph
+        self._workspace_compacted = False
+        self.prefill_cuda_graph_copy_params = None
+        self.input_lengths = None
+        self.cu_seq_lens = None
+        # Pre-allocated buffers for CUDA graph copy path (avoid per-forward allocation)
+        self._aligned_q_buf = None
+        # reserve buffer for q cast
+        self._aligned_q_cast_buf = None
+        self._compact_out_buf = None
+        # Use Paged KV Cache wrapper
+        self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            self.g_workspace_buffer,
+            "HND",
+            backend=backend,
+        )
+
+    def __del__(self):
+        release_py_flashinfer_workspace_buffer(self.g_workspace_buffer)
+
+    def set_params(self, params: rtp_llm_ops.FlashInferMlaAttnParams):
+        """Set the params object to be used by this op."""
+        self.fmha_params = params
+
+    def prepare(
+        self,
+        attn_inputs: PyAttentionInputs,
+        forbid_realloc: bool = False,
+    ) -> ParamsBase:
+        """
+        Prepare the prefill wrapper with paged KV cache parameters.
+
+        forbid_realloc: True only when called from prepare_cuda_graph (replay); forbids buffer realloc.
+        """
+        check_attention_inputs(attn_inputs)
+        block_id_host = attn_inputs.kv_cache_kernel_block_id
+        if block_id_host is None or block_id_host.numel() == 0:
+            block_id_host = attn_inputs.kv_cache_kernel_block_id_device
+        # Keep the same fill path for capture and replay: the host fill sizes
+        # buffers exactly while the device fill sizes for the worst case, so
+        # switching paths between capture and replay forces a (forbidden)
+        # reallocation during graph replay.
+        if attn_inputs.input_lengths.is_cuda:
+            self.fmha_params.fill_params_mha_device(
+                _device_or(
+                    attn_inputs.prefix_lengths_device, attn_inputs.prefix_lengths
+                ),
+                attn_inputs.sequence_lengths,
+                _device_or(attn_inputs.input_lengths_device, attn_inputs.input_lengths),
+                _device_or(
+                    attn_inputs.kv_cache_kernel_block_id_device,
+                    attn_inputs.kv_cache_kernel_block_id,
+                ),
+                self.page_size,
+                forbid_realloc,
+            )
+        else:
+            self.fmha_params.fill_params(
+                _host_i32(attn_inputs.prefix_lengths),
+                _host_i32(attn_inputs.sequence_lengths),
+                _host_i32(attn_inputs.input_lengths),
+                _host_i32(block_id_host),
+                self.page_size,
+                forbid_realloc,
+            )
+        # Store CUDA graph copy parameters
+        # Define qo_indptr early for CUDA graph initialization
+        if attn_inputs.prefill_cuda_graph_copy_params is not None:
+            initializing_cuda_graph_copy = self.prefill_cuda_graph_copy_params is None
+            # The copy kernels run inside the captured graph. Bind them to the
+            # graph-owned device metadata that CudaGraphRunner refreshes once
+            # per replay; no layer-local metadata copies are needed.
+            copy_input_lengths = _device_or(
+                attn_inputs.input_lengths_device, attn_inputs.input_lengths
+            )
+            copy_cu_seq_lens = attn_inputs.cu_seqlens_device
+            copy_batch_size = (
+                attn_inputs.prefill_cuda_graph_copy_params.cuda_graph_prefill_batch_size
+            )
+            if (
+                copy_input_lengths is None
+                or not copy_input_lengths.is_cuda
+                or copy_input_lengths.dtype != torch.int32
+                or copy_input_lengths.dim() != 1
+                or copy_cu_seq_lens is None
+                or not copy_cu_seq_lens.is_cuda
+                or copy_cu_seq_lens.dtype != torch.int32
+                or copy_cu_seq_lens.dim() != 1
+                or copy_batch_size is None
+                or not copy_batch_size.is_cuda
+                or copy_batch_size.dtype != torch.int32
+                or copy_batch_size.dim() != 1
+                or copy_batch_size.numel() != 1
+            ):
+                raise ValueError(
+                    "CUDA Graph prefill copy metadata must provide rank-1 int32 "
+                    "device input_lengths/cu_seqlens and one int32 batch-size value"
+                )
+
+            if initializing_cuda_graph_copy:
+                self.input_lengths = copy_input_lengths
+                self.cu_seq_lens = copy_cu_seq_lens
+            elif (
+                self.input_lengths is None
+                or self.input_lengths.numel() < copy_input_lengths.numel()
+                or self.cu_seq_lens is None
+                or self.cu_seq_lens.numel() < copy_cu_seq_lens.numel()
+            ):
+                raise RuntimeError(
+                    "CUDA Graph prefill copy metadata shape changed after capture"
+                )
+
+            # Production replay passes the same fixed-address capture buffers,
+            # so these branches are no-ops. Retain conditional copies for
+            # direct operator tests/callers that provide fresh tensors.
+            if (
+                self.prefill_cuda_graph_copy_params is not None
+                and self.prefill_cuda_graph_copy_params.cuda_graph_prefill_batch_size.data_ptr()
+                != copy_batch_size.data_ptr()
+            ):
+                self.prefill_cuda_graph_copy_params.cuda_graph_prefill_batch_size.copy_(
+                    copy_batch_size, non_blocking=True
+                )
+            if self.input_lengths.data_ptr() != copy_input_lengths.data_ptr():
+                self.input_lengths[: copy_input_lengths.numel()].copy_(
+                    copy_input_lengths, non_blocking=True
+                )
+            if self.cu_seq_lens.data_ptr() != copy_cu_seq_lens.data_ptr():
+                self.cu_seq_lens[: copy_cu_seq_lens.numel()].copy_(
+                    copy_cu_seq_lens, non_blocking=True
+                )
+            qo_indptr = (
+                copy_cu_seq_lens.clone()
+                if initializing_cuda_graph_copy
+                else self.qo_indptr
+            )
+        else:
+            qo_indptr = attn_inputs.cu_seqlens_device[
+                : attn_inputs.input_lengths.size(0) + 1
+            ]
+
+        if self.enable_cuda_graph and self.prefill_wrapper._qo_indptr_buf is None:
+            self.prefill_wrapper._use_cuda_graph = True
+            self.prefill_wrapper._qo_indptr_buf = qo_indptr
+            # The native metadata builder changes its tensor shapes to the
+            # active batch on replay. Separate views retain the capture shapes
+            # while sharing the same storage and fixed device addresses.
+            self.prefill_wrapper._paged_kv_indptr_buf = (
+                self.fmha_params.decode_page_indptr_d.view(-1)
+            )
+            self.prefill_wrapper._paged_kv_last_page_len_buf = (
+                self.fmha_params.paged_kv_last_page_len_d.view(-1)
+            )
+            self.prefill_wrapper._paged_kv_indices_buf = self.fmha_params.page_indice_d
+            self.prefill_wrapper._fixed_batch_size = (
+                len(attn_inputs.cu_seqlens_device) - 1
+            )
+            if attn_inputs.prefill_cuda_graph_copy_params is not None:
+                self.prefill_cuda_graph_copy_params = (
+                    attn_inputs.prefill_cuda_graph_copy_params
+                )
+                # input_lengths and cu_seq_lens were already set above
+                self.qo_indptr = qo_indptr
+                # Fill with cumulative sequence: [0, max_seq_len, 2*max_seq_len, ...]
+                self.qo_indptr.copy_(
+                    torch.arange(
+                        self.qo_indptr.size(0),
+                        device=self.qo_indptr.device,
+                        dtype=self.qo_indptr.dtype,
+                    )
+                    * self.prefill_cuda_graph_copy_params.max_seq_len
+                )
+
+        # Update buffers for subsequent calls if in CUDA graph mode
+        if self.prefill_cuda_graph_copy_params is not None:
+            assert attn_inputs.prefill_cuda_graph_copy_params is not None
+            assert self.input_lengths is not None
+            assert self.cu_seq_lens is not None
+            qo_indptr = self.qo_indptr
+
+        self._plan_prefill_wrapper(qo_indptr)
+        if self.enable_cuda_graph and not self._workspace_compacted:
+            self.g_workspace_buffer = _compact_graph_workspace(
+                self.prefill_wrapper,
+                self.g_workspace_buffer,
+                self.local_head_num,
+                self.head_dim_vo,
+            )
+            self._workspace_compacted = True
+            self._plan_prefill_wrapper(qo_indptr)
+        return self.fmha_params
+
+    def _plan_prefill_wrapper(self, qo_indptr: torch.Tensor) -> None:
+        kv_indptr = self.fmha_params.decode_page_indptr_d
+        last_page_len = self.fmha_params.paged_kv_last_page_len_d
+        active_batch_size = last_page_len.numel()
+        batch_size = qo_indptr.numel() - 1
+        if kv_indptr.numel() != active_batch_size + 1:
+            raise ValueError("Paged prefill KV metadata has inconsistent batch sizes")
+
+        if self.enable_cuda_graph:
+            graph_kv_indptr = self.prefill_wrapper._paged_kv_indptr_buf
+            graph_last_page_len = self.prefill_wrapper._paged_kv_last_page_len_buf
+            if (
+                active_batch_size > batch_size
+                or graph_kv_indptr.numel() != batch_size + 1
+                or graph_last_page_len.numel() != batch_size
+            ):
+                raise ValueError(
+                    "Paged prefill metadata exceeds the captured batch size"
+                )
+            if (
+                graph_kv_indptr.data_ptr() != kv_indptr.data_ptr()
+                or graph_last_page_len.data_ptr() != last_page_len.data_ptr()
+            ):
+                raise RuntimeError(
+                    "Paged prefill KV metadata was reallocated after capture"
+                )
+
+            if active_batch_size < batch_size:
+                # FlashInfer derives its batch size from qo_indptr. Inactive
+                # query slots must have empty KV ranges; passing shortened KV
+                # tensors makes the native planner read beyond their bounds.
+                graph_last_page_len[active_batch_size:].zero_()
+                graph_kv_indptr[active_batch_size + 1 :].copy_(
+                    kv_indptr[active_batch_size : active_batch_size + 1].expand(
+                        batch_size - active_batch_size
+                    ),
+                    non_blocking=True,
+                )
+            kv_indptr = graph_kv_indptr
+            last_page_len = graph_last_page_len
+        elif active_batch_size != batch_size:
+            raise ValueError("Paged prefill query and KV batch sizes must match")
+
+        self.prefill_wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            self.fmha_params.page_indice_d,
+            last_page_len,
+            self.local_head_num,
+            self.local_kv_head_num,
+            self.head_dim_qk,
+            self.page_size,
+            causal=self.is_causal,
+            q_data_type=self.q_dtype,
+            kv_data_type=self.kv_dtype,
+            o_data_type=self.dtype,
+        )
+
+    @staticmethod
+    def support(attn_inputs: PyAttentionInputs) -> bool:
+        return True
+
+    def forward(
+        self, q: torch.Tensor, kv_cache: Optional[LayerKVCache]
+    ) -> torch.Tensor:
+        """
+        Forward pass with paged KV cache
+
+        Args:
+            q: Query tensor [total_tokens, num_heads, head_dim]
+            kv_cache: Paged KV cache [num_pages, 2, page_size, kv_heads, head_dim]
+            params: Parameters (not used currently)
+
+        Returns:
+            output: [total_tokens, num_heads, head_dim]
+        """
+        from rtp_llm.ops.compute_ops import (
+            cuda_graph_copy_large2small,
+            cuda_graph_copy_small2large,
+        )
+
+        assert kv_cache is not None, "kv_cache is required for paged attention"
+        assert (
+            q.dim() == 3
+        ), f"Expected q to be 3D tensor [total_tokens, num_heads, head_dim], got {q.dim()}D"
+
+        paged_kv_cache = kv_cache.kv_cache_base
+        if paged_kv_cache.dim() == 2:
+            paged_kv_cache = common.reshape_paged_kv_cache(
+                paged_kv_cache, self.local_kv_head_num, self.page_size, self.head_dim_qk
+            )
+        # CUDA graph copy logic for prefill
+        if self.prefill_cuda_graph_copy_params:
+            assert (
+                self.input_lengths is not None
+            ), "input_lengths is required for CUDA graph copy"
+            assert (
+                self.cu_seq_lens is not None
+            ), "cu_seq_lens is required for CUDA graph copy"
+
+            # Reshape from 3D [token_num, head_num, head_size] to 2D [token_num, hidden_size]
+            token_num, head_num, head_size = q.shape
+            hidden_size = head_num * head_size
+
+            # Pre-allocate buffers on first use (avoid per-forward GPU allocation)
+            total_len = (
+                self.prefill_cuda_graph_copy_params.max_seq_len
+                * self.prefill_cuda_graph_copy_params.max_batch_size
+            )
+            if self._aligned_q_buf is None or self._aligned_q_buf.shape != (
+                total_len,
+                hidden_size,
+            ):
+                self._aligned_q_buf = torch.zeros(
+                    (total_len, hidden_size), dtype=q.dtype, device=q.device
+                )
+            if self._compact_out_buf is None or self._compact_out_buf.shape != (
+                token_num,
+                hidden_size,
+            ):
+                self._compact_out_buf = torch.zeros(
+                    (token_num, hidden_size), dtype=q.dtype, device=q.device
+                )
+
+            q_2d = q.view(token_num, hidden_size).contiguous()
+            self._aligned_q_buf.zero_()
+
+            # Copy small to large (compact -> aligned)
+            cuda_graph_copy_small2large(
+                q_2d,
+                self._aligned_q_buf,
+                self.prefill_cuda_graph_copy_params.cuda_graph_prefill_batch_size,
+                self.prefill_cuda_graph_copy_params.max_batch_size,
+                self.prefill_cuda_graph_copy_params.max_seq_len,
+                self.input_lengths,
+                hidden_size,
+                self.cu_seq_lens,
+            )
+
+            # Reshape back to 3D for FlashInfer
+            q_aligned = self._aligned_q_buf.view(total_len, head_num, head_size)
+            if q_aligned.dtype != self.q_dtype:
+                if (
+                    self._aligned_q_cast_buf is None
+                    or self._aligned_q_cast_buf.shape != q_aligned.shape
+                    or self._aligned_q_cast_buf.dtype != self.q_dtype
+                    or self._aligned_q_cast_buf.device != q_aligned.device
+                ):
+                    self._aligned_q_cast_buf = torch.empty(
+                        q_aligned.shape,
+                        dtype=self.q_dtype,
+                        device=q_aligned.device,
+                    )
+                rtp_llm_ops.per_tensor_quant_fp8(
+                    q_aligned,
+                    self._aligned_q_cast_buf,
+                    _get_fp8_unit_scale_tensor(q_aligned.device),
+                    True,
+                )
+                q_aligned = self._aligned_q_cast_buf
+
+            # Paged FP8 defaults to unit scales and the output dtype from plan().
+            result = self.prefill_wrapper.run(q_aligned, paged_kv_cache)
+
+            # Reshape result to 2D for copy back (ensure contiguous)
+            result_2d = result.view(total_len, hidden_size).contiguous()
+            self._compact_out_buf.zero_()
+
+            # Copy large to small (aligned -> compact)
+            cuda_graph_copy_large2small(
+                result_2d,
+                self._compact_out_buf,
+                self.prefill_cuda_graph_copy_params.cuda_graph_prefill_batch_size,
+                self.prefill_cuda_graph_copy_params.max_batch_size,
+                self.prefill_cuda_graph_copy_params.max_seq_len,
+                self.input_lengths,
+                hidden_size,
+                self.cu_seq_lens,
+            )
+
+            # Reshape back to 3D
+            result = self._compact_out_buf.view(token_num, head_num, head_size)
+        else:
+            # No CUDA graph copy, direct execution
+            # Paged FP8 defaults to unit scales and the output dtype from plan().
+            result = self.prefill_wrapper.run(
+                quantize_to_fp8_if_needed(q, self.q_dtype), paged_kv_cache
+            )
+
+        return result
+
+
+class PyFlashinferPrefillAttnOp(object):
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        backend: str = "auto",
+    ) -> None:
+        self.g_workspace_buffer = get_py_flashinfer_workspace_buffer()
+        # attn_configs.head_num and kv_head_num are already divided by tp_size in ModelConfig::getAttentionConfigs
+        self.local_head_num = attn_configs.head_num
+        self.local_kv_head_num = attn_configs.kv_head_num
+        self.head_dim_qk = attn_configs.size_per_head
+        self.page_size = attn_configs.kernel_tokens_per_block
+        # TODO: maybe use v_head_dim
+        self.head_dim_vo = attn_configs.size_per_head
+        self.prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+            self.g_workspace_buffer,
+            backend=backend,
+        )
+        self.dtype = attn_configs.dtype
+        self.q_dtype = attn_q_dtype(attn_configs)
+        self.kv_dtype = attn_kv_dtype(attn_configs)
+        self.is_causal = attn_configs.is_causal
+        self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
+
+    def __del__(self):
+        release_py_flashinfer_workspace_buffer(self.g_workspace_buffer)
+
+    def set_params(self, params: rtp_llm_ops.FlashInferMlaAttnParams):
+        """Set the params object to be used by this op."""
+        self.fmha_params = params
+
+    def prepare(self, attn_inputs: PyAttentionInputs) -> ParamsBase:
+        """
+        Prepare the prefill wrapper
+
+        Args:
+            attn_inputs: Attention inputs containing sequence information
+        """
+        batch_size = attn_inputs.input_lengths.size(0)
+        cu_seqlens = attn_inputs.cu_seqlens_device[: batch_size + 1]
+
+        # Encoder-only models (BERT) have no paged kv cache; fill_params
+        # pybind requires a Tensor, so substitute an empty int32 tensor.
+        kv_block_id = attn_inputs.kv_cache_kernel_block_id
+        if kv_block_id is None or kv_block_id.numel() == 0:
+            kv_block_id = attn_inputs.kv_cache_kernel_block_id_device
+        if kv_block_id is None:
+            kv_block_id = torch.empty(0, dtype=torch.int32)
+
+        self.fmha_params.fill_params(
+            _host_i32(attn_inputs.prefix_lengths),
+            _host_i32(attn_inputs.sequence_lengths),
+            _host_i32(attn_inputs.input_lengths),
+            _host_i32(kv_block_id),
+            self.page_size,
+        )
+
+        self.prefill_wrapper.plan(
+            cu_seqlens,
+            cu_seqlens,
+            self.local_head_num,
+            self.local_kv_head_num,
+            self.head_dim_qk,
+            self.head_dim_vo,
+            causal=self.is_causal,
+            q_data_type=self.q_dtype,
+            kv_data_type=self.kv_dtype,
+            o_data_type=self.dtype,
+        )
+        return self.fmha_params
+
+    @staticmethod
+    def support(attn_inputs: PyAttentionInputs) -> bool:
+        return (
+            attn_inputs.prefix_lengths.numel() <= 0
+            or attn_inputs.prefix_lengths.sum().item() == 0
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: Optional[LayerKVCache] = None,
+    ) -> torch.Tensor:
+        q = quantize_to_fp8_if_needed(q, self.q_dtype)
+        k = quantize_to_fp8_if_needed(k, self.kv_dtype)
+        v = quantize_to_fp8_if_needed(v, self.kv_dtype)
+        if q.dtype == torch.float8_e4m3fn:
+            # FlashInfer's FA3 FP8 need scale_q, scale_k, scale_v and an output matching the planned dtype.
+            out = torch.empty(
+                q.shape[:-1] + v.shape[-1:], dtype=self.dtype, device=q.device
+            )
+            return self.prefill_wrapper.run(
+                q,
+                k,
+                v,
+                FP8_UNIT_SCALE,
+                FP8_UNIT_SCALE,
+                FP8_UNIT_SCALE,
+                out=out,
+            )
+        return self.prefill_wrapper.run(q, k, v)
+
+
+class PyFlashinferHybridPrefillAttnOp(object):
+    """FlashInfer hybrid prefill op.
+
+    It evaluates attention over the newest ragged KV segment and the existing
+    prefix paged KV cache sequentially on the current CUDA stream, then merges
+    the two attention states with FlashInfer's LSE merge.
+    """
+
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        attn_inputs: PyAttentionInputs,
+        backend: str = "auto",
+    ) -> None:
+        self.g_workspace_buffer = get_py_flashinfer_workspace_buffer()
+        self.local_head_num = attn_configs.head_num
+        self.local_kv_head_num = attn_configs.kv_head_num
+        self.head_dim_qk = attn_configs.size_per_head
+        self.head_dim_vo = attn_configs.size_per_head
+        self.page_size = attn_configs.kernel_tokens_per_block
+        self.dtype = attn_configs.dtype
+        self.kv_dtype = attn_kv_dtype(attn_configs)
+        self.q_dtype = attn_q_dtype(attn_configs)
+        self.is_causal = attn_configs.is_causal
+        self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
+        # The serial ragged/write/paged flow can share one workspace buffer.
+        self.ragged_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+            self.g_workspace_buffer,
+            backend=backend,
+        )
+        self.prefix_paged_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            self.g_workspace_buffer,
+            "HND",
+            backend=backend,
+        )
+
+    def __del__(self):
+        release_py_flashinfer_workspace_buffer(self.g_workspace_buffer)
+
+    def set_params(self, params: rtp_llm_ops.FlashInferMlaAttnParams):
+        """Set the params object to be used by this op."""
+        self.fmha_params = params
+
+    def prepare(
+        self,
+        attn_inputs: PyAttentionInputs,
+        forbid_realloc: bool = False,
+    ) -> ParamsBase:
+        """Prepare ragged-new and paged-prefix FlashInfer wrappers."""
+        block_table = attn_inputs.kv_cache_kernel_block_id
+        if block_table is None or block_table.numel() == 0:
+            block_table = attn_inputs.kv_cache_kernel_block_id_device
+        assert (
+            block_table is not None and block_table.numel() > 0
+        ), "hybrid prefill requires a non-empty kv_cache_kernel_block_id"
+        self.fmha_params.fill_params(
+            _host_i32(attn_inputs.prefix_lengths),
+            _host_i32(attn_inputs.sequence_lengths),
+            _host_i32(attn_inputs.input_lengths),
+            _host_i32(block_table),
+            self.page_size,
+            forbid_realloc,
+        )
+
+        batch_size = attn_inputs.input_lengths.size(0)
+        qo_indptr = attn_inputs.cu_seqlens_device[: batch_size + 1]
+
+        self.ragged_wrapper.plan(
+            qo_indptr,
+            qo_indptr,
+            self.local_head_num,
+            self.local_kv_head_num,
+            self.head_dim_qk,
+            self.head_dim_vo,
+            causal=self.is_causal,
+            q_data_type=self.q_dtype,
+            kv_data_type=self.kv_dtype,
+            o_data_type=self.dtype,
+        )
+
+        # batch_reuse_info_vec_h columns are defined in FlashInferMlaParams.cc.
+        prefix_len_col = 1
+        page_start_col = 2
+        reuse_info = self.fmha_params.batch_reuse_info_vec_h
+        prefix_lengths = reuse_info[:, prefix_len_col]
+        if (prefix_lengths <= 0).any().item():
+            raise ValueError(
+                "hybrid prefill requires a non-empty prefix cache per batch item"
+            )
+
+        prefix_paged_kv_indptr = torch.empty(
+            batch_size + 1, dtype=torch.int32, device="cpu"
+        )
+        prefix_paged_kv_indptr[:-1].copy_(reuse_info[:, page_start_col])
+        prefix_paged_kv_indptr[-1] = self.fmha_params.reuse_cache_page_indice_h.numel()
+        prefix_paged_kv_last_page_len = (prefix_lengths - 1) % self.page_size + 1
+
+        self.prefix_paged_wrapper.plan(
+            qo_indptr,
+            prefix_paged_kv_indptr,
+            self.fmha_params.reuse_cache_page_indice_d,
+            prefix_paged_kv_last_page_len,
+            self.local_head_num,
+            self.local_kv_head_num,
+            self.head_dim_qk,
+            self.page_size,
+            causal=False,
+            q_data_type=self.q_dtype,
+            kv_data_type=self.kv_dtype,
+            o_data_type=self.dtype,
+        )
+        return self.fmha_params
+
+    @staticmethod
+    def support(attn_inputs: PyAttentionInputs) -> bool:
+        block_table = attn_inputs.kv_cache_kernel_block_id
+        if block_table is None or block_table.numel() == 0:
+            block_table = attn_inputs.kv_cache_kernel_block_id_device
+        prefix_lengths = attn_inputs.prefix_lengths
+        return (
+            block_table is not None
+            and block_table.numel() > 0
+            and prefix_lengths is not None
+            and prefix_lengths.numel() > 0
+            and prefix_lengths.min().item() > 0
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: Optional[LayerKVCache],
+        kv_cache_write_op: Optional[KVCacheWriteOp] = None,
+    ) -> torch.Tensor:
+        assert kv_cache is not None, "kv_cache is required for hybrid prefill"
+        paged_kv_cache = kv_cache.kv_cache_base
+        if paged_kv_cache.dim() == 2:
+            paged_kv_cache = common.reshape_paged_kv_cache(
+                paged_kv_cache, self.local_kv_head_num, self.page_size, self.head_dim_qk
+            )
+
+        q = quantize_to_fp8_if_needed(q, self.q_dtype)
+        k = quantize_to_fp8_if_needed(k, self.kv_dtype)
+        v = quantize_to_fp8_if_needed(v, self.kv_dtype)
+        if q.dtype == torch.float8_e4m3fn:
+            # Positional scale_q/scale_k/scale_v; see FP8_UNIT_SCALE.
+            out = torch.empty(
+                q.shape[:-1] + v.shape[-1:], dtype=self.dtype, device=q.device
+            )
+            new_out, new_lse = self.ragged_wrapper.run(
+                q,
+                k,
+                v,
+                FP8_UNIT_SCALE,
+                FP8_UNIT_SCALE,
+                FP8_UNIT_SCALE,
+                out=out,
+                return_lse=True,
+            )
+        else:
+            new_out, new_lse = self.ragged_wrapper.run(q, k, v, return_lse=True)
+
+        if kv_cache_write_op is not None:
+            kv_cache_write_op.forward(k, v, kv_cache)
+
+        # Paged FP8 defaults to unit scales and the output dtype from plan().
+        prefix_out, prefix_lse = self.prefix_paged_wrapper.run(
+            q, paged_kv_cache, return_lse=True
+        )
+        merge_state_in_place(new_out, new_lse, prefix_out, prefix_lse)
+        return new_out
+
+
+class PyFlashinferPrefillImplBase(FMHAImplBase):
+    """Base class for FlashInfer prefill implementations (Ragged and Paged)."""
+
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        attn_inputs: PyAttentionInputs,
+        parallelism_config: Optional[ParallelismConfig] = None,
+    ) -> None:
+        """Initialize prefill implementation with common setup.
+
+        Args:
+            attn_configs: Attention configuration
+            attn_inputs: Attention inputs
+        """
+        # Store configs and inputs
+        self.need_rope_kv_cache = attn_configs.need_rope_kv_cache
+        self.attn_configs = attn_configs
+        self.attn_inputs = attn_inputs
+
+        self.fmha_impl = self._create_fmha_impl(attn_configs, attn_inputs)
+        self.rope_impl = self._create_rope_impl(attn_configs)
+        # Create KV cache write op
+        self.kv_cache_write_op = KVCacheWriteOp(
+            num_kv_heads=attn_configs.kv_head_num,
+            head_size=attn_configs.size_per_head,
+            token_per_block=attn_configs.kernel_tokens_per_block,
+        )
+        self.create_params(attn_inputs)
+        self.fmha_impl.prepare(attn_inputs)
+        self.write_cache_store_impl = common.create_write_cache_store_impl(attn_inputs)
+
+    def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
+        self.fmha_impl.prepare(attn_inputs, forbid_realloc=True)
+
+    def create_params(self, attn_inputs: PyAttentionInputs):
+        """Create FlashInfer MLA attention parameters.
+
+        Similar to MLA implementation, this creates and initializes the params
+        that will be used for both FMHA and RoPE operations.
+        """
+        self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
+        self.rope_params = self.fmha_params
+        # Pass the shared params to all ops
+        self.fmha_impl.set_params(self.fmha_params)
+        if self.rope_impl is not None:
+            self.rope_impl.set_params(self.rope_params)
+        # KV cache write always needs params (even without RoPE)
+        self.kv_cache_write_op.set_params(self.rope_params)
+
+    def _create_fmha_impl(
+        self, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
+    ) -> Any:
+        """Create FMHA implementation. To be overridden by subclasses."""
+        raise NotImplementedError("Subclass must implement _create_fmha_impl")
+
+    def _create_rope_impl(self, attn_configs: AttentionConfigs) -> Any:
+        """Create RoPE implementation. To be overridden by subclasses."""
+        raise NotImplementedError("Subclass must implement _create_rope_impl")
+
+    def _split_qkv(
+        self, qkv: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split QKV tensor into query, key, value.
+
+        Args:
+            qkv: QKV tensor [total_tokens, (num_heads + 2*num_kv_heads) * head_dim]
+
+        Returns:
+            Tuple of (query, key, value) tensors
+        """
+        qkv = qkv.reshape(qkv.shape[0], -1)
+        num_heads = self.attn_configs.head_num
+        num_kv_heads = self.attn_configs.kv_head_num
+        head_dim = self.attn_configs.size_per_head
+
+        q, k, v = torch.split(
+            qkv,
+            [
+                head_dim * num_heads,
+                head_dim * num_kv_heads,
+                head_dim * num_kv_heads,
+            ],
+            dim=-1,
+        )
+
+        query = q.reshape(q.shape[0], num_heads, head_dim)
+        key = k.reshape(k.shape[0], num_kv_heads, head_dim)
+        value = v.reshape(v.shape[0], num_kv_heads, head_dim)
+
+        return query, key, value
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        kv_cache: Optional[LayerKVCache],
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        """Common forward implementation for all prefill implementations."""
+        if self.need_rope_kv_cache and self.rope_impl is not None:
+            query, key, value = self.rope_impl.forward(qkv)
+        else:
+            query, key, value = self._split_qkv(qkv)
+
+        # Cast K/V once so the KV cache write and the attention op share
+        # the same tensors.
+        kv_dtype = attn_kv_dtype(self.attn_configs)
+        key = quantize_to_fp8_if_needed(key, kv_dtype)
+        value = quantize_to_fp8_if_needed(value, kv_dtype)
+
+        if self.need_rope_kv_cache:
+            self.kv_cache_write_op.forward(key, value, kv_cache)
+
+        fmha_inputs = self._prepare_fmha_input(query, key, value)
+
+        # Apply write cache store if needed
+        common.apply_write_cache_store(
+            self.write_cache_store_impl, self.attn_inputs, kv_cache
+        )
+
+        # Execute FMHA forward
+        return self.fmha_impl.forward(*fmha_inputs, kv_cache)
+
+    def _prepare_fmha_input(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        """Positional args for fmha_impl.forward; kv_cache is appended by forward().
+
+        Default: only query (paged layout, KV is read from the cache).
+        """
+        return (query,)
+
+
+class PyFlashinferPagedPrefillImpl(PyFlashinferPrefillImplBase):
+    """FlashInfer prefill implementation with paged KV cache layout using MhaRotaryEmbeddingOp."""
+
+    def _create_fmha_impl(
+        self, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
+    ) -> Any:
+        """Create paged FMHA implementation."""
+        return PyFlashinferPrefillPagedAttnOp(attn_configs, attn_inputs)
+
+    def _create_rope_impl(self, attn_configs: AttentionConfigs) -> Any:
+        """Create RoPE implementation for paged layout."""
+        if attn_configs.rope_config.style == RopeStyle.No:
+            return None
+        return MhaRotaryEmbeddingOp(attn_configs)
+
+    def _prepare_fmha_input(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        """For paged layout, only pass query (KV is already in cache)."""
+        return (query,)
+
+    @staticmethod
+    def support(attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs) -> bool:
+        """Check if paged prefill implementation is supported.
+
+        Returns True if:
+        1. Not running on SM10x datacenter Blackwell, where TRTLLMGen is preferred.
+           SM12x consumer Blackwell keeps this FlashInfer paged fallback because
+           TRTLLMGen/XQA do not have sm_120a support in this build.
+        2. The underlying paged FMHA op supports the inputs
+        3. MhaRotaryEmbeddingOp supports the inputs
+        """
+        return (
+            not is_sm10x()
+            and PyFlashinferPrefillPagedAttnOp.support(attn_inputs)
+            and attn_configs.rope_config.style != RopeStyle.Mrope
+        )
+
+    def support_cuda_graph(self) -> bool:
+        return True
+
+
+class PyFlashinferHybridPrefillImpl(PyFlashinferPrefillImplBase):
+    """FlashInfer hybrid prefill implementation.
+
+    The current qkv chunk first attends to the new ragged KV, appends that KV to
+    the cache, and then attends to the existing prefix through its prefix-only
+    page table. The two attention states are merged via LSE.
+    """
+
+    def _create_fmha_impl(
+        self, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
+    ) -> Any:
+        """Create hybrid FMHA implementation."""
+        return PyFlashinferHybridPrefillAttnOp(attn_configs, attn_inputs)
+
+    def _create_rope_impl(self, attn_configs: AttentionConfigs) -> Any:
+        """Create RoPE implementation for hybrid layout."""
+        if attn_configs.rope_config.style == RopeStyle.No:
+            return None
+        return MhaRotaryEmbeddingOp(attn_configs)
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        kv_cache: Optional[LayerKVCache],
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        """Run ragged attention, append KV, then run paged prefix attention."""
+        # Single-stream flow: RoPE -> ragged attention -> KV write -> paged attention.
+        # Hybrid always needs the new K/V for its ragged half.
+        if self.need_rope_kv_cache and self.rope_impl is not None:
+            query, key, value = self.rope_impl.forward(qkv)
+        else:
+            query, key, value = self._split_qkv(qkv)
+
+        query = quantize_to_fp8_if_needed(query, attn_q_dtype(self.attn_configs))
+        kv_dtype = attn_kv_dtype(self.attn_configs)
+        key = quantize_to_fp8_if_needed(key, kv_dtype)
+        value = quantize_to_fp8_if_needed(value, kv_dtype)
+
+        # Write new K/V after ragged attention and before paged attention.
+        kv_cache_write_op = self.kv_cache_write_op if self.need_rope_kv_cache else None
+        result = self.fmha_impl.forward(
+            query,
+            key,
+            value,
+            kv_cache,
+            kv_cache_write_op,
+        )
+        common.apply_write_cache_store(
+            self.write_cache_store_impl, self.attn_inputs, kv_cache
+        )
+        return result
+
+    @staticmethod
+    def support(attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs) -> bool:
+        """Check if hybrid prefill implementation is supported."""
+        return (
+            not attn_inputs.is_cuda_graph
+            and not is_sm10x()
+            and PyFlashinferHybridPrefillAttnOp.support(attn_inputs)
+            and attn_configs.rope_config.style != RopeStyle.Mrope
+        )
+
+    def support_cuda_graph(self) -> bool:
+        return False
+
+
+class PyFlashinferPrefillImpl(PyFlashinferPrefillImplBase):
+    """FlashInfer prefill implementation with ragged KV cache layout using MhaRotaryEmbeddingOp."""
+
+    def _create_fmha_impl(
+        self, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
+    ) -> Any:
+        """Create ragged FMHA implementation."""
+        return PyFlashinferPrefillAttnOp(attn_configs)
+
+    def _create_rope_impl(self, attn_configs: AttentionConfigs) -> Any:
+        """Create RoPE implementation for ragged layout."""
+        if attn_configs.rope_config.style == RopeStyle.No:
+            return None
+        return MhaRotaryEmbeddingOp(attn_configs)
+
+    def _prepare_fmha_input(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        """For ragged layout, pass Q/K/V directly to the ragged wrapper."""
+        return query, key, value
+
+    def support_cuda_graph(self) -> bool:
+        return False
+
+    @staticmethod
+    def support(attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs) -> bool:
+        """Check if ragged prefill implementation is supported.
+
+        Returns True if:
+        1. The underlying ragged FMHA op supports the inputs
+           (requires prefix_lengths to be empty or zero)
+        2. MhaRotaryEmbeddingOp supports the inputs
+        3. Mrope is not used
+
+        Note: Unlike the paged variant, ragged prefill is kept enabled on
+        Blackwell: TRT-LLM Gen prefill requires a paged kv cache and
+        therefore does not cover BERT-style encoder-only inputs that lack
+        one. Without this fallback, sm_120 has no usable prefill impl for
+        such cases.
+        """
+        return (
+            PyFlashinferPrefillAttnOp.support(attn_inputs)
+            and attn_configs.rope_config.style != RopeStyle.Mrope
+        )
+
+
+def determine_use_tensor_core_from_configs(attn_configs: AttentionConfigs) -> bool:
+    """Determine whether to use tensor cores based on attention configs."""
+    # Use tensor cores for larger head dimensions and when kv_head_num matches requirements
+    return attn_configs.head_num // attn_configs.kv_head_num >= 4
+
+
+class PyFlashinferDecodeAttnOp(object):
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        attn_inputs: PyAttentionInputs,
+    ) -> None:
+        self.g_workspace_buffer = get_py_flashinfer_workspace_buffer()
+        # attn_configs already has head_num and kv_head_num divided by tp_size
+        self.local_head_num = attn_configs.head_num
+        self.local_kv_head_num = attn_configs.kv_head_num
+        self.head_dim_qk = attn_configs.size_per_head
+        self.head_dim_vo = attn_configs.size_per_head
+        self.seq_size_per_block = attn_configs.kernel_tokens_per_block
+        self.use_tensor_core = determine_use_tensor_core_from_configs(attn_configs)
+        self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+            self.g_workspace_buffer,
+            "HND",
+            use_tensor_cores=self.use_tensor_core,
+        )
+        self.dtype = attn_configs.dtype
+        self.kv_dtype = attn_kv_dtype(attn_configs)
+        # CUDA-core decode dequantizes FP8 KV; tensor-core decode uses the
+        # batch-prefill path and therefore shares attn_q_dtype().
+        self.q_dtype = (
+            attn_q_dtype(attn_configs) if self.use_tensor_core else self.dtype
+        )
+        self.enable_cuda_graph = attn_inputs.is_cuda_graph
+        self._workspace_compacted = False
+        # Snapshot of the page indptr used by the last CUDA-core graph plan.
+        # Dtype, head counts, and page size are fixed for this op's lifetime.
+        self._cuda_core_plan_page_indptr_h: Optional[torch.Tensor] = None
+        self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
+
+    def __del__(self):
+        release_py_flashinfer_workspace_buffer(self.g_workspace_buffer)
+
+    def set_params(self, params: rtp_llm_ops.FlashInferMlaAttnParams) -> None:
+        """Install params before initial prepare and invalidate the plan snapshot."""
+        if self.decode_wrapper._fixed_batch_size != 0:
+            raise RuntimeError(
+                "FlashInfer decode params cannot be replaced after CUDA graph buffers "
+                "have been bound"
+            )
+        self.fmha_params = params
+        self._cuda_core_plan_page_indptr_h = None
+
+    def _tensor_core_cuda_graph_needs_replan(self) -> bool:
+        # FlashInfer BatchDecode routes tensor-core decode through BatchPrefill.
+        # Its plan derives kv_lens from both page indptr and last-page lengths,
+        # so the pinned 0.2.5/0.6.9/0.6.15.post1 implementations must replan
+        # every replay.
+        return self.enable_cuda_graph and self.use_tensor_core
+
+    def _uses_cuda_core_graph_plan_cache(self) -> bool:
+        return self.enable_cuda_graph and not self.use_tensor_core
+
+    def _cuda_core_cuda_graph_needs_replan(self) -> bool:
+        if not self._uses_cuda_core_graph_plan_cache():
+            return False
+        current_page_indptr = self.fmha_params.decode_page_indptr_h
+        return self._cuda_core_plan_page_indptr_h is None or not torch.equal(
+            self._cuda_core_plan_page_indptr_h,
+            current_page_indptr,
+        )
+
+    def _cuda_graph_replay_needs_replan(self) -> bool:
+        return (
+            self._tensor_core_cuda_graph_needs_replan()
+            or self._cuda_core_cuda_graph_needs_replan()
+        )
+
+    def _plan_decode_wrapper(self, attn_inputs: PyAttentionInputs) -> None:
+        use_cuda_core_graph_plan_cache = self._uses_cuda_core_graph_plan_cache()
+        if self.use_tensor_core:
+            # Tensor-core decode plans from host mirrors in both eager and graph
+            # modes; only replay decides whether another plan call is required.
+            page_indptr = self.fmha_params.decode_page_indptr_h
+            page_indice = self.fmha_params.page_indice_h
+            last_page_len = self.fmha_params.paged_kv_last_page_len_h
+            plan_kwargs = {"non_blocking": True}
+        elif use_cuda_core_graph_plan_cache:
+            # FlashInfer 0.2.5/0.6.9/0.6.15.post1 CUDA-core BatchDecode derives
+            # its work partition from page indptr. The last-page-length values
+            # are read by the kernel at runtime; their tensor length still
+            # matches the graph's fixed batch size. Keep both metadata tensors
+            # on host to avoid a D2H copy. Indices stay on device and alias the
+            # graph-bound buffer refreshed by fill_params() before each replay.
+            # It is the same tensor as the wrapper's indices buffer, so the
+            # plan-internal copy is a no-op; forbid_realloc=True guarantees
+            # that its capture-time capacity remains valid during replay.
+            page_indptr = self.fmha_params.decode_page_indptr_h
+            page_indice = self.fmha_params.page_indice_d
+            last_page_len = self.fmha_params.paged_kv_last_page_len_h
+            plan_kwargs = {"non_blocking": True}
+        else:
+            page_indptr = self.fmha_params.decode_page_indptr_d
+            page_indice = self.fmha_params.page_indice_d
+            last_page_len = self.fmha_params.paged_kv_last_page_len_d
+            plan_kwargs = {}
+
+        self.decode_wrapper.plan(
+            page_indptr,
+            page_indice,
+            last_page_len,
+            self.local_head_num,
+            self.local_kv_head_num,
+            self.head_dim_qk,
+            self.seq_size_per_block,
+            q_data_type=self.q_dtype,
+            kv_data_type=self.kv_dtype,
+            o_data_type=self.dtype,
+            **plan_kwargs,
+        )
+        if use_cuda_core_graph_plan_cache:
+            self._cuda_core_plan_page_indptr_h = (
+                self.fmha_params.decode_page_indptr_h.clone()
+            )
+
+    def prepare(
+        self,
+        attn_inputs: PyAttentionInputs,
+        forbid_realloc: bool = False,
+    ) -> ParamsBase:
+        """
+        Prepare the decode wrapper with paged KV cache parameters.
+
+        forbid_realloc: True only when called from prepare_cuda_graph (replay); forbids buffer realloc.
+        """
+        # Graph planning uses HOST mirrors for tensor-core decode and for the
+        # CUDA-core topology cache. The device fill leaves those mirrors at
+        # their stale capacity sizes (MIN_CACHE_BATCH_SIZE), which corrupts
+        # the plan's batch size, so both graph backends use the host fill.
+        if (
+            attn_inputs.input_lengths.is_cuda
+            and not self.use_tensor_core
+            and not self.enable_cuda_graph
+        ):
+            self.fmha_params.fill_params_mha_device(
+                _device_or(
+                    attn_inputs.prefix_lengths_device, attn_inputs.prefix_lengths
+                ),
+                attn_inputs.sequence_lengths,
+                _device_or(attn_inputs.input_lengths_device, attn_inputs.input_lengths),
+                _device_or(
+                    attn_inputs.kv_cache_kernel_block_id_device,
+                    attn_inputs.kv_cache_kernel_block_id,
+                ),
+                self.seq_size_per_block,
+                forbid_realloc=forbid_realloc,
+            )
+        else:
+            block_id_host = attn_inputs.kv_cache_kernel_block_id
+            if block_id_host is None or block_id_host.numel() == 0:
+                block_id_host = attn_inputs.kv_cache_kernel_block_id_device
+            self.fmha_params.fill_params(
+                _host_i32(attn_inputs.prefix_lengths),
+                _host_i32(attn_inputs.sequence_lengths),
+                _host_i32(attn_inputs.input_lengths),
+                _host_i32(block_id_host),
+                self.seq_size_per_block,
+                forbid_realloc=forbid_realloc,
+            )
+
+        if self.enable_cuda_graph and self.decode_wrapper._fixed_batch_size == 0:
+            batch_size = attn_inputs.input_lengths.size(0)
+            self.decode_wrapper._use_cuda_graph = True
+            # Both decode backends read these buffers during run(); replay only
+            # updates fmha_params in-place, so the wrapper must hold these views.
+            self.decode_wrapper._paged_kv_indptr_buf = (
+                self.fmha_params.decode_page_indptr_d
+            )
+            self.decode_wrapper._paged_kv_last_page_len_buf = (
+                self.fmha_params.paged_kv_last_page_len_d
+            )
+            self.decode_wrapper._paged_kv_indices_buf = self.fmha_params.page_indice_d
+            self.decode_wrapper._fixed_batch_size = batch_size
+            if self.use_tensor_core:
+                self.decode_wrapper._qo_indptr_buf = torch.arange(
+                    batch_size + 1,
+                    dtype=torch.int32,
+                    device=self.g_workspace_buffer.device,
+                )
+
+        self._plan_decode_wrapper(attn_inputs)
+        if self.enable_cuda_graph and not self._workspace_compacted:
+            self.g_workspace_buffer = _compact_graph_workspace(
+                self.decode_wrapper,
+                self.g_workspace_buffer,
+                self.local_head_num,
+                self.head_dim_vo,
+            )
+            self._workspace_compacted = True
+            self._plan_decode_wrapper(attn_inputs)
+        return self.fmha_params
+
+    def prepare_for_cuda_graph_replay(self, attn_inputs: PyAttentionInputs) -> None:
+        """Refresh FlashInfer runtime buffers before replaying the captured graph."""
+        if not attn_inputs.sequence_lengths.is_cuda:
+            # Host pipeline: refresh the host mirrors and re-plan when the
+            # selected backend's cached metadata no longer matches them.
+            block_id_host = attn_inputs.kv_cache_kernel_block_id
+            if block_id_host is None or block_id_host.numel() == 0:
+                block_id_host = attn_inputs.kv_cache_kernel_block_id_device
+            self.fmha_params.fill_params(
+                _host_i32(attn_inputs.prefix_lengths),
+                _host_i32(attn_inputs.sequence_lengths),
+                _host_i32(attn_inputs.input_lengths),
+                _host_i32(block_id_host),
+                self.seq_size_per_block,
+                forbid_realloc=True,
+            )
+            if self._cuda_graph_replay_needs_replan():
+                self._plan_decode_wrapper(attn_inputs)
+            return
+
+        # Device-metadata compatibility path inherited from the base
+        # implementation. CudaGraphRunner routes graph replay through the
+        # pinned host mirrors above.
+        seq_plus_1 = attn_inputs.sequence_lengths_plus_1_device
+        if seq_plus_1 is None or not seq_plus_1.is_cuda:
+            seq_plus_1 = (attn_inputs.sequence_lengths.to(torch.int32) + 1).cuda()
+        block_id = _device_or(
+            attn_inputs.kv_cache_kernel_block_id_device,
+            attn_inputs.kv_cache_kernel_block_id,
+        )
+        if block_id is not None and not block_id.is_cuda:
+            block_id = block_id.cuda()
+        self.fmha_params.fill_decode_cuda_graph_params(
+            seq_plus_1,
+            block_id,
+            self.seq_size_per_block,
+        )
+
+    def support(self, attn_inputs: PyAttentionInputs) -> bool:
+        return True
+
+    def forward(
+        self, q: torch.Tensor, kv_cache: Optional[LayerKVCache], params: ParamsBase
+    ) -> torch.Tensor:
+        assert kv_cache is not None, "kv_cache is required"
+        q = quantize_to_fp8_if_needed(
+            q.reshape(q.shape[0], self.local_head_num, self.head_dim_qk),
+            self.q_dtype,
+        )
+        paged_kv_cache = kv_cache.kv_cache_base
+        if paged_kv_cache is not None and paged_kv_cache.dim() == 2:
+            paged_kv_cache = common.reshape_paged_kv_cache(
+                paged_kv_cache,
+                self.local_kv_head_num,
+                self.seq_size_per_block,
+                self.head_dim_qk,
+            )
+        # Decode FP8 defaults to unit scales and the output dtype from plan().
+        return self.decode_wrapper.run(q, paged_kv_cache)
+
+
+class PyFlashinferDecodeImpl(FMHAImplBase):
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        attn_inputs: PyAttentionInputs,
+        parallelism_config: Optional[ParallelismConfig] = None,
+    ) -> None:
+        # Create implementations
+        self.need_rope_kv_cache = attn_configs.need_rope_kv_cache
+        self.fmha_impl = PyFlashinferDecodeAttnOp(attn_configs, attn_inputs)
+        self.rope_impl = FusedRopeKVCacheDecodeOp(attn_configs)
+        self.attn_configs = attn_configs
+
+        # Store input info
+        self.attn_inputs = attn_inputs
+
+        self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
+        self.fmha_impl.set_params(self.fmha_params)
+        self.fmha_impl.prepare(attn_inputs)
+        self.rope_params = self.rope_impl.prepare(attn_inputs)
+        self.write_cache_store_impl = common.create_write_cache_store_impl(attn_inputs)
+
+    def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs) -> None:
+        """Prepare FlashInfer/RoPE buffers and metadata for CUDA graph replay."""
+        self.fmha_impl.prepare_for_cuda_graph_replay(attn_inputs)
+        if self.need_rope_kv_cache:
+            # Update rope params for correct position encoding during replay.
+            refresh_sequence_lengths = getattr(
+                self.rope_impl, "refresh_sequence_lengths", None
+            )
+            if refresh_sequence_lengths is None:
+                # Non-CUDA backends use the C++ RoPE binding. Its prepare()
+                # accepts only attn_inputs and its params do not expose the
+                # CUDA-only stable sequence_lengths buffer.
+                new_rope_params = self.rope_impl.prepare(attn_inputs)
+            else:
+                new_rope_params = self.rope_impl.prepare(
+                    attn_inputs, forbid_reallocation=True
+                )
+            common.copy_kv_cache_offset(
+                self.rope_params.kv_cache_offset, new_rope_params.kv_cache_offset
+            )
+            if refresh_sequence_lengths is not None:
+                self.rope_params.sequence_lengths = new_rope_params.sequence_lengths
+
+    def support_cuda_graph(self) -> bool:
+        return True
+
+    @classmethod
+    def support(
+        cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
+    ) -> bool:
+        return not attn_configs.use_mla
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        kv_cache: Optional[LayerKVCache],
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        # Apply RoPE and KV Cache processing
+        if self.need_rope_kv_cache:
+            qkv = self.rope_impl.forward(qkv, kv_cache, self.rope_params)
+
+        # Apply write cache store if needed
+        common.apply_write_cache_store(
+            self.write_cache_store_impl, self.attn_inputs, kv_cache
+        )
+
+        # Execute FMHA forward
+        return self.fmha_impl.forward(qkv, kv_cache, self.fmha_params)

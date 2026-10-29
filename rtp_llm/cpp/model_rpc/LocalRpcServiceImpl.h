@@ -1,0 +1,183 @@
+#pragma once
+
+#include <memory>
+#include <string>
+#include <iostream>
+#include "grpc++/grpc++.h"
+#include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.grpc.pb.h"
+#include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
+#include "rtp_llm/cpp/multimodal_processor/MultimodalProcessor.h"
+#include "rtp_llm/cpp/model_rpc/LocalRpcServer.h"
+
+namespace rtp_llm {
+
+class LocalRpcServiceImpl: public RpcService::Service {
+public:
+    LocalRpcServiceImpl() {}
+    virtual ~LocalRpcServiceImpl() {}
+    virtual grpc::Status init(const EngineInitParams&                                maga_init_params,
+                              std::unique_ptr<rtp_llm::ProposeModelEngineInitParams> propose_params,
+                              py::object                                             mm_process_engine) {
+        local_server_ = std::make_shared<LocalRpcServer>();
+        return local_server_->init(maga_init_params, std::move(propose_params), mm_process_engine);
+    }
+    grpc::Status init(const EngineInitParams&                                maga_init_params,
+                      std::unique_ptr<rtp_llm::ProposeModelEngineInitParams> propose_params,
+                      py::object                                             weight_manager,
+                      py::object                                             mm_process_engine) {
+        local_server_ = std::make_shared<LocalRpcServer>();
+        return local_server_->init(maga_init_params, std::move(propose_params), mm_process_engine);
+    }
+
+    grpc::Status GenerateStreamCall(grpc::ServerContext*                   context,
+                                    const GenerateInputPB*                 request,
+                                    grpc::ServerWriter<GenerateOutputsPB>* writer) override {
+        return local_server_->GenerateStreamCall(context, request, writer);
+    }
+
+    grpc::Status BatchGenerateCall(grpc::ServerContext*        context,
+                                   const BatchGenerateInputPB* request,
+                                   BatchGenerateOutputsPB*     response) override {
+        return local_server_->BatchGenerateCall(context, request, response);
+    }
+
+    grpc::Status EnqueueBatch(grpc::ServerContext*         context,
+                              const EnqueueBatchRequestPB* request,
+                              EnqueueBatchResponsePB*      response) override {
+        (void)context;
+        (void)request;
+        (void)response;
+        return grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "EnqueueBatch not implemented on this role");
+    }
+
+    grpc::Status EnqueueGroup(grpc::ServerContext*         context,
+                              const EnqueueGroupRequestPB* request,
+                              EnqueueBatchResponsePB*      response) override {
+        (void)context;
+        (void)request;
+        (void)response;
+        return grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "EnqueueGroup not implemented on this role");
+    }
+
+    grpc::Status FetchResponse(grpc::ServerContext*                   context,
+                               const FetchRequestPB*                  request,
+                               grpc::ServerWriter<GenerateOutputsPB>* writer) override {
+        (void)context;
+        (void)request;
+        (void)writer;
+        return grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "FetchResponse not implemented on this role");
+    }
+
+    ::grpc::Status
+    GetWorkerStatus(::grpc::ServerContext* context, const StatusVersionPB* request, WorkerStatusPB* response) override {
+        return local_server_->GetWorkerStatus(context, request, response);
+    }
+
+    ::grpc::Status
+    UpdateWeights(::grpc::ServerContext* context, const UpdateWeightsRequestPB* request, EmptyPB* response) override {
+        return local_server_->UpdateWeights(context, request, response);
+    }
+
+    ::grpc::Status
+    GetCacheStatus(::grpc::ServerContext* context, const CacheVersionPB* request, CacheStatusPB* response) override {
+        return local_server_->GetCacheStatus(context, request, response);
+    }
+
+    ::grpc::Status UpdateSchedulerInfo(::grpc::ServerContext*              context,
+                                       const UpdateSchedulerInfoRequestPB* request,
+                                       EmptyPB*                            response) override {
+        return local_server_->UpdateSchedulerInfo(context, request, response);
+    }
+
+    ::grpc::Status
+    SetLogLevel(::grpc::ServerContext* context, const SetLogLevelRequestPB* request, EmptyPB* response) override {
+        return local_server_->SetLogLevel(context, request, response);
+    }
+
+    ::grpc::Status
+    StartProfile(::grpc::ServerContext* context, const StartProfileRequestPB* request, EmptyPB* response) override {
+        return local_server_->StartProfile(context, request, response);
+    }
+
+    ::grpc::Status StartProfileInternal(::grpc::ServerContext*               context,
+                                        const StartProfileInternalRequestPB* request,
+                                        EmptyPB*                             response) override {
+        return local_server_->StartProfileInternal(context, request, response);
+    }
+
+    ::grpc::Status DumpTorchAllocator(::grpc::ServerContext*             context,
+                                      const TorchAllocatorDumpRequestPB* request,
+                                      TorchAllocatorDumpResponsePB*      response) override {
+        return local_server_->DumpTorchAllocator(context, request, response);
+    }
+
+    ::grpc::Status DumpTorchAllocatorInternal(::grpc::ServerContext*             context,
+                                              const TorchAllocatorDumpRequestPB* request,
+                                              TorchAllocatorDumpResultPB*        response) override {
+        return local_server_->DumpTorchAllocatorInternal(context, request, response);
+    }
+
+    ::grpc::Status
+    CheckHealth(::grpc::ServerContext* context, const EmptyPB* request, CheckHealthResponsePB* response) override {
+        return local_server_->CheckHealth(context, request, response);
+    }
+
+    ::grpc::Status UpdateEplbConfig(::grpc::ServerContext*           context,
+                                    const UpdateEplbConfigRequestPB* request,
+                                    EmptyPB*                         response) override {
+        return local_server_->UpdateEplbConfig(context, request, response);
+    }
+
+    ::grpc::Status SetPause(::grpc::ServerContext* context, const EmptyPB* request, EmptyPB* response) override {
+        return local_server_->SetPause(context, request, response);
+    }
+
+    ::grpc::Status SetRestart(::grpc::ServerContext* context, const EmptyPB* request, EmptyPB* response) override {
+        return local_server_->SetRestart(context, request, response);
+    }
+
+    WorkerStatusInfo getWorkerStatusInfo(int64_t latest_finished_version) {
+        return local_server_->getWorkerStatusInfo(latest_finished_version);
+    }
+
+    KVCacheInfo getCacheStatusInfo(int64_t latest_cache_version, bool need_cache_keys) {
+        return local_server_->getCacheStatusInfo(latest_cache_version, need_cache_keys);
+    }
+
+    EngineScheduleInfo getEngineScheduleInfo(int64_t latest_finised_version) {
+        return local_server_->getEngineScheduleInfo(latest_finised_version);
+    }
+
+    std::shared_ptr<EngineBase> getEngine() const {
+        return local_server_->getEngine();
+    };
+
+    std::shared_ptr<MultimodalProcessor> getMultimodalProcessor() const {
+        return local_server_->getMultimodalProcessor();
+    };
+
+    virtual size_t onflightRequestNum() {
+        return local_server_->onflightRequestNum();
+    }
+
+    virtual void beginShutdown() {}
+
+    virtual void stop() {
+        if (local_server_) {
+            local_server_->stop();
+        }
+    }
+
+    ::grpc::Status ExecuteFunction(::grpc::ServerContext*     context,
+                                   const ::FunctionRequestPB* request,
+                                   ::FunctionResponsePB*      response) override {
+        return local_server_->ExecuteFunction(context, request, response);
+    }
+
+protected:
+    std::shared_ptr<LocalRpcServer> local_server_;
+};
+
+typedef LocalRpcServiceImpl RpcServiceImpl;
+
+}  // namespace rtp_llm

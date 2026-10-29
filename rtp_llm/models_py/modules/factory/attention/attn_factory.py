@@ -1,0 +1,386 @@
+import logging
+from typing import Callable, Dict, List, Optional, Union
+
+from rtp_llm.config.cuda_graph import (
+    CudaGraphSelectionMode,
+    GenerationPrefillCudaGraphUnsupportedBackend,
+)
+from rtp_llm.device.device_type import DeviceType, get_device_type
+from rtp_llm.model_loader.model_weight_info import ModelWeights
+from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import (
+    FMHAImplBase,
+    MlaImplBase,
+)
+from rtp_llm.ops import (
+    AttentionConfigs,
+    FMHAConfig,
+    KvCacheDataType,
+    ParallelismConfig,
+    RopeStyle,
+)
+from rtp_llm.ops.compute_ops import PyAttentionInputs
+from rtp_llm.ops.fused_rope_kvcache_op import DecodeRopeContractError
+from rtp_llm.utils.model_weight import W
+
+AttentionImpl = Union[FMHAImplBase, MlaImplBase]
+AttentionImplFactory = Callable[..., AttentionImpl]
+
+
+def _normalize_cuda_graph_selection_mode(
+    is_cuda_graph: bool,
+    mode: Optional[Union[str, CudaGraphSelectionMode]],
+) -> CudaGraphSelectionMode:
+    if mode is None:
+        return (
+            CudaGraphSelectionMode.DECODE_GRAPH
+            if is_cuda_graph
+            else CudaGraphSelectionMode.EAGER
+        )
+    return CudaGraphSelectionMode(mode)
+
+
+def _matches_cuda_graph_selection_mode(
+    instance: AttentionImpl, mode: CudaGraphSelectionMode
+) -> bool:
+    if mode == CudaGraphSelectionMode.EAGER:
+        return True
+    if not instance.support_cuda_graph():
+        return False
+    if mode == CudaGraphSelectionMode.GENERATION_PREFILL_GRAPH:
+        return instance.supports_generation_prefill_cuda_graph()
+    return True
+
+
+def _implementation_allows_cuda_graph_selection_mode(
+    impl: type[AttentionImpl], mode: CudaGraphSelectionMode
+) -> bool:
+    """Filter role-specific implementations before support()/construction.
+
+    Most attention implementations participate in the existing eager/decode
+    routing and therefore leave ``cuda_graph_selection_modes`` unset. A
+    backend that exists for one graph role only declares the exact modes it
+    accepts, preventing a graph-shaped input for another role from selecting
+    it merely because ``is_cuda_graph`` is true.
+    """
+
+    allowed_modes = getattr(impl, "cuda_graph_selection_modes", None)
+    return allowed_modes is None or mode in allowed_modes
+
+
+# Lists to store registered implementations
+PREFILL_MHA_IMPS: List[type[FMHAImplBase]] = []
+DECODE_MHA_IMPS: List[type[FMHAImplBase]] = []
+PREFILL_MLA_IMPS: List[type[MlaImplBase]] = []
+DECODE_MLA_IMPS: List[type[MlaImplBase]] = []
+
+FLASHINFER_TRTLLM_GEN_IMPLS = {
+    "FlashInferTRTLLMPrefillImpl",
+    "FlashInferTRTLLMSpecDecodeImpl",
+    "FlashInferTRTLLMDecodeImpl",
+}
+
+
+def get_mla_impl(
+    attn_configs: AttentionConfigs,
+    weight: ModelWeights,
+    attn_inputs: PyAttentionInputs,
+    fmha_config: Optional[FMHAConfig] = None,
+    quant_config: Optional[object] = None,
+    is_cuda_graph: bool = False,
+    max_seq_len: int = 0,
+    parallelism_config: Optional[ParallelismConfig] = None,
+    cuda_graph_selection_mode: Optional[Union[str, CudaGraphSelectionMode]] = None,
+) -> MlaImplBase:
+
+    selection_mode = _normalize_cuda_graph_selection_mode(
+        is_cuda_graph, cuda_graph_selection_mode
+    )
+
+    mla_impls = PREFILL_MLA_IMPS if attn_inputs.is_prefill else DECODE_MLA_IMPS
+    for impl in mla_impls:
+        if not _implementation_allows_cuda_graph_selection_mode(impl, selection_mode):
+            continue
+        # Check support before creating instance
+        if not impl.support(attn_configs, attn_inputs):
+            continue
+
+        cos_sin_cache = weight.get_global_weight_or_none(W.rope_cos_sin_cache)
+        # TODO: support fast path for cp prefill
+        use_fast_path = (
+            attn_inputs.is_prefill
+            and attn_inputs.cu_kv_seqlens_device.max().item()
+            <= attn_configs.indexer_topk
+            and not (
+                parallelism_config and parallelism_config.prefill_cp_config.is_enabled()
+            )
+        )
+
+        if not use_fast_path and not impl.support_parallelism_config(
+            parallelism_config
+        ):
+            continue
+
+        # Skip sparse MLA if fast path is enabled
+        if use_fast_path and impl.is_sparse():
+            logging.debug(
+                f"skip sparse mla impl [{impl}] because fast path: {use_fast_path}"
+            )
+            continue
+
+        if attn_configs.is_sparse and not use_fast_path and not impl.is_sparse():
+            logging.debug(f"skip mla impl [{impl}] because sparse mla is not supported")
+            continue
+
+        instance = impl(
+            attn_configs,
+            attn_inputs,
+            weight.weights,
+            cos_sin_cache=cos_sin_cache,
+            fmha_config=fmha_config,
+            quant_config=quant_config,
+            max_seq_len=max_seq_len,
+            is_cuda_graph=is_cuda_graph,
+            parallelism_config=parallelism_config,
+        )
+        if selection_mode == CudaGraphSelectionMode.GENERATION_PREFILL_GRAPH:
+            if not _matches_cuda_graph_selection_mode(instance, selection_mode):
+                raise GenerationPrefillCudaGraphUnsupportedBackend(
+                    "selected semantic attention backend "
+                    f"{type(instance).__name__} is not generation-prefill CUDA Graph safe"
+                )
+            return instance
+        if _matches_cuda_graph_selection_mode(instance, selection_mode):
+            return instance
+    if selection_mode == CudaGraphSelectionMode.GENERATION_PREFILL_GRAPH:
+        raise GenerationPrefillCudaGraphUnsupportedBackend(
+            "MLA has no generation-prefill CUDA Graph implementation"
+        )
+    raise Exception("can not find mla type")
+
+
+def _is_fmha_impl_disabled(
+    impl_class_name: str, fmha_config: Optional[FMHAConfig]
+) -> bool:
+    """Check if a FMHA implementation is disabled in fmha_config.
+
+    Args:
+        impl_class_name: The implementation class name
+        fmha_config: The FMHA config, if None, assume not disabled
+
+    Returns:
+        True if the FMHA implementation is disabled, False otherwise
+    """
+    if fmha_config is None:
+        return False
+
+    # XQA implementations
+    if "XQA" in impl_class_name:
+        return not fmha_config.enable_xqa
+    # FlashInfer TRT-LLM FMHA v2 implementations
+    elif impl_class_name == "FlashInferTRTLLMFMHAv2PrefillImpl":
+        return not fmha_config.enable_flashinfer_trt_fmha_v2
+    elif impl_class_name == "FlashInferTRTLLMFMHAv2PagedPrefillImpl":
+        return not fmha_config.enable_paged_flashinfer_trt_fmha_v2
+    # FlashInfer TRT-LLM Gen implementations (SM100)
+    elif impl_class_name in FLASHINFER_TRTLLM_GEN_IMPLS:
+        return not fmha_config.enable_flashinfer_trtllm_gen
+    # FlashInfer native Hybrid Prefill
+    elif impl_class_name == "PyFlashinferHybridPrefillImpl":
+        return (
+            fmha_config.disable_flashinfer_hybrid_prefill
+            or fmha_config.disable_flashinfer_native
+        )
+    # FlashInfer native implementations
+    elif "FlashInfer" in impl_class_name or "Flashinfer" in impl_class_name:
+        return fmha_config.disable_flashinfer_native
+    # Generation-prefill Triton PA reads the shuffled K/V layout produced by the ASM
+    # RoPE+KV writer, so both switches are part of this backend's contract.
+    elif impl_class_name == "AiterPrefillImplTriton":
+        return not (fmha_config.use_triton_pa and fmha_config.use_asm_pa)
+    # Aiter ASM / CK paged prefill.
+    elif (
+        "AiterPrefillImplAsm" in impl_class_name
+        or "AiterPrefillImplPaged" in impl_class_name
+    ):
+        return not fmha_config.use_asm_pa
+    # Aiter ASM decode — disabled when triton PA is enabled (triton PA takes priority)
+    elif "AiterDecodeImplAsm" in impl_class_name:
+        if fmha_config.use_triton_pa:
+            return True
+        return not fmha_config.use_asm_pa
+    # Aiter Non-ASM implementations
+    elif (
+        "AiterPrefillImplNonAsm" in impl_class_name
+        or "AiterDecodeImplNonAsm" in impl_class_name
+    ):
+        return not fmha_config.use_aiter_pa
+    # Aiter Triton implementations
+    elif "AiterDecodeImplTriton" in impl_class_name:
+        return not fmha_config.use_triton_pa
+    # Default: not disabled
+    return False
+
+
+def get_fmha_impl(
+    attn_configs: AttentionConfigs,
+    weight: ModelWeights,
+    attn_inputs: PyAttentionInputs,
+    fmha_config: Optional[FMHAConfig] = None,
+    quant_config: Optional[object] = None,
+    is_cuda_graph: bool = False,
+    max_seq_len: int = 0,
+    parallelism_config: Optional[ParallelismConfig] = None,
+    cuda_graph_selection_mode: Optional[Union[str, CudaGraphSelectionMode]] = None,
+) -> FMHAImplBase:
+    selection_mode = _normalize_cuda_graph_selection_mode(
+        is_cuda_graph, cuda_graph_selection_mode
+    )
+    # Set is_cuda_graph as dynamic attribute on attn_inputs for base class to read
+    attn_inputs.is_cuda_graph = is_cuda_graph
+
+    mha_impls = PREFILL_MHA_IMPS if attn_inputs.is_prefill else DECODE_MHA_IMPS
+    strict_impl_selection = False
+    if get_device_type() == DeviceType.ROCm:
+        from rtp_llm.models_py.modules.factory.attention.rocm_impl.aiter import (
+            validate_v_layout,
+        )
+
+        strict_impl_selection = validate_v_layout(
+            attn_configs, attn_inputs, fmha_config
+        )
+
+    for impl in mha_impls:
+        # Check if this FMHA implementation is disabled before creating instance
+        impl_class_name = impl.__name__
+
+        if not _implementation_allows_cuda_graph_selection_mode(impl, selection_mode):
+            continue
+
+        # Skip if this FMHA implementation is disabled in config
+        if _is_fmha_impl_disabled(impl_class_name, fmha_config):
+            continue
+
+        # Check support before creating instance
+        if not impl.support(attn_configs, attn_inputs):
+            continue
+
+        # Check if implementation supports parallelism config
+        if not impl.support_parallelism_config(parallelism_config):
+            continue
+        kwargs = {"fmha_config": fmha_config} if impl.accepts_fmha_config else {}
+        try:
+            instance = impl(attn_configs, attn_inputs, parallelism_config, **kwargs)
+        except DecodeRopeContractError:
+            # Input/state contract violations are not implementation
+            # incompatibilities; silently selecting another backend would hide
+            # the bug as a performance regression.
+            raise
+        except Exception as e:
+            if (
+                selection_mode == CudaGraphSelectionMode.GENERATION_PREFILL_GRAPH
+                or strict_impl_selection
+                or (
+                    isinstance(e, RuntimeError)
+                    and "illegal memory access" in str(e).lower()
+                )
+            ):
+                raise
+            logging.warning(f"Failed to instantiate {impl_class_name}: {e}")
+            continue
+        if selection_mode == CudaGraphSelectionMode.GENERATION_PREFILL_GRAPH:
+            # Backend priority is part of model semantics. Do not skip an eager
+            # backend (for example HeadWise sink/sliding-window attention) and
+            # silently capture a lower-priority dense implementation.
+            if not _matches_cuda_graph_selection_mode(instance, selection_mode):
+                raise GenerationPrefillCudaGraphUnsupportedBackend(
+                    "selected semantic attention backend "
+                    f"{impl_class_name} is not generation-prefill CUDA Graph safe"
+                )
+            return instance
+        if _matches_cuda_graph_selection_mode(instance, selection_mode):
+            return instance
+    if (
+        attn_configs.rope_config.style == RopeStyle.Mrope
+        and not attn_configs.rope_config.mrope_interleaved
+    ):
+        raise ValueError(
+            "No registered attention implementation supports non-interleaved MRoPE "
+            "on this backend. Qwen2-VL/Qwen2.5-VL checkpoints use the "
+            "non-interleaved layout by default; do not flip mrope_interleaved because "
+            "that changes RoPE semantics. Use a CUDA backend for these checkpoints."
+        )
+    if selection_mode == CudaGraphSelectionMode.GENERATION_PREFILL_GRAPH:
+        raise GenerationPrefillCudaGraphUnsupportedBackend(
+            "no generation-prefill CUDA Graph attention implementation "
+            "matches the current model, cache layout, dtype, and GPU"
+        )
+    raise Exception("can not find mha type")
+
+
+class AttnImplFactory(object):
+    """Factory class for creating FMHA implementations based on attention_type."""
+
+    # FMHA implementation registry - maps attention_type to impl method
+    FMHA_IMPL_REGISTRY: Dict[str, AttentionImplFactory] = {
+        "mha": get_fmha_impl,
+        "mla": get_mla_impl,
+    }
+
+    @classmethod
+    def get_fmha_impl(
+        cls,
+        model_config,  # ModelConfig - kept for backward compatibility, but will extract attn_configs
+        parallelism_config,
+        weight: ModelWeights,
+        attn_inputs: PyAttentionInputs,
+        fmha_config: Optional[FMHAConfig] = None,
+        is_cuda_graph: bool = False,
+        cuda_graph_selection_mode: Optional[Union[str, CudaGraphSelectionMode]] = None,
+    ) -> AttentionImpl:
+        # Extract AttentionConfigs from ModelConfig
+        attn_configs = model_config.getAttentionConfigs(
+            parallelism_config.get_attn_tp_size()
+        )
+        attn_inputs.headwise_config = getattr(model_config, "headwise_config", None)
+        key_str = "mla" if attn_configs.use_mla else "mha"
+        fmha_impl_method = cls.FMHA_IMPL_REGISTRY[key_str]
+        instance = fmha_impl_method(
+            attn_configs,
+            weight,
+            attn_inputs,
+            fmha_config,
+            model_config.quant_config,
+            is_cuda_graph,
+            model_config.max_seq_len,
+            parallelism_config,
+            cuda_graph_selection_mode,
+        )
+        logging.debug(f"get fmha impl: {type(instance).__name__}")
+        return instance
+
+    @classmethod
+    def get_fmha_impl_method(cls, attention_type: str) -> AttentionImplFactory:
+        """
+        Get the appropriate FMHA implementation method based on attention_type.
+
+        Args:
+            attention_type: String identifying the attention type
+
+        Returns:
+            Method name to call for getting FMHA implementation
+
+        Raises:
+            ValueError: If attention_type is not supported
+        """
+        if attention_type not in cls.FMHA_IMPL_REGISTRY:
+            available_types = list(cls.FMHA_IMPL_REGISTRY.keys())
+            raise ValueError(
+                f"Unsupported attention type '{attention_type}'. Available types: {available_types}"
+            )
+
+        return cls.FMHA_IMPL_REGISTRY[attention_type]
+
+    @classmethod
+    def get_supported_types(cls) -> List[str]:
+        """Get list of supported attention types."""
+        return list(cls.FMHA_IMPL_REGISTRY.keys())

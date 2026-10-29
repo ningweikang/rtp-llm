@@ -1,0 +1,110 @@
+from typing import Optional
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.models_py.distributed.collective_torch import Group, all_gather
+from rtp_llm.ops import ParallelismConfig
+from rtp_llm.ops.compute_ops import rtp_llm_ops
+
+
+class EmbeddingTorch(nn.Module):
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.embedding(input, self.weight)
+
+
+class Embedding(nn.Module):
+    def __init__(
+        self,
+        config: ModelConfig,
+        parallelism_config: ParallelismConfig,
+        weight: torch.Tensor,
+    ):
+        super().__init__()
+        self.weight = weight
+        self.config = config
+        self.parallelism_config = parallelism_config
+        self.tp_size = parallelism_config.get_attn_tp_size()
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        token_types: Optional[torch.Tensor] = None,
+        text_tokens_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        tokens = input.size(0)
+        hidden_size = self.weight.size(-1)
+        output = torch.empty(
+            (tokens, hidden_size), dtype=self.weight.dtype, device=input.device
+        )
+        rtp_llm_ops.embedding(
+            output, input, self.weight.data, position_ids, token_types, text_tokens_mask
+        )
+        if self.tp_size > 1:
+            m, n = output.shape
+            output = all_gather(output, group=Group.TP)
+            output = (
+                output.reshape(self.tp_size, m, n)
+                .transpose(0, 1)
+                .contiguous()
+                .reshape(m, -1)
+            )
+        return output
+
+
+class EmbeddingBert(nn.Module):
+    def __init__(
+        self,
+        config: ModelConfig,
+        parallelism_config: ParallelismConfig,
+        weight: torch.Tensor,
+    ):
+        super().__init__()
+        self.weight = weight
+        self.config = config
+        self.parallelism_config = parallelism_config
+        self.tp_size = parallelism_config.get_attn_tp_size()
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        combo_position_ids: torch.Tensor,
+        position_encoding: torch.Tensor,
+        combo_tokens_type_ids: torch.Tensor,
+        token_type_embedding: torch.Tensor,
+        input_embedding_scalar: float,
+    ) -> torch.Tensor:
+        tokens = input.size(0)
+        hidden_size = self.weight.size(-1)
+        output = torch.empty(
+            (tokens, hidden_size), dtype=self.weight.dtype, device=input.device
+        )
+
+        rtp_llm_ops.embedding_bert(
+            output,
+            input,
+            self.weight.data,
+            combo_position_ids,
+            position_encoding,
+            combo_tokens_type_ids,
+            token_type_embedding,
+            input_embedding_scalar,
+        )
+
+        if self.tp_size > 1:
+            m, n = output.shape
+            output = all_gather(output, group=Group.TP)
+            output = (
+                output.reshape(self.tp_size, m, n)
+                .transpose(0, 1)
+                .contiguous()
+                .reshape(m, -1)
+            )
+        return output

@@ -1,0 +1,236 @@
+import gc
+import logging
+import threading
+import time
+from typing import TYPE_CHECKING, Optional
+
+from rtp_llm.access_logger.access_logger import AccessLogger
+from rtp_llm.config.engine_config import EngineConfig, update_worker_addrs
+from rtp_llm.config.log_config import get_log_path
+from rtp_llm.config.py_config_modules import PyEnvConfigs
+from rtp_llm.distribute.distributed_server import DistributedServer, get_world_info
+from rtp_llm.metrics import kmonitor
+from rtp_llm.model_factory import ModelFactory
+from rtp_llm.models_py.distributed.collective_torch import init_distributed_environment
+from rtp_llm.server.server_args.hw_kernel_group_args import (
+    validate_hw_kernel_group_args,
+)
+from rtp_llm.utils.concurrency_controller import get_global_controller
+
+if TYPE_CHECKING:
+    from rtp_llm.async_decoder_engine.base_engine import BaseEngine
+
+USAGE_HEADER = "USAGE"
+
+
+class BackendManager(object):
+    def __init__(self, py_env_configs: PyEnvConfigs):
+        self.py_env_configs = py_env_configs
+        self._access_logger = AccessLogger(
+            get_log_path(),
+            py_env_configs.profiling_debug_logging_config.log_file_backup_count,
+            py_env_configs.server_config.rank_id,
+            py_env_configs.server_config.frontend_server_id,
+        )
+        self._distributed_server = DistributedServer(py_env_configs)
+        self.thread_lock_ = threading.Lock()
+        self._global_controller = get_global_controller()
+        # just rank 0 report metric
+        if py_env_configs.parallelism_config.world_rank == 0:
+            kmonitor.init()
+        self.engine: Optional["BaseEngine"] = None
+        self._shutdown_requested = threading.Event()
+
+    def start(self):
+        """Initialize backend server without entering service loop"""
+        self._distributed_server.start(self.py_env_configs)
+        # Create EngineConfig from py_env_configs (server/distribute config already adjusted for this rank)
+        engine_config = EngineConfig.create(
+            self.py_env_configs,
+            nccl_comm_config=self._distributed_server.get_nccl_comm_config(),
+        )
+
+        if engine_config.parallelism_config.world_size > 1:
+            init_distributed_environment(
+                engine_config.parallelism_config,
+                nccl_comm_config=self._distributed_server.get_nccl_comm_config(),
+                nccl_init_port=self._distributed_server.get_nccl_init_port(),
+                backend="nccl",
+                timeout=self.py_env_configs.distribute_config.dist_comm_timeout,
+                disable_custom_all_reduce=self.py_env_configs.ft_disable_custom_ar_override,
+            )
+        world_info = get_world_info(
+            self.py_env_configs.server_config,
+            self.py_env_configs.distribute_config,
+            self.py_env_configs.parallelism_config,
+            distributed_server=self._distributed_server,
+        )
+        update_worker_addrs(
+            engine_config.runtime_config,
+            engine_config.parallelism_config,
+            world_info,
+        )
+        # Build main model_config
+        model_config = ModelFactory.create_model_config(
+            model_args=self.py_env_configs.model_args,
+            lora_config=self.py_env_configs.lora_config,
+            kv_cache_config=engine_config.kv_cache_config,
+            profiling_debug_logging_config=engine_config.profiling_debug_logging_config,
+            generate_env_config=self.py_env_configs.generate_env_config,
+            embedding_config=self.py_env_configs.embedding_config,
+            quantization_config=self.py_env_configs.quantization_config,
+            render_config=self.py_env_configs.render_config,
+            eplb_config=self.py_env_configs.eplb_config,
+            vit_config=self.py_env_configs.vit_config,
+        )
+        # Let engine_config finalize based on model_config (e.g. scheduler config)
+        ModelFactory.update_engine_config_from_model_config(
+            engine_config=engine_config,
+            model_config=model_config,
+        )
+        # Generation-prefill is a secondary runner owned only by the normalized
+        # PDFUSION language-model process. Validate its cross-option capacity
+        # after EngineConfig has applied the implicit VIT role and ModelFactory
+        # has resolved explicit/checkpoint-inferred task types. Earlier parser
+        # validation would reject shared configs in processes that never create
+        # this runner.
+        validate_hw_kernel_group_args(
+            engine_config.hw_kernel_config,
+            max_context_batch_size=(
+                engine_config.runtime_config.fifo_scheduler_config.max_context_batch_size
+            ),
+            concurrency_limit=engine_config.concurrency_config.concurrency_limit,
+            role_type=engine_config.parallelism_config.role_type,
+            speculative_type=engine_config.sp_config.type,
+            task_type=model_config.task_type,
+        )
+
+        # Initialize DeepEP/MoriEP wrapper if MOE model and EP is enabled
+        if (
+            model_config.expert_num > 0
+            and engine_config.parallelism_config.world_size > 1
+            and not engine_config.moe_config.use_all_gather
+        ):
+            deepep_init_success = False
+            moriep_init_success = False
+
+            # MegaMoE runs on DeepGEMM symmetric buffers and never uses the
+            # DeepEP/NVSHMEM wrapper. Initializing it anyway poisons the CUDA
+            # context when unused NVSHMEM device state cannot start, so the
+            # wrapper is skipped for those strategies.
+            skip_deepep = engine_config.moe_config.moe_strategy in (
+                "mega_moe",
+                "mega_moe_se",
+            )
+            if skip_deepep and engine_config.moe_config.use_deepep_moe:
+                logging.info(
+                    "moe_strategy=%s does not use DeepEP; skipping DeepEP wrapper "
+                    "initialization",
+                    engine_config.moe_config.moe_strategy,
+                )
+
+            # Initialize DeepEP if enabled
+            if engine_config.moe_config.use_deepep_moe and not skip_deepep:
+                try:
+                    from rtp_llm.models_py.distributed.deepep_wrapper import (
+                        init_deepep_wrapper,
+                    )
+
+                    init_deepep_wrapper(engine_config, model_config)
+                    deepep_init_success = True
+                except Exception as e:
+                    logging.error(f"Failed to initialize DeepEP wrapper: {e}")
+
+            # Initialize MoriEP if enabled (can be independent of DeepEP)
+            if engine_config.moe_config.use_mori_ep:
+                try:
+                    from rtp_llm.models_py.distributed.moriep_wrapper import (
+                        init_moriep_wrapper,
+                    )
+
+                    init_moriep_wrapper(engine_config, model_config)
+                    moriep_init_success = True
+                    logging.info("MoriEP wrapper initialized successfully")
+                except Exception as e:
+                    logging.error(f"Failed to initialize MoriEP wrapper: {e}")
+
+            # Raise if a requested EP backend failed to initialize
+            if (
+                engine_config.moe_config.use_deepep_moe
+                and not skip_deepep
+                and not deepep_init_success
+            ):
+                raise RuntimeError("DeepEP was requested but failed to initialize")
+            if engine_config.moe_config.use_mori_ep and not moriep_init_success:
+                raise RuntimeError(
+                    "use_mori_ep is set but MoriEP wrapper failed to initialize"
+                )
+
+        # Optional propose model config
+        propose_model_config = ModelFactory.create_propose_model_config(
+            engine_config=engine_config,
+            model_config=model_config,
+            model_args=self.py_env_configs.model_args,
+        )
+
+        # Finally create engine using the new API
+        self.engine = ModelFactory.from_model_configs(
+            model_config=model_config,
+            engine_config=engine_config,
+            world_info=world_info,
+            vit_config=self.py_env_configs.vit_config,
+            merge_lora=self.py_env_configs.lora_config.merge_lora,
+            propose_model_config=propose_model_config,
+        )
+        logging.info(
+            "engine created successfully: self.engine.task_type=%s",
+            self.engine.task_type,
+        )
+
+    def serve_forever(self):
+        """Enter service loop to keep the process alive until shutdown is requested"""
+        # freeze all current tracked objects to reduce gc cost
+        gc.collect()
+        gc.freeze()
+        logging.info("BackendManager entering serve_forever loop")
+        while not self._shutdown_requested.is_set():
+            time.sleep(0.1)  # Check shutdown flag more frequently
+        logging.info("Shutdown requested, stopping BackendManager...")
+        self.stop()
+        logging.info("BackendManager stopped successfully")
+
+    def request_shutdown(self):
+        """Request graceful shutdown of the backend manager"""
+        logging.info("BackendManager shutdown requested")
+        self._shutdown_requested.set()
+
+    def stop(self) -> None:
+        """Stop the backend manager and cleanup resources"""
+        if self.engine is not None:
+            from rtp_llm.utils.fuser import _nfs_manager
+
+            engine_stop_error = None
+            try:
+                self.engine.stop()
+            except Exception as e:
+                engine_stop_error = e
+                logging.exception("engine stop failed during backend shutdown")
+            finally:
+                try:
+                    _nfs_manager.unmount_all()
+                    logging.info("all nfs paths unmounted")
+                except Exception:
+                    logging.exception("nfs unmount failed during backend shutdown")
+                    if engine_stop_error is None:
+                        raise
+            if engine_stop_error is not None:
+                raise engine_stop_error
+
+    def ready(self):
+        if self.engine is not None:
+            return self.engine.ready()
+        return True
+
+    @property
+    def role_type(self) -> str:
+        return self.engine.role_type if self.engine else "unknown"
